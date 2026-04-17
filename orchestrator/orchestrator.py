@@ -72,26 +72,14 @@ class LibraryOrchestrator:
         if limit == 0:
             self.dashboard.set_total(0)
             return self.state_store.status_counts()
-        recovered_item_ids = deque(self.state_store.list_ready_for_heavy_item_ids())
-        recovered_sources = set()
-        for item_id in recovered_item_ids:
-            item = self.state_store.get_item_by_id(item_id)
-            if item is not None:
-                recovered_sources.add(str(item.source_path))
-
-        discovered_sources = self._discover_sources(limit=limit)
-        sources = deque(
-            source_path
-            for source_path in discovered_sources
-            if str(source_path) not in recovered_sources
-        )
-        self.dashboard.set_total(len(sources) + len(recovered_item_ids))
+        sources = deque(self._discover_sources(limit=limit))
+        self.dashboard.set_total(len(sources))
         max_light_workers = max(1, self.config.limits.max_parallel_items)
         max_heavy_workers = max(1, self.config.limits.max_parallel_heavy_agents)
         pending_light: dict[Future[str | None], Path] = {}
         pending_heavy: dict[Future[None], str] = {}
-        ready_for_heavy = deque(recovered_item_ids)
-        queued_heavy_ids = set(recovered_item_ids)
+        ready_for_heavy: deque[str] = deque()
+        queued_heavy_ids: set[str] = set()
         stop_requested = False
         with (
             ThreadPoolExecutor(max_workers=max_light_workers, thread_name_prefix="light") as light_executor,
@@ -174,74 +162,119 @@ class LibraryOrchestrator:
         }:
             self.dashboard.finish_item(self.state_store.status_counts(), f"Skipped already processed item: {item.source_name}")
             return None
-        if item.status == ItemStatus.PREPARED and item.unpack_dir and item.unpack_dir.exists():
-            self.dashboard.begin_agent(source_path, "prepare", "Prepared item already waiting for heavy processing.")
-            try:
-                self.dashboard.advance_agent("prepare", self.state_store.status_counts(), item.message or "Prepared item already waiting for heavy processing.")
-            finally:
-                self.dashboard.end_agent("prepare")
+        if item.status == ItemStatus.CLASSIFIED_FAST:
             return item.item_id
-        file_role = classify_file_role(source_path)
-        if (
-            source_path.suffix.lower() in set(self.config.behavior.trash_extensions)
-            or file_role == "trash"
-        ):
-            self._route_to_special(item, self.config.paths.trash_root, ItemStatus.TRASH, "Detected as trash by extension or file signature.")
-            self.dashboard.finish_item(self.state_store.status_counts(), item.message)
-            return None
-        if file_role == "unknown" and source_path.is_file():
-            self._route_to_special(item, self.config.paths.manual_review_root, ItemStatus.MANUAL_REVIEW, "Unknown file type by extension and signature.")
-            self.dashboard.finish_item(self.state_store.status_counts(), item.message)
-            return None
-        item.source_hash = compute_sha256(source_path)
-        self.state_store.save_item(item)
-        if should_unpack_with_agent(item.container_kind):
-            self.queues.enqueue(QueueStage.UNPACK, item.item_id)
 
-        try:
+        if item.status == ItemStatus.PREPARED and item.unpack_dir and item.unpack_dir.exists():
+            excerpt = item.prepared_excerpt or collect_excerpt(
+                item.unpack_dir,
+                self.config.lmstudio.fast_excerpt_words,
+            )
+        else:
+            file_role = classify_file_role(source_path)
+            if (
+                source_path.suffix.lower() in set(self.config.behavior.trash_extensions)
+                or file_role == "trash"
+            ):
+                self._route_to_special(item, self.config.paths.trash_root, ItemStatus.TRASH, "Detected as trash by extension or file signature.")
+                self.dashboard.finish_item(self.state_store.status_counts(), item.message)
+                return None
+            if file_role == "unknown" and source_path.is_file():
+                self._route_to_special(item, self.config.paths.manual_review_root, ItemStatus.MANUAL_REVIEW, "Unknown file type by extension and signature.")
+                self.dashboard.finish_item(self.state_store.status_counts(), item.message)
+                return None
+            item.source_hash = compute_sha256(source_path)
+            self.state_store.save_item(item)
             if should_unpack_with_agent(item.container_kind):
-                self.dashboard.begin_agent(source_path, "unpack", "Unpacking archive source.")
+                self.queues.enqueue(QueueStage.UNPACK, item.item_id)
+
+            try:
+                if should_unpack_with_agent(item.container_kind):
+                    self.dashboard.begin_agent(source_path, "unpack", "Unpacking archive source.")
+                    try:
+                        with self._unpack_slots:
+                            item, excerpt = self.unpack_agent.run(self.context, item)
+                        self.dashboard.advance_agent("unpack", self.state_store.status_counts(), item.message)
+                        if item.status == ItemStatus.MANUAL_REVIEW:
+                            self.dashboard.finish_item(self.state_store.status_counts(), item.message)
+                            return None
+                    finally:
+                        self.dashboard.end_agent("unpack")
+                else:
+                    self.dashboard.begin_agent(source_path, "prepare", "Staging source into workspace.")
+                    try:
+                        item.unpack_dir = stage_source(item.source_path, self.context.workspace_root / item.item_id)
+                        excerpt = collect_excerpt(item.unpack_dir, self.config.lmstudio.fast_excerpt_words)
+                        self.state_store.add_event(
+                            item.item_id,
+                            "prepare",
+                            "Source staged into workspace without archive unpack.",
+                            payload={"unpack_dir": str(item.unpack_dir)},
+                        )
+                    finally:
+                        self.dashboard.end_agent("prepare")
+                item.prepared_excerpt = excerpt
+                item.status = ItemStatus.PREPARED
+                item.message = "Prepared for fast classification."
+                self.state_store.save_item(item)
+                self.state_store.add_event(
+                    item.item_id,
+                    "prepare_ready",
+                    item.message,
+                    payload={
+                        "unpack_dir": str(item.unpack_dir) if item.unpack_dir else "",
+                        "excerpt_words": len(item.prepared_excerpt.split()),
+                    },
+                )
+                self.dashboard.begin_agent(source_path, "prepare", item.message)
                 try:
-                    with self._unpack_slots:
-                        item, excerpt = self.unpack_agent.run(self.context, item)
-                    self.dashboard.advance_agent("unpack", self.state_store.status_counts(), item.message)
-                    if item.status == ItemStatus.MANUAL_REVIEW:
-                        self.dashboard.finish_item(self.state_store.status_counts(), item.message)
-                        return None
-                finally:
-                    self.dashboard.end_agent("unpack")
-            else:
-                self.dashboard.begin_agent(source_path, "prepare", "Staging source into workspace.")
-                try:
-                    item.unpack_dir = stage_source(item.source_path, self.context.workspace_root / item.item_id)
-                    excerpt = collect_excerpt(item.unpack_dir, self.config.lmstudio.fast_excerpt_words)
-                    self.state_store.add_event(
-                        item.item_id,
-                        "prepare",
-                        "Source staged into workspace without archive unpack.",
-                        payload={"unpack_dir": str(item.unpack_dir)},
-                    )
+                    self.dashboard.advance_agent("prepare", self.state_store.status_counts(), item.message)
                 finally:
                     self.dashboard.end_agent("prepare")
-            item.prepared_excerpt = excerpt
-            item.status = ItemStatus.PREPARED
-            item.message = "Prepared for heavy classification."
-            self.state_store.save_item(item)
-            self.state_store.add_event(
-                item.item_id,
-                "prepare_ready",
-                item.message,
-                payload={
-                    "unpack_dir": str(item.unpack_dir) if item.unpack_dir else "",
-                    "excerpt_words": len(item.prepared_excerpt.split()),
-                },
-            )
-            self.dashboard.begin_agent(source_path, "prepare", item.message)
+            except Exception as error:  # pragma: no cover
+                self._route_to_special(item, self.config.paths.damaged_root, ItemStatus.DAMAGED, str(error))
+                self.dashboard.finish_item(self.state_store.status_counts(), item.message)
+                return None
+
+        try:
+            self.dashboard.begin_agent(source_path, "archivarius", "Running fast classification.")
             try:
-                self.dashboard.advance_agent("prepare", self.state_store.status_counts(), item.message)
+                item, needs_deep = self.archivarius_agent.run(self.context, item, excerpt)
+                self.dashboard.advance_agent("archivarius", self.state_store.status_counts(), item.message)
             finally:
-                self.dashboard.end_agent("prepare")
-            return item.item_id
+                self.dashboard.end_agent("archivarius")
+
+            if needs_deep:
+                item.message = "Queued for deep classification."
+                self.state_store.save_item(item)
+                self.state_store.add_event(
+                    item.item_id,
+                    "queue_deep",
+                    item.message,
+                    payload={"confidence": item.confidence},
+                )
+                return item.item_id
+
+            self.dashboard.begin_agent(source_path, "pack", "Packing normalized archive.")
+            try:
+                with self._pack_slots:
+                    item = self.pack_agent.run(self.context, item)
+                self.dashboard.advance_agent("pack", self.state_store.status_counts(), item.message)
+            finally:
+                self.dashboard.end_agent("pack")
+            self.dashboard.begin_agent(source_path, "placement", "Placing archive into library tree.")
+            try:
+                with self._placement_lock:
+                    self.placement_agent.run(self.context, item)
+                    if self.config.behavior.move_outputs:
+                        self._remove_source_path(item.source_path)
+                self.dashboard.advance_agent("placement", self.state_store.status_counts(), item.message)
+            finally:
+                self.dashboard.end_agent("placement")
+            if self.config.behavior.cleanup_workspace and item.unpack_dir:
+                shutil.rmtree(item.unpack_dir.parent, ignore_errors=True)
+            self.dashboard.finish_item(self.state_store.status_counts(), item.message)
+            return None
         except Exception as error:  # pragma: no cover
             self._route_to_special(item, self.config.paths.damaged_root, ItemStatus.DAMAGED, str(error))
             self.dashboard.finish_item(self.state_store.status_counts(), item.message)
@@ -261,24 +294,12 @@ class LibraryOrchestrator:
             return
 
         try:
-            excerpt_source = item.unpack_dir or item.source_path
-            excerpt = item.prepared_excerpt or collect_excerpt(
-                excerpt_source,
-                self.config.lmstudio.fast_excerpt_words,
-            )
-            self.dashboard.begin_agent(item.source_path, "archivarius", "Running fast classification.")
+            self.dashboard.begin_agent(item.source_path, "expert", "Running deep classification.")
             try:
-                item, needs_deep = self.archivarius_agent.run(self.context, item, excerpt)
-                self.dashboard.advance_agent("archivarius", self.state_store.status_counts(), item.message)
+                item = self.expert_agent.run(self.context, item)
+                self.dashboard.advance_agent("expert", self.state_store.status_counts(), item.message)
             finally:
-                self.dashboard.end_agent("archivarius")
-            if needs_deep:
-                self.dashboard.begin_agent(item.source_path, "expert", "Running deep classification.")
-                try:
-                    item = self.expert_agent.run(self.context, item)
-                    self.dashboard.advance_agent("expert", self.state_store.status_counts(), item.message)
-                finally:
-                    self.dashboard.end_agent("expert")
+                self.dashboard.end_agent("expert")
             self.dashboard.begin_agent(item.source_path, "pack", "Packing normalized archive.")
             try:
                 with self._pack_slots:
