@@ -52,6 +52,7 @@ class LmStudioConfig:
 @dataclass(slots=True)
 class LimitsConfig:
     max_items_per_run: int = 10
+    max_parallel_items: int = 4
     max_parallel_unpack: int = 1
     max_parallel_pack: int = 1
     hdd_busy_threshold_percent: float = 85.0

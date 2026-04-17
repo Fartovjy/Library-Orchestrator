@@ -51,6 +51,15 @@ MAGIC_SIGNATURES: list[tuple[bytes, str]] = [
 ]
 
 
+def should_unpack_with_agent(kind: ContainerKind) -> bool:
+    tool = find_archive_tool()
+    if kind in {ContainerKind.ZIP, ContainerKind.EPUB}:
+        return True
+    if kind in {ContainerKind.RAR, ContainerKind.SEVEN_Z}:
+        return tool is not None
+    return False
+
+
 def detect_container_kind(path: Path) -> ContainerKind:
     if path.is_dir():
         return ContainerKind.DIRECTORY
@@ -136,6 +145,17 @@ def is_supported_unpack_kind(kind: ContainerKind) -> bool:
         ContainerKind.FB2,
         ContainerKind.PDF,
     } or (kind in {ContainerKind.RAR, ContainerKind.SEVEN_Z} and tool is not None)
+
+
+def stage_source(source_path: Path, destination_dir: Path) -> Path:
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    staged_dir = destination_dir / "payload"
+    staged_dir.mkdir(parents=True, exist_ok=True)
+    if source_path.is_dir():
+        shutil.copytree(source_path, staged_dir, dirs_exist_ok=True)
+        return staged_dir
+    shutil.copy2(source_path, staged_dir / source_path.name)
+    return staged_dir
 
 
 def unpack_source(source_path: Path, destination_dir: Path) -> Path:

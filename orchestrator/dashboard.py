@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import sys
 import time
+import threading
 import ctypes
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +28,7 @@ class DashboardState:
     last_message: str = "-"
     started_at: float = field(default_factory=time.monotonic)
     agent_counts: dict[str, int] = field(default_factory=lambda: {name: 0 for name in AGENT_ORDER})
+    active_agent_counts: dict[str, int] = field(default_factory=lambda: {name: 0 for name in AGENT_ORDER})
     status_counts: dict[str, int] = field(default_factory=dict)
     active_agents: tuple[str, ...] = ()
     hotkey_hint: str = "-"
@@ -35,38 +37,69 @@ class DashboardState:
 class TerminalDashboard:
     def __init__(self) -> None:
         self.state = DashboardState()
+        self._lock = threading.RLock()
         self._ansi_ready = self._enable_ansi_if_possible()
 
     def set_total(self, total_items: int) -> None:
-        self.state.total_items = total_items
-        self.render()
+        with self._lock:
+            self.state.total_items = total_items
+            self.render()
 
     def set_hotkey_hint(self, hint: str) -> None:
-        self.state.hotkey_hint = hint
-        self.render()
+        with self._lock:
+            self.state.hotkey_hint = hint
+            self.render()
 
     def set_current(self, item: Path, stage: str, message: str = "") -> None:
-        self.state.current_item = str(item)
-        self.state.current_stage = stage
-        self.state.active_agents = (stage,) if stage in AGENT_ORDER else ()
-        if message:
-            self.state.last_message = message
-        self.render()
+        with self._lock:
+            self.state.current_item = str(item)
+            self.state.current_stage = stage
+            if message:
+                self.state.last_message = message
+            self._refresh_active_agents()
+            self.render()
+
+    def begin_agent(self, item: Path, agent_name: str, message: str = "") -> None:
+        with self._lock:
+            self.state.current_item = str(item)
+            self.state.current_stage = agent_name
+            if agent_name in self.state.active_agent_counts:
+                self.state.active_agent_counts[agent_name] += 1
+            if message:
+                self.state.last_message = message
+            self._refresh_active_agents()
+            self.render()
 
     def advance_agent(self, agent_name: str, status_counts: dict[str, int], message: str = "") -> None:
-        if agent_name in self.state.agent_counts:
-            self.state.agent_counts[agent_name] += 1
-        self.state.status_counts = dict(status_counts)
-        if message:
-            self.state.last_message = message
-        self.render()
+        with self._lock:
+            if agent_name in self.state.agent_counts:
+                self.state.agent_counts[agent_name] += 1
+            self.state.status_counts = dict(status_counts)
+            if message:
+                self.state.last_message = message
+            self._refresh_active_agents()
+            self.render()
+
+    def end_agent(self, agent_name: str, message: str = "") -> None:
+        with self._lock:
+            if agent_name in self.state.active_agent_counts:
+                self.state.active_agent_counts[agent_name] = max(
+                    self.state.active_agent_counts[agent_name] - 1,
+                    0,
+                )
+            if message:
+                self.state.last_message = message
+            self._refresh_active_agents()
+            self.render()
 
     def finish_item(self, status_counts: dict[str, int], message: str = "") -> None:
-        self.state.processed_items += 1
-        self.state.status_counts = dict(status_counts)
-        if message:
-            self.state.last_message = message
-        self.render()
+        with self._lock:
+            self.state.processed_items += 1
+            self.state.status_counts = dict(status_counts)
+            if message:
+                self.state.last_message = message
+            self._refresh_active_agents()
+            self.render()
 
     def render(self) -> None:
         width = shutil.get_terminal_size((100, 30)).columns
@@ -128,10 +161,24 @@ class TerminalDashboard:
         return f"Statuses      : {self._truncate(', '.join(parts), width - 16)}"
 
     def _active_agents_line(self, width: int) -> str:
-        if not self.state.active_agents:
+        total_active = sum(self.state.active_agent_counts.values())
+        if total_active <= 0:
             return "0"
-        value = f"{len(self.state.active_agents)} ({', '.join(self.state.active_agents)})"
+        parts = []
+        for agent_name in AGENT_ORDER:
+            count = self.state.active_agent_counts.get(agent_name, 0)
+            if count <= 0:
+                continue
+            parts.append(f"{agent_name} x{count}")
+        value = f"{total_active} ({', '.join(parts)})"
         return self._truncate(value, width)
+
+    def _refresh_active_agents(self) -> None:
+        active = []
+        for agent_name in AGENT_ORDER:
+            count = self.state.active_agent_counts.get(agent_name, 0)
+            active.extend([agent_name] * max(count, 0))
+        self.state.active_agents = tuple(active)
 
     def _progress_bar(self, percent: float, width: int, fill: str = "=", empty: str = "-") -> str:
         filled = int(round(width * max(0.0, min(percent, 1.0))))

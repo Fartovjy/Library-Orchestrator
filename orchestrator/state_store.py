@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
 from pathlib import Path
 
@@ -11,16 +12,19 @@ from .models import ContainerKind, ItemStatus, WorkItem, utc_now
 class StateStore:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
+        self._lock = threading.RLock()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path)
+        connection = sqlite3.connect(self.db_path, timeout=30.0)
         connection.row_factory = sqlite3.Row
         return connection
 
     def _initialize(self) -> None:
-        with self._connect() as connection:
+        with self._lock, self._connect() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=NORMAL")
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS items (
@@ -75,7 +79,7 @@ class StateStore:
         return item
 
     def get_item_by_source(self, source_path: Path) -> WorkItem | None:
-        with self._connect() as connection:
+        with self._lock, self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM items WHERE source_path = ?",
                 (str(source_path),),
@@ -85,7 +89,7 @@ class StateStore:
         return self._row_to_item(row)
 
     def list_existing_sources(self) -> set[str]:
-        with self._connect() as connection:
+        with self._lock, self._connect() as connection:
             rows = connection.execute("SELECT source_path FROM items").fetchall()
         return {row["source_path"] for row in rows}
 
@@ -97,7 +101,7 @@ class StateStore:
             ItemStatus.TRASH.value,
             ItemStatus.DAMAGED.value,
         )
-        with self._connect() as connection:
+        with self._lock, self._connect() as connection:
             rows = connection.execute(
                 "SELECT source_path FROM items WHERE status IN (?, ?, ?, ?, ?)",
                 terminal_statuses,
@@ -106,7 +110,7 @@ class StateStore:
 
     def save_item(self, item: WorkItem) -> None:
         item.updated_at = utc_now()
-        with self._connect() as connection:
+        with self._lock, self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO items (
@@ -150,7 +154,7 @@ class StateStore:
             )
 
     def add_event(self, item_id: str, stage: str, message: str, payload: dict | None = None) -> None:
-        with self._connect() as connection:
+        with self._lock, self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO events (item_id, stage, message, payload_json, created_at)
@@ -166,7 +170,7 @@ class StateStore:
             )
 
     def register_hash(self, content_hash: str, item_id: str, final_path: Path | None) -> None:
-        with self._connect() as connection:
+        with self._lock, self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO known_hashes (content_hash, item_id, final_path)
@@ -179,14 +183,14 @@ class StateStore:
             )
 
     def find_duplicate(self, content_hash: str) -> sqlite3.Row | None:
-        with self._connect() as connection:
+        with self._lock, self._connect() as connection:
             return connection.execute(
                 "SELECT * FROM known_hashes WHERE content_hash = ?",
                 (content_hash,),
             ).fetchone()
 
     def status_counts(self) -> dict[str, int]:
-        with self._connect() as connection:
+        with self._lock, self._connect() as connection:
             rows = connection.execute(
                 "SELECT status, COUNT(*) AS count FROM items GROUP BY status"
             ).fetchall()

@@ -119,8 +119,9 @@ orchestrator_project/
 - Supported unpack now: directories, plain files, ZIP-like archives, FB2, PDF, `rar`, and `7z`
 - `rar` and `7z` support uses installed Windows tools such as `7-Zip` or `WinRAR`
 - Output normalization is always a ZIP archive with LZMA compression level 9
-- The pipeline is stateful and resumable, but the first build runs items sequentially
-- Queue abstraction and HDD throttling are already in place so we can add worker scaling next
+- The pipeline is stateful, resumable, and processes multiple source items in parallel
+- Fast trash/manual-review routing can proceed while LM Studio is classifying other files
+- Queue abstraction, worker limits, and HDD throttling are in place for controlled scaling
 - Discovery order is breadth-first: current folder level first, then subfolders
 - Smaller files are scheduled before larger ones within each folder level
 - Non-book binaries are filtered using file signatures, not only filename extensions
