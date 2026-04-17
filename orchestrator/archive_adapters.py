@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import functools
 import hashlib
 import html
 import re
 import shutil
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -125,6 +127,7 @@ def classify_file_role(path: Path) -> str:
 
 
 def is_supported_unpack_kind(kind: ContainerKind) -> bool:
+    tool = find_archive_tool()
     return kind in {
         ContainerKind.DIRECTORY,
         ContainerKind.FILE,
@@ -132,7 +135,7 @@ def is_supported_unpack_kind(kind: ContainerKind) -> bool:
         ContainerKind.EPUB,
         ContainerKind.FB2,
         ContainerKind.PDF,
-    }
+    } or (kind in {ContainerKind.RAR, ContainerKind.SEVEN_Z} and tool is not None)
 
 
 def unpack_source(source_path: Path, destination_dir: Path) -> Path:
@@ -146,6 +149,9 @@ def unpack_source(source_path: Path, destination_dir: Path) -> Path:
     if kind in {ContainerKind.ZIP, ContainerKind.EPUB}:
         with zipfile.ZipFile(source_path) as archive:
             archive.extractall(unpack_dir)
+        return unpack_dir
+    if kind in {ContainerKind.RAR, ContainerKind.SEVEN_Z}:
+        extract_with_external_tool(source_path, unpack_dir)
         return unpack_dir
     shutil.copy2(source_path, unpack_dir / source_path.name)
     return unpack_dir
@@ -162,6 +168,8 @@ def collect_excerpt(source_path: Path, max_words: int) -> str:
         return ""
     if kind in {ContainerKind.ZIP, ContainerKind.EPUB}:
         return _excerpt_from_zip(source_path, max_words)
+    if kind in {ContainerKind.RAR, ContainerKind.SEVEN_Z}:
+        return ""
     return _excerpt_from_file(source_path, max_words)
 
 
@@ -290,3 +298,43 @@ def is_iso_image(path: Path) -> bool:
         return marker[1:6] == b"CD001"
     except OSError:
         return False
+
+
+@functools.lru_cache(maxsize=1)
+def find_archive_tool() -> Path | None:
+    candidates = [
+        Path(r"C:\Program Files\7-Zip\7z.exe"),
+        Path(r"C:\Program Files (x86)\7-Zip\7z.exe"),
+        Path(r"C:\Program Files\WinRAR\UnRAR.exe"),
+        Path(r"C:\Program Files\WinRAR\WinRAR.exe"),
+        Path(r"C:\Program Files (x86)\WinRAR\UnRAR.exe"),
+        Path(r"C:\Program Files (x86)\WinRAR\WinRAR.exe"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def extract_with_external_tool(source_path: Path, output_dir: Path) -> None:
+    tool = find_archive_tool()
+    if tool is None:
+        raise RuntimeError("No external extractor found for RAR/7Z archives.")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lower_name = tool.name.lower()
+    if lower_name == "7z.exe":
+        command = [str(tool), "x", "-y", f"-o{output_dir}", str(source_path)]
+    elif lower_name == "unrar.exe":
+        command = [str(tool), "x", "-o+", str(source_path), str(output_dir)]
+    else:
+        command = [str(tool), "x", "-ibck", "-y", str(source_path), str(output_dir)]
+    completed = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        details = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
+        raise RuntimeError(f"Archive extraction failed: {details}")

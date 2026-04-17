@@ -22,5 +22,6 @@ class UnpackAgent(BaseAgent):
         item.message = "Source unpacked into workspace."
         context.state_store.save_item(item)
         context.state_store.add_event(item.item_id, self.name, item.message)
-        excerpt = collect_excerpt(item.source_path, context.config.lmstudio.fast_excerpt_words)
+        excerpt_source = item.unpack_dir or item.source_path
+        excerpt = collect_excerpt(excerpt_source, context.config.lmstudio.fast_excerpt_words)
         return item, excerpt

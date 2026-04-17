@@ -116,8 +116,8 @@ orchestrator_project/
 
 ## Current Scope Of This First Build
 
-- Supported unpack now: directories, plain files, ZIP-like archives, FB2, PDF
-- Unsupported archives such as `rar` and `7z` are routed to manual review for now
+- Supported unpack now: directories, plain files, ZIP-like archives, FB2, PDF, `rar`, and `7z`
+- `rar` and `7z` support uses installed Windows tools such as `7-Zip` or `WinRAR`
 - Output normalization is always a ZIP archive with LZMA compression level 9
 - The pipeline is stateful and resumable, but the first build runs items sequentially
 - Queue abstraction and HDD throttling are already in place so we can add worker scaling next
