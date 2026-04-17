@@ -240,7 +240,12 @@ class LibraryOrchestrator:
             self.dashboard.begin_agent(source_path, "archivarius", "Running fast classification.")
             try:
                 item, needs_deep = self.archivarius_agent.run(self.context, item, excerpt)
-                self.dashboard.advance_agent("archivarius", self.state_store.status_counts(), item.message)
+                self.dashboard.advance_agent(
+                    "archivarius",
+                    self.state_store.status_counts(),
+                    item.message,
+                    recognition_percent=item.confidence,
+                )
             finally:
                 self.dashboard.end_agent("archivarius")
 
@@ -297,7 +302,12 @@ class LibraryOrchestrator:
             self.dashboard.begin_agent(item.source_path, "expert", "Running deep classification.")
             try:
                 item = self.expert_agent.run(self.context, item)
-                self.dashboard.advance_agent("expert", self.state_store.status_counts(), item.message)
+                self.dashboard.advance_agent(
+                    "expert",
+                    self.state_store.status_counts(),
+                    item.message,
+                    recognition_percent=item.confidence,
+                )
             finally:
                 self.dashboard.end_agent("expert")
             self.dashboard.begin_agent(item.source_path, "pack", "Packing normalized archive.")

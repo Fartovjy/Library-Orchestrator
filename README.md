@@ -110,6 +110,7 @@ orchestrator_project/
 - duplicate routing, manual-review routing, trash routing, and damaged-file routing
 - CLI commands for `run`, `status`, `stop`, and `clear-stop`
 - terminal dashboard with current file, current stage, global progress, and per-agent progress
+- dashboard agent table includes both completion percent and average recognition percent for classifiers
 - file-type detection by magic bytes before LM Studio classification
 - Windows terminal dashboard with ANSI re-rendering and active-agent indicator
 - Safe stop hotkeys in the running console: `Ctrl+X`, `Esc`, or `Q`

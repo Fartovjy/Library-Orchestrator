@@ -29,6 +29,8 @@ class DashboardState:
     last_message: str = "-"
     started_at: float = field(default_factory=time.monotonic)
     agent_counts: dict[str, int] = field(default_factory=lambda: {name: 0 for name in AGENT_ORDER})
+    agent_recognition_sums: dict[str, float] = field(default_factory=lambda: {name: 0.0 for name in AGENT_ORDER})
+    agent_recognition_counts: dict[str, int] = field(default_factory=lambda: {name: 0 for name in AGENT_ORDER})
     active_agent_counts: dict[str, int] = field(default_factory=lambda: {name: 0 for name in AGENT_ORDER})
     status_counts: dict[str, int] = field(default_factory=dict)
     active_agents: tuple[str, ...] = ()
@@ -71,10 +73,20 @@ class TerminalDashboard:
             self._refresh_active_agents()
             self.render()
 
-    def advance_agent(self, agent_name: str, status_counts: dict[str, int], message: str = "") -> None:
+    def advance_agent(
+        self,
+        agent_name: str,
+        status_counts: dict[str, int],
+        message: str = "",
+        recognition_percent: float | None = None,
+    ) -> None:
         with self._lock:
             if agent_name in self.state.agent_counts:
                 self.state.agent_counts[agent_name] += 1
+            if recognition_percent is not None and agent_name in self.state.agent_recognition_sums:
+                bounded = max(0.0, min(recognition_percent, 1.0))
+                self.state.agent_recognition_sums[agent_name] += bounded
+                self.state.agent_recognition_counts[agent_name] += 1
             self.state.status_counts = dict(status_counts)
             if message:
                 self.state.last_message = message
@@ -135,13 +147,14 @@ class TerminalDashboard:
         name_width = 12
         count_width = 9
         percent_width = 9
-        bar_width = min(max(width - (name_width + count_width + percent_width + 13), 10), 30)
+        recognized_width = 11
+        bar_width = min(max(width - (name_width + count_width + percent_width + recognized_width + 16), 10), 30)
         header = (
-            f"+{'-' * name_width}+{'-' * count_width}+{'-' * percent_width}+{'-' * (bar_width + 2)}+"
+            f"+{'-' * name_width}+{'-' * count_width}+{'-' * percent_width}+{'-' * recognized_width}+{'-' * (bar_width + 2)}+"
         )
         lines = [
             header,
-            f"| {'agent'.ljust(name_width - 1)}| {'done'.ljust(count_width - 1)}| {'percent'.ljust(percent_width - 1)}| {'progress'.ljust(bar_width + 1)}|",
+            f"| {'agent'.ljust(name_width - 1)}| {'done'.ljust(count_width - 1)}| {'percent'.ljust(percent_width - 1)}| {'recognized'.ljust(recognized_width - 1)}| {'progress'.ljust(bar_width + 1)}|",
             header,
         ]
         total = max(self.state.total_items, 1)
@@ -149,8 +162,14 @@ class TerminalDashboard:
             count = self.state.agent_counts.get(agent_name, 0)
             percent = min(count / total, 1.0)
             bar = self._progress_bar(percent, width=bar_width, fill="#", empty=".")
+            recognition_count = self.state.agent_recognition_counts.get(agent_name, 0)
+            if recognition_count > 0:
+                recognition_avg = self.state.agent_recognition_sums.get(agent_name, 0.0) / recognition_count
+                recognition_text = f"{recognition_avg * 100:5.1f}%"
+            else:
+                recognition_text = "-"
             lines.append(
-                f"| {agent_name.ljust(name_width - 1)}| {str(count).ljust(count_width - 1)}| {f'{percent * 100:5.1f}%'.ljust(percent_width - 1)}| {bar.ljust(bar_width + 1)}|"
+                f"| {agent_name.ljust(name_width - 1)}| {str(count).ljust(count_width - 1)}| {f'{percent * 100:5.1f}%'.ljust(percent_width - 1)}| {recognition_text.ljust(recognized_width - 1)}| {bar.ljust(bar_width + 1)}|"
             )
         lines.append(header)
         return "\n".join(lines)
