@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local runtime data
+runtime/
+
+# OS / editor
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Local stop / temp artifacts
+STOP

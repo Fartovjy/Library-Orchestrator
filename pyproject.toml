@@ -1,0 +1,19 @@
+[project]
+name = "library-orchestrator"
+version = "0.1.0"
+description = "Multi-agent orchestrator for library normalization and cataloging."
+requires-python = ">=3.10"
+dependencies = [
+  "psutil>=5.9",
+  "requests>=2.31",
+]
+
+[project.scripts]
+library-orchestrator = "orchestrator.main:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["orchestrator*"]
