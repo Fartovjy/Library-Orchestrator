@@ -12,6 +12,7 @@ from pathlib import Path
 AGENT_ORDER = [
     "discovery",
     "unpack",
+    "prepare",
     "archivarius",
     "expert",
     "pack",

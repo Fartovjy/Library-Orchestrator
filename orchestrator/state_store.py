@@ -39,6 +39,7 @@ class StateStore:
                     confidence REAL NOT NULL,
                     source_hash TEXT NOT NULL,
                     packed_hash TEXT NOT NULL,
+                    prepared_excerpt TEXT NOT NULL DEFAULT '',
                     unpack_dir TEXT,
                     packed_path TEXT,
                     final_path TEXT,
@@ -63,6 +64,14 @@ class StateStore:
                 );
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(items)").fetchall()
+            }
+            if "prepared_excerpt" not in columns:
+                connection.execute(
+                    "ALTER TABLE items ADD COLUMN prepared_excerpt TEXT NOT NULL DEFAULT ''"
+                )
 
     def get_or_create_item(self, source_path: Path, container_kind: ContainerKind) -> WorkItem:
         existing = self.get_item_by_source(source_path)
@@ -108,6 +117,29 @@ class StateStore:
             ).fetchall()
         return {row["source_path"] for row in rows}
 
+    def get_item_by_id(self, item_id: str) -> WorkItem | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM items WHERE item_id = ?",
+                (item_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_item(row)
+
+    def list_ready_for_heavy_item_ids(self) -> list[str]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT item_id
+                FROM items
+                WHERE status = ?
+                ORDER BY updated_at, created_at, item_id
+                """,
+                (ItemStatus.PREPARED.value,),
+            ).fetchall()
+        return [row["item_id"] for row in rows]
+
     def save_item(self, item: WorkItem) -> None:
         item.updated_at = utc_now()
         with self._lock, self._connect() as connection:
@@ -115,9 +147,9 @@ class StateStore:
                 """
                 INSERT INTO items (
                     item_id, source_path, source_name, container_kind, status, author, title,
-                    genre, confidence, source_hash, packed_hash, unpack_dir, packed_path,
+                    genre, confidence, source_hash, packed_hash, prepared_excerpt, unpack_dir, packed_path,
                     final_path, message, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(item_id) DO UPDATE SET
                     status=excluded.status,
                     author=excluded.author,
@@ -126,6 +158,7 @@ class StateStore:
                     confidence=excluded.confidence,
                     source_hash=excluded.source_hash,
                     packed_hash=excluded.packed_hash,
+                    prepared_excerpt=excluded.prepared_excerpt,
                     unpack_dir=excluded.unpack_dir,
                     packed_path=excluded.packed_path,
                     final_path=excluded.final_path,
@@ -144,6 +177,7 @@ class StateStore:
                     item.confidence,
                     item.source_hash,
                     item.packed_hash,
+                    item.prepared_excerpt,
                     str(item.unpack_dir) if item.unpack_dir else None,
                     str(item.packed_path) if item.packed_path else None,
                     str(item.final_path) if item.final_path else None,
@@ -209,6 +243,7 @@ class StateStore:
             confidence=float(row["confidence"]),
             source_hash=row["source_hash"],
             packed_hash=row["packed_hash"],
+            prepared_excerpt=row["prepared_excerpt"] or "",
             unpack_dir=Path(row["unpack_dir"]) if row["unpack_dir"] else None,
             packed_path=Path(row["packed_path"]) if row["packed_path"] else None,
             final_path=Path(row["final_path"]) if row["final_path"] else None,

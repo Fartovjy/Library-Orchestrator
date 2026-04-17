@@ -57,7 +57,6 @@ class LibraryOrchestrator:
         self.expert_agent = ExpertAgent()
         self.pack_agent = PackAgent()
         self.placement_agent = PlacementAgent()
-        self._heavy_slots = threading.Semaphore(max(1, self.config.limits.max_parallel_heavy_agents))
         self._unpack_slots = threading.Semaphore(max(1, self.config.limits.max_parallel_unpack))
         self._pack_slots = threading.Semaphore(max(1, self.config.limits.max_parallel_pack))
         self._placement_lock = threading.Lock()
@@ -73,14 +72,38 @@ class LibraryOrchestrator:
         if limit == 0:
             self.dashboard.set_total(0)
             return self.state_store.status_counts()
-        sources = deque(self._discover_sources(limit=limit))
-        self.dashboard.set_total(len(sources))
-        max_workers = max(1, self.config.limits.max_parallel_items)
-        pending: dict[Future[None], Path] = {}
+        recovered_item_ids = deque(self.state_store.list_ready_for_heavy_item_ids())
+        recovered_sources = set()
+        for item_id in recovered_item_ids:
+            item = self.state_store.get_item_by_id(item_id)
+            if item is not None:
+                recovered_sources.add(str(item.source_path))
+
+        discovered_sources = self._discover_sources(limit=limit)
+        sources = deque(
+            source_path
+            for source_path in discovered_sources
+            if str(source_path) not in recovered_sources
+        )
+        self.dashboard.set_total(len(sources) + len(recovered_item_ids))
+        max_light_workers = max(1, self.config.limits.max_parallel_items)
+        max_heavy_workers = max(1, self.config.limits.max_parallel_heavy_agents)
+        pending_light: dict[Future[str | None], Path] = {}
+        pending_heavy: dict[Future[None], str] = {}
+        ready_for_heavy = deque(recovered_item_ids)
+        queued_heavy_ids = set(recovered_item_ids)
         stop_requested = False
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="orchestrator") as executor:
-            while sources or pending:
-                while not stop_requested and sources and len(pending) < max_workers:
+        with (
+            ThreadPoolExecutor(max_workers=max_light_workers, thread_name_prefix="light") as light_executor,
+            ThreadPoolExecutor(max_workers=max_heavy_workers, thread_name_prefix="heavy") as heavy_executor,
+        ):
+            while sources or pending_light or ready_for_heavy or pending_heavy:
+                while not stop_requested and ready_for_heavy and len(pending_heavy) < max_heavy_workers:
+                    item_id = ready_for_heavy.popleft()
+                    future = heavy_executor.submit(self.finish_prepared_item, item_id)
+                    pending_heavy[future] = item_id
+
+                while not stop_requested and sources and len(pending_light) < max_light_workers:
                     source_path = sources.popleft()
                     if self._try_process_special_source(source_path):
                         continue
@@ -92,36 +115,52 @@ class LibraryOrchestrator:
                             break
                     if stop_requested:
                         break
-                    future = executor.submit(self.process_source, source_path)
-                    pending[future] = source_path
+                    future = light_executor.submit(self.prepare_source, source_path)
+                    pending_light[future] = source_path
 
-                if not pending:
+                if not pending_light and not pending_heavy:
                     if stop_requested:
                         break
                     continue
 
-                if not stop_requested and sources and len(pending) >= max_workers:
+                if not stop_requested and sources and len(pending_light) >= max_light_workers:
                     if self._drain_special_sources(sources):
                         continue
 
-                done, _ = wait(tuple(pending), timeout=0.2, return_when=FIRST_COMPLETED)
+                wait_targets = tuple(list(pending_light) + list(pending_heavy))
+                done, _ = wait(wait_targets, timeout=0.2, return_when=FIRST_COMPLETED)
                 if not done:
                     if self._poll_stop_requested():
                         stop_requested = True
                     continue
 
                 for future in done:
-                    source_path = pending.pop(future)
+                    if future in pending_light:
+                        source_path = pending_light.pop(future)
+                        try:
+                            item_id = future.result()
+                            if item_id and item_id not in queued_heavy_ids:
+                                ready_for_heavy.append(item_id)
+                                queued_heavy_ids.add(item_id)
+                        except Exception as error:  # pragma: no cover
+                            self.dashboard.set_current(source_path, "failed", f"Unhandled light worker error: {error}")
+                            self.dashboard.finish_item(self.state_store.status_counts(), f"Unhandled light worker error: {error}")
+                        continue
+
+                    item_id = pending_heavy.pop(future)
+                    queued_heavy_ids.discard(item_id)
                     try:
                         future.result()
                     except Exception as error:  # pragma: no cover
-                        self.dashboard.set_current(source_path, "failed", f"Unhandled worker error: {error}")
-                        self.dashboard.finish_item(self.state_store.status_counts(), f"Unhandled worker error: {error}")
+                        item = self.state_store.get_item_by_id(item_id)
+                        target = item.source_path if item is not None else self.config.paths.source_root
+                        self.dashboard.set_current(target, "failed", f"Unhandled heavy worker error: {error}")
+                        self.dashboard.finish_item(self.state_store.status_counts(), f"Unhandled heavy worker error: {error}")
                 if self._poll_stop_requested():
                     stop_requested = True
         return self.state_store.status_counts()
 
-    def process_source(self, source_path: Path) -> None:
+    def prepare_source(self, source_path: Path) -> str | None:
         self.dashboard.set_current(source_path, "discovery", "Item scheduled for processing.")
         container_kind = detect_container_kind(source_path)
         item = self.state_store.get_or_create_item(source_path, container_kind)
@@ -134,7 +173,14 @@ class LibraryOrchestrator:
             ItemStatus.DAMAGED,
         }:
             self.dashboard.finish_item(self.state_store.status_counts(), f"Skipped already processed item: {item.source_name}")
-            return
+            return None
+        if item.status == ItemStatus.PREPARED and item.unpack_dir and item.unpack_dir.exists():
+            self.dashboard.begin_agent(source_path, "prepare", "Prepared item already waiting for heavy processing.")
+            try:
+                self.dashboard.advance_agent("prepare", self.state_store.status_counts(), item.message or "Prepared item already waiting for heavy processing.")
+            finally:
+                self.dashboard.end_agent("prepare")
+            return item.item_id
         file_role = classify_file_role(source_path)
         if (
             source_path.suffix.lower() in set(self.config.behavior.trash_extensions)
@@ -142,11 +188,11 @@ class LibraryOrchestrator:
         ):
             self._route_to_special(item, self.config.paths.trash_root, ItemStatus.TRASH, "Detected as trash by extension or file signature.")
             self.dashboard.finish_item(self.state_store.status_counts(), item.message)
-            return
+            return None
         if file_role == "unknown" and source_path.is_file():
             self._route_to_special(item, self.config.paths.manual_review_root, ItemStatus.MANUAL_REVIEW, "Unknown file type by extension and signature.")
             self.dashboard.finish_item(self.state_store.status_counts(), item.message)
-            return
+            return None
         item.source_hash = compute_sha256(source_path)
         self.state_store.save_item(item)
         if should_unpack_with_agent(item.container_kind):
@@ -161,41 +207,86 @@ class LibraryOrchestrator:
                     self.dashboard.advance_agent("unpack", self.state_store.status_counts(), item.message)
                     if item.status == ItemStatus.MANUAL_REVIEW:
                         self.dashboard.finish_item(self.state_store.status_counts(), item.message)
-                        return
+                        return None
                 finally:
                     self.dashboard.end_agent("unpack")
             else:
-                item.unpack_dir = stage_source(item.source_path, self.context.workspace_root / item.item_id)
-                self.state_store.save_item(item)
-                self.state_store.add_event(
-                    item.item_id,
-                    "prepare",
-                    "Source staged into workspace without archive unpack.",
-                    payload={"unpack_dir": str(item.unpack_dir)},
-                )
-                excerpt = collect_excerpt(item.unpack_dir, self.config.lmstudio.fast_excerpt_words)
-            with self._heavy_slots:
-                self.dashboard.begin_agent(source_path, "archivarius", "Running fast classification.")
+                self.dashboard.begin_agent(source_path, "prepare", "Staging source into workspace.")
                 try:
-                    item, needs_deep = self.archivarius_agent.run(self.context, item, excerpt)
-                    self.dashboard.advance_agent("archivarius", self.state_store.status_counts(), item.message)
+                    item.unpack_dir = stage_source(item.source_path, self.context.workspace_root / item.item_id)
+                    excerpt = collect_excerpt(item.unpack_dir, self.config.lmstudio.fast_excerpt_words)
+                    self.state_store.add_event(
+                        item.item_id,
+                        "prepare",
+                        "Source staged into workspace without archive unpack.",
+                        payload={"unpack_dir": str(item.unpack_dir)},
+                    )
                 finally:
-                    self.dashboard.end_agent("archivarius")
-                if needs_deep:
-                    self.dashboard.begin_agent(source_path, "expert", "Running deep classification.")
-                    try:
-                        item = self.expert_agent.run(self.context, item)
-                        self.dashboard.advance_agent("expert", self.state_store.status_counts(), item.message)
-                    finally:
-                        self.dashboard.end_agent("expert")
-            self.dashboard.begin_agent(source_path, "pack", "Packing normalized archive.")
+                    self.dashboard.end_agent("prepare")
+            item.prepared_excerpt = excerpt
+            item.status = ItemStatus.PREPARED
+            item.message = "Prepared for heavy classification."
+            self.state_store.save_item(item)
+            self.state_store.add_event(
+                item.item_id,
+                "prepare_ready",
+                item.message,
+                payload={
+                    "unpack_dir": str(item.unpack_dir) if item.unpack_dir else "",
+                    "excerpt_words": len(item.prepared_excerpt.split()),
+                },
+            )
+            self.dashboard.begin_agent(source_path, "prepare", item.message)
+            try:
+                self.dashboard.advance_agent("prepare", self.state_store.status_counts(), item.message)
+            finally:
+                self.dashboard.end_agent("prepare")
+            return item.item_id
+        except Exception as error:  # pragma: no cover
+            self._route_to_special(item, self.config.paths.damaged_root, ItemStatus.DAMAGED, str(error))
+            self.dashboard.finish_item(self.state_store.status_counts(), item.message)
+            return None
+
+    def finish_prepared_item(self, item_id: str) -> None:
+        item = self.state_store.get_item_by_id(item_id)
+        if item is None:
+            return
+        if item.status in {
+            ItemStatus.PLACED,
+            ItemStatus.DUPLICATE,
+            ItemStatus.MANUAL_REVIEW,
+            ItemStatus.TRASH,
+            ItemStatus.DAMAGED,
+        }:
+            return
+
+        try:
+            excerpt_source = item.unpack_dir or item.source_path
+            excerpt = item.prepared_excerpt or collect_excerpt(
+                excerpt_source,
+                self.config.lmstudio.fast_excerpt_words,
+            )
+            self.dashboard.begin_agent(item.source_path, "archivarius", "Running fast classification.")
+            try:
+                item, needs_deep = self.archivarius_agent.run(self.context, item, excerpt)
+                self.dashboard.advance_agent("archivarius", self.state_store.status_counts(), item.message)
+            finally:
+                self.dashboard.end_agent("archivarius")
+            if needs_deep:
+                self.dashboard.begin_agent(item.source_path, "expert", "Running deep classification.")
+                try:
+                    item = self.expert_agent.run(self.context, item)
+                    self.dashboard.advance_agent("expert", self.state_store.status_counts(), item.message)
+                finally:
+                    self.dashboard.end_agent("expert")
+            self.dashboard.begin_agent(item.source_path, "pack", "Packing normalized archive.")
             try:
                 with self._pack_slots:
                     item = self.pack_agent.run(self.context, item)
                 self.dashboard.advance_agent("pack", self.state_store.status_counts(), item.message)
             finally:
                 self.dashboard.end_agent("pack")
-            self.dashboard.begin_agent(source_path, "placement", "Placing archive into library tree.")
+            self.dashboard.begin_agent(item.source_path, "placement", "Placing archive into library tree.")
             try:
                 with self._placement_lock:
                     self.placement_agent.run(self.context, item)

@@ -13,6 +13,7 @@ def utc_now() -> str:
 class ItemStatus(StrEnum):
     DISCOVERED = "discovered"
     UNPACKED = "unpacked"
+    PREPARED = "prepared"
     CLASSIFIED_FAST = "classified_fast"
     CLASSIFIED_DEEP = "classified_deep"
     PACKED = "packed"
@@ -39,6 +40,7 @@ class ContainerKind(StrEnum):
 class QueueStage(StrEnum):
     DISCOVERY = "discovery"
     UNPACK = "unpack"
+    PREPARE = "prepare"
     FAST_CLASSIFY = "fast_classify"
     DEEP_CLASSIFY = "deep_classify"
     PACK = "pack"
@@ -69,6 +71,7 @@ class WorkItem:
     confidence: float = 0.0
     source_hash: str = ""
     packed_hash: str = ""
+    prepared_excerpt: str = ""
     unpack_dir: Path | None = None
     packed_path: Path | None = None
     final_path: Path | None = None
