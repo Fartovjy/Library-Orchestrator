@@ -23,6 +23,7 @@
   "limits": {
     "max_items_per_run": 10,
     "max_parallel_items": 4,
+    "max_parallel_heavy_agents": 1,
     "max_parallel_unpack": 1,
     "max_parallel_pack": 1,
     "hdd_busy_threshold_percent": 85.0,

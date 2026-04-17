@@ -121,6 +121,7 @@ orchestrator_project/
 - Output normalization is always a ZIP archive with LZMA compression level 9
 - The pipeline is stateful, resumable, and processes multiple source items in parallel
 - Fast trash/manual-review routing can proceed while LM Studio is classifying other files
+- Typical tuning is 4 light workers with 1 shared heavy LM classification slot
 - Queue abstraction, worker limits, and HDD throttling are in place for controlled scaling
 - Discovery order is breadth-first: current folder level first, then subfolders
 - Smaller files are scheduled before larger ones within each folder level

@@ -57,6 +57,7 @@ class LibraryOrchestrator:
         self.expert_agent = ExpertAgent()
         self.pack_agent = PackAgent()
         self.placement_agent = PlacementAgent()
+        self._heavy_slots = threading.Semaphore(max(1, self.config.limits.max_parallel_heavy_agents))
         self._unpack_slots = threading.Semaphore(max(1, self.config.limits.max_parallel_unpack))
         self._pack_slots = threading.Semaphore(max(1, self.config.limits.max_parallel_pack))
         self._placement_lock = threading.Lock()
@@ -173,19 +174,20 @@ class LibraryOrchestrator:
                     payload={"unpack_dir": str(item.unpack_dir)},
                 )
                 excerpt = collect_excerpt(item.unpack_dir, self.config.lmstudio.fast_excerpt_words)
-            self.dashboard.begin_agent(source_path, "archivarius", "Running fast classification.")
-            try:
-                item, needs_deep = self.archivarius_agent.run(self.context, item, excerpt)
-                self.dashboard.advance_agent("archivarius", self.state_store.status_counts(), item.message)
-            finally:
-                self.dashboard.end_agent("archivarius")
-            if needs_deep:
-                self.dashboard.begin_agent(source_path, "expert", "Running deep classification.")
+            with self._heavy_slots:
+                self.dashboard.begin_agent(source_path, "archivarius", "Running fast classification.")
                 try:
-                    item = self.expert_agent.run(self.context, item)
-                    self.dashboard.advance_agent("expert", self.state_store.status_counts(), item.message)
+                    item, needs_deep = self.archivarius_agent.run(self.context, item, excerpt)
+                    self.dashboard.advance_agent("archivarius", self.state_store.status_counts(), item.message)
                 finally:
-                    self.dashboard.end_agent("expert")
+                    self.dashboard.end_agent("archivarius")
+                if needs_deep:
+                    self.dashboard.begin_agent(source_path, "expert", "Running deep classification.")
+                    try:
+                        item = self.expert_agent.run(self.context, item)
+                        self.dashboard.advance_agent("expert", self.state_store.status_counts(), item.message)
+                    finally:
+                        self.dashboard.end_agent("expert")
             self.dashboard.begin_agent(source_path, "pack", "Packing normalized archive.")
             try:
                 with self._pack_slots:
