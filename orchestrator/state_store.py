@@ -698,6 +698,19 @@ class StateStore:
             ).fetchall()
         return {row["status"]: int(row["count"]) for row in rows}
 
+    def batch_status_counts(self, batch_id: str) -> dict[str, int]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM items
+                WHERE batch_id = ?
+                GROUP BY status
+                """,
+                (batch_id,),
+            ).fetchall()
+        return {row["status"]: int(row["count"]) for row in rows}
+
     def _row_to_batch(self, row: sqlite3.Row | None) -> BatchRun | None:
         if row is None:
             return None

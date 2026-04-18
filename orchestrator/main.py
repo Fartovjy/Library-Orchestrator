@@ -39,7 +39,17 @@ def main() -> int:
         return 0
 
     if args.command == "status":
-        print(json.dumps(orchestrator.state_store.status_counts(), ensure_ascii=False, indent=2))
+        active_batch = orchestrator.state_store.get_active_batch()
+        if active_batch is not None:
+            print(
+                json.dumps(
+                    orchestrator.state_store.batch_status_counts(active_batch.batch_id),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(json.dumps(orchestrator.state_store.status_counts(), ensure_ascii=False, indent=2))
         return 0
 
     if args.command == "repair":

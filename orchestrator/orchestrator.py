@@ -191,7 +191,7 @@ class LibraryOrchestrator:
                 future.result()
 
         self._sync_dashboard(batch.batch_id, "Batch completed.")
-        return self.state_store.status_counts()
+        return self.state_store.batch_status_counts(batch.batch_id)
 
     def _prepare_batch(self, limit: int | None) -> BatchRun:
         active_batch = self.state_store.get_active_batch()
