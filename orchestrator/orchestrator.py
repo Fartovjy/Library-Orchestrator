@@ -21,6 +21,8 @@ from .archive_adapters import (
     collect_excerpt,
     compute_sha256,
     detect_container_kind,
+    EMPTY_ZIP_SHA256,
+    is_valid_packed_archive,
     should_unpack_with_agent,
     stage_source,
 )
@@ -177,6 +179,7 @@ class LibraryOrchestrator:
         active_batch = self.state_store.get_active_batch()
         if active_batch is not None and self.state_store.batch_has_pending_work(active_batch.batch_id):
             self.state_store.reset_claimed_tasks(active_batch.batch_id)
+            self._repair_invalid_packs(active_batch.batch_id)
             return active_batch
         if active_batch is not None:
             self.state_store.finalize_batch(active_batch.batch_id)
@@ -413,6 +416,7 @@ class LibraryOrchestrator:
         return item.message, None
 
     def _process_placement_task(self, batch_id: str, item) -> tuple[str, float | None]:
+        item = self._ensure_pack_ready_for_placement(item)
         with self._placement_lock:
             item = self.placement_agent.run(self.context, item)
             if self.config.behavior.move_outputs:
@@ -621,3 +625,111 @@ class LibraryOrchestrator:
             self._remove_source_path(root_item.source_path)
         if root_item.unpack_dir:
             shutil.rmtree(root_item.unpack_dir.parent, ignore_errors=True)
+
+    def _repair_invalid_packs(self, batch_id: str) -> None:
+        repaired = 0
+        unrecoverable = 0
+        for item in self.state_store.list_items_with_hash(batch_id, EMPTY_ZIP_SHA256):
+            if self._repair_invalid_packed_item(batch_id, item):
+                repaired += 1
+            else:
+                unrecoverable += 1
+        if repaired or unrecoverable:
+            self._sync_dashboard(
+                batch_id,
+                f"Recovered {repaired} empty archives; {unrecoverable} item(s) need manual recovery.",
+            )
+
+    def _repair_invalid_packed_item(self, batch_id: str, item) -> bool:
+        deleted_outputs = self._discard_invalid_archives(item)
+        item.packed_path = None
+        item.packed_hash = ""
+        if deleted_outputs:
+            item.final_path = None
+
+        if item.unpack_dir and item.unpack_dir.exists():
+            item.status = ItemStatus.PREPARED
+            item.message = "Invalid packed archive detected. Requeued for repack from workspace."
+            self.state_store.save_item(item)
+            self.state_store.delete_task(batch_id, item.item_id, TaskStage.PLACEMENT)
+            self.state_store.ensure_task(batch_id, item.item_id, TaskStage.PACK)
+            self.state_store.add_event(item.item_id, "repair", item.message)
+            return True
+
+        if item.source_path.exists():
+            item.unpack_dir = None
+            item.status = ItemStatus.DISCOVERED
+            item.message = "Invalid packed archive detected. Requeued from source."
+            self.state_store.save_item(item)
+            for stage in (
+                TaskStage.UNPACK,
+                TaskStage.SPLITTER,
+                TaskStage.PREPARE,
+                TaskStage.ARCHIVARIUS,
+                TaskStage.EXPERT,
+                TaskStage.PACK,
+                TaskStage.PLACEMENT,
+            ):
+                self.state_store.delete_task(batch_id, item.item_id, stage)
+            self._schedule_child_item(batch_id, item)
+            self.state_store.add_event(item.item_id, "repair", item.message)
+            return True
+
+        item.status = ItemStatus.DAMAGED
+        item.message = "Invalid packed archive detected, but source data is no longer available for rebuild."
+        self.state_store.save_item(item)
+        self.state_store.delete_task(batch_id, item.item_id, TaskStage.PACK)
+        self.state_store.delete_task(batch_id, item.item_id, TaskStage.PLACEMENT)
+        self.state_store.add_event(item.item_id, "repair", item.message)
+        return False
+
+    def _discard_invalid_archives(self, item) -> bool:
+        deleted_any = False
+        for path in (item.packed_path, item.final_path):
+            if path is None or not path.exists():
+                continue
+            if is_valid_packed_archive(path):
+                continue
+            path.unlink(missing_ok=True)
+            deleted_any = True
+        return deleted_any
+
+    def _ensure_pack_ready_for_placement(self, item):
+        if (
+            item.packed_path
+            and item.packed_hash
+            and item.packed_hash != EMPTY_ZIP_SHA256
+            and is_valid_packed_archive(item.packed_path)
+        ):
+            return item
+
+        self._discard_invalid_archives(item)
+        item.packed_path = None
+        item.packed_hash = ""
+
+        if item.unpack_dir is None or not item.unpack_dir.exists():
+            if not item.source_path.exists():
+                raise RuntimeError("Packed archive is invalid and source data is unavailable.")
+            if should_unpack_with_agent(item.container_kind):
+                with self._unpack_slots:
+                    item, excerpt = self.unpack_agent.run(self.context, item)
+                item.prepared_excerpt = excerpt
+                self.state_store.save_item(item)
+            else:
+                item.unpack_dir, nested_count = stage_source(
+                    item.source_path,
+                    self.context.workspace_root / item.item_id,
+                    max_nested_depth=self.config.limits.max_nested_archive_depth,
+                )
+                self.state_store.add_event(
+                    item.item_id,
+                    "repair_stage",
+                    "Source restaged before placement because packed archive was invalid.",
+                    payload={
+                        "unpack_dir": str(item.unpack_dir),
+                        "nested_archives_expanded": nested_count,
+                    },
+                )
+
+        with self._pack_slots:
+            return self.pack_agent.run(self.context, item)

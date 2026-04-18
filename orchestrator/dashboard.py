@@ -140,9 +140,14 @@ class TerminalDashboard:
 
     def _agent_table(self, width: int) -> str:
         name_width = 12
-        count_width = 9
+        count_samples = ["done"]
+        for agent_name in AGENT_ORDER:
+            count = self.state.agent_done_counts.get(agent_name, 0)
+            denominator = max(self.state.agent_total_counts.get(agent_name, 0), 0)
+            count_samples.append(f"{count}/{denominator}")
+        count_width = max(13, max(len(sample) for sample in count_samples) + 2)
         percent_width = 9
-        recognized_width = 11
+        recognized_width = 12
         bar_width = min(max(width - (name_width + count_width + percent_width + recognized_width + 16), 10), 30)
         header = (
             f"+{'-' * name_width}+{'-' * count_width}+{'-' * percent_width}+{'-' * recognized_width}+{'-' * (bar_width + 2)}+"
@@ -152,7 +157,6 @@ class TerminalDashboard:
             f"| {'agent'.ljust(name_width - 1)}| {'done'.ljust(count_width - 1)}| {'percent'.ljust(percent_width - 1)}| {'recognized'.ljust(recognized_width - 1)}| {'progress'.ljust(bar_width + 1)}|",
             header,
         ]
-        total = max(self.state.total_items, 1)
         for agent_name in AGENT_ORDER:
             count = self.state.agent_done_counts.get(agent_name, 0)
             denominator = max(self.state.agent_total_counts.get(agent_name, 0), 0)
@@ -163,8 +167,10 @@ class TerminalDashboard:
                 recognition_text = f"{recognition_avg * 100:5.1f}%"
             else:
                 recognition_text = "-"
+            count_text = f"{count}/{denominator}"
+            percent_text = f"{percent * 100:5.1f}%"
             lines.append(
-                f"| {agent_name.ljust(name_width - 1)}| {f'{count}/{denominator}'.ljust(count_width - 1)}| {f'{percent * 100:5.1f}%'.ljust(percent_width - 1)}| {recognition_text.ljust(recognized_width - 1)}| {bar.ljust(bar_width + 1)}|"
+                f"| {agent_name.ljust(name_width - 1)}| {count_text.ljust(count_width - 1)}| {percent_text.ljust(percent_width - 1)}| {recognition_text.ljust(recognized_width - 1)}| {bar.ljust(bar_width + 1)}|"
             )
         lines.append(header)
         return "\n".join(lines)

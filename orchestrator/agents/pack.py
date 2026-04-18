@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from ..archive_adapters import compute_sha256, normalize_title, pack_directory_to_zip, sanitize_name
+from ..archive_adapters import (
+    EMPTY_ZIP_SHA256,
+    compute_sha256,
+    is_valid_packed_archive,
+    normalize_title,
+    pack_directory_to_zip,
+    sanitize_name,
+)
 from ..models import ItemStatus
 from .base import AgentContext, BaseAgent
 
@@ -20,8 +27,14 @@ class PackAgent(BaseAgent):
         if not any(path.is_file() for path in item.unpack_dir.rglob("*")):
             raise RuntimeError("Cannot pack empty workspace.")
         pack_directory_to_zip(item.unpack_dir, output_path)
+        if not is_valid_packed_archive(output_path):
+            output_path.unlink(missing_ok=True)
+            raise RuntimeError("Pack produced an invalid archive.")
         item.packed_path = output_path
         item.packed_hash = compute_sha256(output_path)
+        if item.packed_hash == EMPTY_ZIP_SHA256:
+            output_path.unlink(missing_ok=True)
+            raise RuntimeError("Pack produced an empty archive.")
         item.status = ItemStatus.PACKED
         item.message = "Workspace normalized into ZIP."
         context.state_store.save_item(item)

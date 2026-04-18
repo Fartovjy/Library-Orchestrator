@@ -17,6 +17,7 @@ from .models import (
     WorkItem,
     utc_now,
 )
+from .archive_adapters import EMPTY_ZIP_SHA256
 
 
 class StateStore:
@@ -113,6 +114,13 @@ class StateStore:
                 SET root_item_id = item_id
                 WHERE root_item_id = ''
                 """
+            )
+            connection.execute(
+                """
+                DELETE FROM known_hashes
+                WHERE content_hash = ?
+                """,
+                (EMPTY_ZIP_SHA256,),
             )
 
     def _ensure_column(self, connection: sqlite3.Connection, table_name: str, column_name: str, spec: str) -> None:
@@ -576,6 +584,8 @@ class StateStore:
             )
 
     def register_hash(self, content_hash: str, item_id: str, final_path: Path | None) -> None:
+        if not content_hash or content_hash == EMPTY_ZIP_SHA256:
+            return
         with self._lock, self._connect() as connection:
             connection.execute(
                 """
@@ -589,11 +599,35 @@ class StateStore:
             )
 
     def find_duplicate(self, content_hash: str) -> sqlite3.Row | None:
+        if not content_hash or content_hash == EMPTY_ZIP_SHA256:
+            return None
         with self._lock, self._connect() as connection:
             return connection.execute(
                 "SELECT * FROM known_hashes WHERE content_hash = ?",
                 (content_hash,),
             ).fetchone()
+
+    def delete_task(self, batch_id: str, item_id: str, stage: TaskStage) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM tasks
+                WHERE batch_id = ? AND item_id = ? AND stage = ?
+                """,
+                (batch_id, item_id, stage.value),
+            )
+
+    def list_items_with_hash(self, batch_id: str, packed_hash: str) -> list[WorkItem]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM items
+                WHERE batch_id = ? AND packed_hash = ?
+                """,
+                (batch_id, packed_hash),
+            ).fetchall()
+        return [self._row_to_item(row) for row in rows]
 
     def status_counts(self) -> dict[str, int]:
         with self._lock, self._connect() as connection:

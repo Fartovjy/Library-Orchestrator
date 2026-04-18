@@ -150,6 +150,8 @@ MAGIC_SIGNATURES: list[tuple[bytes, str]] = [
     (b"SQLite format 3\x00", "sqlite"),
 ]
 
+EMPTY_ZIP_SHA256 = "8739c76e681f900923b900c9df0ef75cf421d39cabb54650c4b9ad19b6a76d85"
+
 
 def should_unpack_with_agent(kind: ContainerKind) -> bool:
     tool = find_archive_tool()
@@ -346,6 +348,16 @@ def pack_directory_to_zip(source_dir: Path, output_path: Path) -> None:
         for file_path in sorted(source_dir.rglob("*")):
             if file_path.is_file():
                 archive.write(file_path, file_path.relative_to(source_dir))
+
+
+def is_valid_packed_archive(path: Path) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return any(not info.is_dir() for info in archive.infolist())
+    except (OSError, zipfile.BadZipFile):
+        return False
 
 
 def compute_sha256(path: Path) -> str:
