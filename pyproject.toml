@@ -8,6 +8,11 @@ dependencies = [
   "requests>=2.31",
 ]
 
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
 [project.scripts]
 library-orchestrator = "orchestrator.main:main"
 
@@ -17,3 +22,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["orchestrator*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

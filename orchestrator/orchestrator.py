@@ -528,6 +528,7 @@ class LibraryOrchestrator:
         if source_root != project_root and project_root not in source_root.parents:
             skip_roots.add(project_root)
         sources: list[Path] = []
+        directory_size_cache: dict[Path, int] = {}
         queue: deque[Path] = deque([self.config.paths.source_root])
         while queue:
             if limit is not None and len(sources) >= limit:
@@ -548,10 +549,14 @@ class LibraryOrchestrator:
                 if str(child) in existing:
                     continue
                 if child.is_dir():
+                    size_hint = directory_size_cache.get(child)
+                    if size_hint is None:
+                        size_hint = self._directory_priority_size(child)
+                        directory_size_cache[child] = size_hint
                     if self._directory_has_subdirs(child, skip_roots):
-                        branch_dirs.append((self._directory_size(child), child))
+                        branch_dirs.append((size_hint, child))
                     else:
-                        leaf_dirs.append((self._directory_size(child), child))
+                        leaf_dirs.append((size_hint, child))
                 else:
                     eligible_files.append((self._file_size(child), child))
 
@@ -730,12 +735,17 @@ class LibraryOrchestrator:
         except OSError:
             return 0
 
-    def _directory_size(self, path: Path) -> int:
+    def _directory_priority_size(self, path: Path, sample_limit: int = 512) -> int:
+        # Lightweight estimate: scan only immediate children to avoid deep O(N) walks.
         total = 0
+        sampled = 0
         try:
-            for child in path.rglob("*"):
+            for child in path.iterdir():
+                if sampled >= sample_limit:
+                    break
                 if child.is_file():
                     total += self._file_size(child)
+                sampled += 1
         except OSError:
             return total
         return total
@@ -821,6 +831,7 @@ class LibraryOrchestrator:
                 TaskStage.UNPACK,
                 TaskStage.SPLITTER,
                 TaskStage.PREPARE,
+                TaskStage.DUPLICATE_CHECK,
                 TaskStage.ARCHIVARIUS,
                 TaskStage.EXPERT,
                 TaskStage.PACK,
@@ -950,36 +961,60 @@ class LibraryOrchestrator:
     def _acquire_run_lock(self) -> None:
         lock_path = self.config.paths.run_lock_file
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        if lock_path.exists():
-            try:
-                payload = json.loads(lock_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                payload = {}
-            lock_pid = int(payload.get("pid", 0) or 0)
-            if lock_pid and self._pid_is_running(lock_pid) and lock_pid != os.getpid():
-                raise RuntimeError(
-                    f"Another orchestrator run is already active (pid={lock_pid}). "
-                    "Stop it first or wait for it to finish."
-                )
         lock_payload = {
             "pid": os.getpid(),
             "started_at": time.time(),
             "source_root": str(self.config.paths.source_root),
             "state_db": str(self.config.paths.state_db),
         }
-        lock_path.write_text(json.dumps(lock_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        create_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        for _ in range(4):
+            try:
+                file_descriptor = os.open(lock_path, create_flags)
+            except FileExistsError:
+                payload = self._read_lock_payload(lock_path)
+                lock_pid = self._payload_pid(payload)
+                if lock_pid and self._pid_is_running(lock_pid):
+                    raise RuntimeError(
+                        f"Another orchestrator run is already active (pid={lock_pid}). "
+                        "Stop it first or wait for it to finish."
+                    )
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    raise RuntimeError(f"Cannot clear stale run lock {lock_path}: {error}") from error
+                continue
+            with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(lock_payload, ensure_ascii=False, indent=2))
+                handle.write("\n")
+            return
+        raise RuntimeError(
+            "Unable to acquire run lock after multiple attempts. "
+            "Another process may be racing with this run."
+        )
 
     def _release_run_lock(self) -> None:
         lock_path = self.config.paths.run_lock_file
         if not lock_path.exists():
             return
-        try:
-            payload = json.loads(lock_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            payload = {}
-        lock_pid = int(payload.get("pid", 0) or 0)
+        payload = self._read_lock_payload(lock_path)
+        lock_pid = self._payload_pid(payload)
         if lock_pid in {0, os.getpid()}:
             lock_path.unlink(missing_ok=True)
+
+    def _read_lock_payload(self, lock_path: Path) -> dict:
+        try:
+            return json.loads(lock_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _payload_pid(self, payload: dict) -> int:
+        try:
+            return int(payload.get("pid", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
 
     def _pid_is_running(self, pid: int) -> bool:
         if pid <= 0:
