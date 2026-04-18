@@ -178,3 +178,12 @@ Safe stop:
 ```powershell
 python -m orchestrator.main --config config.example.json stop
 ```
+
+Short forms from the project root:
+
+```powershell
+python -m orchestrator.main run --limit 5304
+python -m orchestrator.main repair
+```
+
+`--config config.example.json` is only needed when you want a config file other than the default `config.example.json`.

@@ -3,6 +3,7 @@ from .base import AgentContext, BaseAgent
 from .expert import ExpertAgent
 from .pack import PackAgent
 from .placement import PlacementAgent
+from .repair import RepairAgent
 from .splitter import SplitterAgent
 from .unpack import UnpackAgent
 
@@ -15,4 +16,5 @@ __all__ = [
     "ExpertAgent",
     "PackAgent",
     "PlacementAgent",
+    "RepairAgent",
 ]

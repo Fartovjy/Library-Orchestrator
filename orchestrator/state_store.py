@@ -632,6 +632,34 @@ class StateStore:
             ).fetchall()
         return [self._row_to_item(row) for row in rows]
 
+    def list_items(self, batch_id: str | None = None, statuses: tuple[ItemStatus, ...] | None = None) -> list[WorkItem]:
+        query = "SELECT * FROM items"
+        clauses: list[str] = []
+        params: list[str] = []
+        if batch_id is not None:
+            clauses.append("batch_id = ?")
+            params.append(batch_id)
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(status.value for status in statuses)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY updated_at"
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [self._row_to_item(row) for row in rows]
+
+    def delete_all_tasks_for_item(self, batch_id: str, item_id: str) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM tasks
+                WHERE batch_id = ? AND item_id = ?
+                """,
+                (batch_id, item_id),
+            )
+
     def status_counts(self) -> dict[str, int]:
         with self._lock, self._connect() as connection:
             rows = connection.execute(

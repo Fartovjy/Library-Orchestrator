@@ -15,6 +15,7 @@ from .agents import (
     ExpertAgent,
     PackAgent,
     PlacementAgent,
+    RepairAgent,
     SplitterAgent,
     UnpackAgent,
 )
@@ -74,6 +75,7 @@ class LibraryOrchestrator:
         self.expert_agent = ExpertAgent()
         self.pack_agent = PackAgent()
         self.placement_agent = PlacementAgent()
+        self.repair_agent = RepairAgent()
         self.splitter_agent = SplitterAgent()
         self._unpack_slots = threading.Semaphore(max(1, self.config.limits.max_parallel_unpack))
         self._pack_slots = threading.Semaphore(max(1, self.config.limits.max_parallel_pack))
@@ -548,6 +550,33 @@ class LibraryOrchestrator:
     def clear_stop_file(self) -> None:
         if self.config.paths.stop_file.exists():
             self.config.paths.stop_file.unlink()
+
+    def repair_database(self) -> dict[str, int]:
+        summary = self.repair_agent.run(self.context)
+        active_batch = self.state_store.get_active_batch()
+        if active_batch is None:
+            return summary.as_dict()
+        requeued = 0
+        for item in self.state_store.list_items(
+            batch_id=active_batch.batch_id,
+            statuses=(ItemStatus.FAILED,),
+        ):
+            if item.message != "Cannot pack empty workspace." or not item.source_path.exists():
+                continue
+            item.status = ItemStatus.DISCOVERED
+            item.unpack_dir = None
+            item.packed_path = None
+            item.packed_hash = ""
+            item.final_path = None
+            item.message = "Requeued by repair command after pack workspace recovery fix."
+            self.state_store.save_item(item)
+            self.state_store.delete_all_tasks_for_item(active_batch.batch_id, item.item_id)
+            self.state_store.ensure_task(active_batch.batch_id, item.item_id, TaskStage.DISCOVERY)
+            self.state_store.add_event(item.item_id, "repair", item.message)
+            requeued += 1
+        result = summary.as_dict()
+        result["requeued_failed"] += requeued
+        return result
 
     def _stop_requested(self) -> bool:
         return self.config.paths.stop_file.exists()

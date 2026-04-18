@@ -19,6 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="Run orchestrator.")
     run_parser.add_argument("--limit", type=int, default=None, help="Limit processed items.")
 
+    subparsers.add_parser("repair", help="Repair SQLite state against current files.")
     subparsers.add_parser("status", help="Print state summary.")
     subparsers.add_parser("stop", help="Request safe stop.")
     subparsers.add_parser("clear-stop", help="Remove stop request.")
@@ -39,6 +40,11 @@ def main() -> int:
 
     if args.command == "status":
         print(json.dumps(orchestrator.state_store.status_counts(), ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "repair":
+        summary = orchestrator.repair_database()
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
 
     if args.command == "stop":
