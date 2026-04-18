@@ -3,6 +3,7 @@
     "source_root": "E:/Разобрать",
     "output_root": "E:/Результат",
     "workspace_root": "C:/Users/Home/Documents/orchestrator_project/temp",
+    "failed_root": "E:/Результат/_Failed",
     "state_db": "E:/Разобрать/orchestrator_project/runtime/state/orchestrator.db",
     "logs_root": "E:/Разобрать/orchestrator_project/runtime/logs",
     "stop_file": "E:/Разобрать/orchestrator_project/runtime/STOP"
@@ -24,16 +25,17 @@
     "max_items_per_run": 10,
     "max_parallel_items": 4,
     "max_parallel_heavy_agents": 1,
-    "max_parallel_unpack": 1,
-    "max_parallel_pack": 1,
-    "max_nested_archive_depth": 3,
+    "max_parallel_unpack": 5,
+    "max_parallel_pack": 3,
+    "max_nested_archive_depth": 5,
     "hdd_busy_threshold_percent": 85.0,
     "sleep_if_busy_seconds": 5.0
   },
   "behavior": {
     "cleanup_workspace": true,
-    "move_outputs": true,
-    "detect_duplicates": true,
+    "move_outputs": false,
+    "detect_duplicates": false,
+    "safe_mode": true,
     "allowed_genres": [
       "Фантастика",
       "Фэнтези",

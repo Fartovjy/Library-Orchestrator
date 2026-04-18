@@ -44,6 +44,7 @@ TERMINAL_STATUSES = {
     ItemStatus.MANUAL_REVIEW,
     ItemStatus.TRASH,
     ItemStatus.DAMAGED,
+    ItemStatus.FAILED,
 }
 
 
@@ -230,7 +231,8 @@ class LibraryOrchestrator:
                 self._sync_dashboard(batch_id, message)
             except Exception as error:  # pragma: no cover
                 self.dashboard.end_agent(stage.value, str(error))
-                self._route_to_special(item, self.config.paths.damaged_root, ItemStatus.DAMAGED, str(error))
+                failure_root, failure_status = self._failure_target_for_error(stage, str(error))
+                self._route_to_special(item, failure_root, failure_status, str(error))
                 self.state_store.complete_task(batch_id, item_id, stage, message=item.message)
                 self._sync_dashboard(batch_id, item.message)
 
@@ -419,7 +421,7 @@ class LibraryOrchestrator:
         item = self._ensure_pack_ready_for_placement(item)
         with self._placement_lock:
             item = self.placement_agent.run(self.context, item)
-            if self.config.behavior.move_outputs:
+            if self._should_remove_source_after_success():
                 self._remove_source_path(item.source_path)
         if self.config.behavior.cleanup_workspace and item.unpack_dir:
             shutil.rmtree(item.unpack_dir.parent, ignore_errors=True)
@@ -460,6 +462,7 @@ class LibraryOrchestrator:
             self.config.paths.manual_review_root.resolve(),
             self.config.paths.trash_root.resolve(),
             self.config.paths.damaged_root.resolve(),
+            self.config.paths.failed_root.resolve(),
             self.config.paths.logs_root.resolve(),
             self.config.paths.state_db.parent.resolve(),
         }
@@ -509,7 +512,7 @@ class LibraryOrchestrator:
         root.mkdir(parents=True, exist_ok=True)
         target = self._unique_target_path(root / item.source_path.name)
         if item.source_path.exists():
-            if self.config.behavior.move_outputs:
+            if self._should_move_source_for_special_route():
                 shutil.move(str(item.source_path), target)
             elif item.source_path.is_dir():
                 if target.exists():
@@ -621,7 +624,7 @@ class LibraryOrchestrator:
         root_item = self.state_store.get_item_by_id(root_item_id)
         if root_item is None:
             return
-        if root_item.status == ItemStatus.SPLIT and self.config.behavior.move_outputs:
+        if root_item.status == ItemStatus.SPLIT and self._should_remove_source_after_success():
             self._remove_source_path(root_item.source_path)
         if root_item.unpack_dir:
             shutil.rmtree(root_item.unpack_dir.parent, ignore_errors=True)
@@ -675,7 +678,7 @@ class LibraryOrchestrator:
             self.state_store.add_event(item.item_id, "repair", item.message)
             return True
 
-        item.status = ItemStatus.DAMAGED
+        item.status = ItemStatus.FAILED
         item.message = "Invalid packed archive detected, but source data is no longer available for rebuild."
         self.state_store.save_item(item)
         self.state_store.delete_task(batch_id, item.item_id, TaskStage.PACK)
@@ -733,3 +736,21 @@ class LibraryOrchestrator:
 
         with self._pack_slots:
             return self.pack_agent.run(self.context, item)
+
+    def _failure_target_for_error(self, stage: TaskStage, message: str) -> tuple[Path, ItemStatus]:
+        normalized = message.lower()
+        if stage == TaskStage.UNPACK and (
+            "archive extraction failed" in normalized
+            or "file is not a zip file" in normalized
+            or "not a rar file" in normalized
+            or "unexpected end of archive" in normalized
+            or "crc failed" in normalized
+        ):
+            return self.config.paths.damaged_root, ItemStatus.DAMAGED
+        return self.config.paths.failed_root, ItemStatus.FAILED
+
+    def _should_remove_source_after_success(self) -> bool:
+        return self.config.behavior.move_outputs and not self.config.behavior.safe_mode
+
+    def _should_move_source_for_special_route(self) -> bool:
+        return self.config.behavior.move_outputs and not self.config.behavior.safe_mode

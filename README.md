@@ -1,5 +1,9 @@
 # Orchestrator Project
 
+КАЖДАЯ КНИГА УНИКАЛЬНА.
+МОЖЕТ БЫТЬ, ЭТО ПОСЛЕДНЯЯ КОПИЯ НА ВСЕЙ ЗЕМЛЕ.
+ЛУЧШЕ НЕДОРАЗОБРАТЬ, ЧЕМ ПОТЕРЯТЬ КНИГУ.
+
 ## Purpose
 
 Create a resilient multi-agent pipeline that:
@@ -11,6 +15,7 @@ Create a resilient multi-agent pipeline that:
 - places outputs into a deterministic library structure;
 - tracks duplicates, trash, manual review cases, and failures;
 - survives long runs, restarts, and partial interruptions.
+- defaults to safe-mode behavior that preserves source files unless you explicitly disable that protection.
 
 ## Unified Understanding Of Both Specs
 
@@ -33,7 +38,8 @@ Core storage and control requirements:
 - duplicate detection and routing to `_Duplicates`;
 - unresolved objects routed to `_Manual_Review`;
 - trash files routed to `_Trash`;
-- obvious non-book sources routed to `_Non_Books`.
+- obvious non-book sources routed to `_Non_Books`;
+- pipeline and infrastructure errors routed to `_Failed` without deleting the source.
 
 ## Target Output Structure
 
@@ -45,20 +51,22 @@ Special branches:
 - `_Non_Books`
 - `_Manual_Review`
 - `_Trash`
+- `_Failed`
 - error / damaged archive quarantine
 
 ## Processing Rules
 
 1. Select a batch of source objects from the library root.
 2. Create discovery tasks for the whole batch in SQLite.
-3. Route trash and obvious non-book sources before LM classification.
+3. Route trash and obvious non-book sources before LM classification without deleting the source while safe mode is on.
 4. Unpack only archive sources into a temporary workspace.
 5. Split unpacked shelves into child book items when one container clearly contains multiple books.
 6. Prepare excerpts from temp workspace and run fast recognition.
 7. Escalate only low-confidence cases to deep analysis.
 8. Normalize the work result into a single ZIP archive.
-9. Compute hashes, resolve duplicates, and place outputs into the target tree.
+9. Compute hashes, optionally resolve duplicates, and place outputs into the target tree.
 10. Persist every task transition into the state store for safe resume after restart.
+11. Treat automation failures as recoverable `failed` cases, not as damaged books.
 
 ## Implementation Direction
 
@@ -114,6 +122,7 @@ orchestrator_project/
 
 - JSON config with runtime paths, models, limits, and behavior flags
 - `behavior.detect_duplicates` lets you disable duplicate routing entirely when you want every packed book placed into the library tree
+- `behavior.safe_mode` defaults to `true` and prevents source deletion even if `move_outputs` is enabled
 - separate `output_root` for final outputs so results do not loop back into the source tree
 - default temp workspace at `C:/Users/Home/Documents/orchestrator_project/temp`
 - SQLite state store for items, events, and known content hashes
@@ -122,7 +131,7 @@ orchestrator_project/
 - resource monitor with IO busy sampling via `psutil`
 - LM Studio client for fast and deep classification passes
 - unpack, fast-classify, deep-classify, pack, and placement agents
-- duplicate routing, manual-review routing, trash routing, and damaged-file routing
+- duplicate routing, manual-review routing, trash routing, failed-processing routing, and damaged-file routing
 - CLI commands for `run`, `status`, `stop`, and `clear-stop`
 - terminal dashboard with current file, current stage, global progress, and per-agent progress
 - dashboard percent now uses each stage's own denominator:
@@ -145,6 +154,7 @@ orchestrator_project/
 - The pipeline is stateful, resumable, and processes multiple source items in parallel
 - DB-first workers can resume after stop/restart by resetting claimed tasks back to pending
 - Fast trash/non-book/manual-review routing can proceed while LM Studio is classifying other files
+- Safe mode keeps original source files in place by default; outputs are copied, not used to destroy the source corpus
 - Typical tuning is 4 light workers with 1 shared heavy LM classification slot
 - Light workers work from SQLite tasks and keep temp excerpts in the DB before heavy processing
 - Queue abstraction, worker limits, and HDD throttling are in place for controlled scaling

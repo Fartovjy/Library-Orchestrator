@@ -16,6 +16,7 @@ class PathsConfig:
     manual_review_root: Path
     trash_root: Path
     damaged_root: Path
+    failed_root: Path
     state_db: Path
     logs_root: Path
     stop_file: Path
@@ -30,6 +31,7 @@ class PathsConfig:
             self.manual_review_root,
             self.trash_root,
             self.damaged_root,
+            self.failed_root,
             self.state_db.parent,
             self.logs_root,
         ):
@@ -68,6 +70,7 @@ class BehaviorConfig:
     cleanup_workspace: bool = True
     move_outputs: bool = False
     detect_duplicates: bool = True
+    safe_mode: bool = True
     allowed_genres: list[str] = field(default_factory=list)
     trash_extensions: list[str] = field(default_factory=list)
 
@@ -104,6 +107,7 @@ class AppConfig:
         manual_review_root = path_values.get("manual_review_root", output_root / "_Manual_Review")
         trash_root = path_values.get("trash_root", output_root / "_Trash")
         damaged_root = path_values.get("damaged_root", output_root / "_Damaged")
+        failed_root = path_values.get("failed_root", output_root / "_Failed")
         workspace_root = path_values.get("workspace_root", repo_root / "temp")
         runtime_root = repo_root / "runtime"
         return PathsConfig(
@@ -116,6 +120,7 @@ class AppConfig:
             manual_review_root=manual_review_root,
             trash_root=trash_root,
             damaged_root=damaged_root,
+            failed_root=failed_root,
             state_db=path_values.get("state_db", runtime_root / "state" / "orchestrator.db"),
             logs_root=path_values.get("logs_root", runtime_root / "logs"),
             stop_file=path_values.get("stop_file", runtime_root / "STOP"),

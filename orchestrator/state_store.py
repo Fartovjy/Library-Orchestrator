@@ -283,10 +283,11 @@ class StateStore:
             ItemStatus.MANUAL_REVIEW.value,
             ItemStatus.TRASH.value,
             ItemStatus.DAMAGED.value,
+            ItemStatus.FAILED.value,
         )
         with self._lock, self._connect() as connection:
             rows = connection.execute(
-                "SELECT source_path FROM items WHERE status IN (?, ?, ?, ?, ?, ?, ?)",
+                "SELECT source_path FROM items WHERE status IN (?, ?, ?, ?, ?, ?, ?, ?)",
                 terminal_statuses,
             ).fetchall()
         return {row["source_path"] for row in rows}
@@ -472,7 +473,7 @@ class StateStore:
                     GROUP BY root_item_id
                     HAVING SUM(
                         CASE
-                            WHEN status IN (?, ?, ?, ?, ?, ?, ?)
+                            WHEN status IN (?, ?, ?, ?, ?, ?, ?, ?)
                             THEN 0
                             ELSE 1
                         END
@@ -488,6 +489,7 @@ class StateStore:
                     ItemStatus.MANUAL_REVIEW.value,
                     ItemStatus.TRASH.value,
                     ItemStatus.DAMAGED.value,
+                    ItemStatus.FAILED.value,
                 ),
             ).fetchone()
             processed_items = int(terminal_row["count"]) if terminal_row is not None else 0
@@ -552,7 +554,7 @@ class StateStore:
                 SELECT COUNT(*) AS count
                 FROM items
                 WHERE root_item_id = ?
-                  AND status NOT IN (?, ?, ?, ?, ?, ?, ?)
+                  AND status NOT IN (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     root_item_id,
@@ -563,6 +565,7 @@ class StateStore:
                     ItemStatus.MANUAL_REVIEW.value,
                     ItemStatus.TRASH.value,
                     ItemStatus.DAMAGED.value,
+                    ItemStatus.FAILED.value,
                 ),
             ).fetchone()
         return bool(row and int(row["count"]) == 0)
