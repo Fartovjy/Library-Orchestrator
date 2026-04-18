@@ -64,6 +64,13 @@ Special branches:
 - modular queues and agents
 - explicit config file for thresholds, limits, paths, and models
 
+## Recommended Models
+
+- Fast model for `Archivarius`: `vikhr-qwen-2.5-1.5b-instruct`
+- Deep model for `Expert`: `google/gemma-4-e4b`
+- Keep the fast model small and Russian-friendly for filename and short-excerpt genre routing
+- Keep the deep model stronger for low-confidence and ambiguous cases
+
 ## Next Step
 
 Build the new project around:

@@ -9,7 +9,7 @@
   },
   "lmstudio": {
     "base_url": "http://127.0.0.1:1234/v1",
-    "fast_model": "llama-3.2-1b-instruct",
+    "fast_model": "vikhr-qwen-2.5-1.5b-instruct",
     "deep_model": "google/gemma-4-e4b",
     "timeout_seconds": 90,
     "temperature": 0.1,
