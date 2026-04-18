@@ -12,7 +12,7 @@ class PackAgent(BaseAgent):
         author = sanitize_name(item.author or "Unknown Author")
         title = sanitize_name(normalize_title(item.title or item.source_path.stem))
         output_name = f"{author} - {title}.zip"
-        staging_root = context.config.paths.workspace_root / "_packed"
+        staging_root = context.config.paths.workspace_root / "_packed" / item.item_id
         staging_root.mkdir(parents=True, exist_ok=True)
         output_path = staging_root / output_name
         if item.unpack_dir is None:
