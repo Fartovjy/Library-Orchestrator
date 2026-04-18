@@ -45,6 +45,19 @@ class TerminalDashboard:
         self._lock = threading.RLock()
         self._ansi_ready = self._enable_ansi_if_possible()
 
+    def reset(
+        self,
+        *,
+        hotkey_hint: str | None = None,
+        message: str = "-",
+        render: bool = True,
+    ) -> None:
+        with self._lock:
+            preserved_hint = self.state.hotkey_hint if hotkey_hint is None else hotkey_hint
+            self.state = DashboardState(hotkey_hint=preserved_hint, last_message=message)
+            if render:
+                self.render()
+
     def set_total(self, total_items: int) -> None:
         with self._lock:
             self.state.total_items = total_items

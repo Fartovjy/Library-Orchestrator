@@ -70,7 +70,7 @@ class LibraryOrchestrator:
         )
         self.dashboard = TerminalDashboard()
         self.hotkeys = StopHotkeyWatcher()
-        self.dashboard.set_hotkey_hint(self.hotkeys.hint())
+        self.dashboard.reset(hotkey_hint=self.hotkeys.hint(), render=False)
         self.unpack_agent = UnpackAgent()
         self.archivarius_agent = ArchivariusAgent()
         self.duplicate_check_agent = DuplicateCheckAgent()
@@ -86,6 +86,10 @@ class LibraryOrchestrator:
         self._stop_event = threading.Event()
 
     def run(self, limit: int | None = None) -> dict[str, int]:
+        self.dashboard.reset(
+            hotkey_hint=self.hotkeys.hint(),
+            message="Starting orchestrator run.",
+        )
         self._acquire_run_lock()
         try:
             return self._run_with_lock(limit)
@@ -567,6 +571,10 @@ class LibraryOrchestrator:
             self.config.paths.stop_file.unlink()
 
     def repair_database(self) -> dict[str, int]:
+        self.dashboard.reset(
+            hotkey_hint=self.hotkeys.hint(),
+            message="Starting database repair.",
+        )
         summary = self.repair_agent.run(self.context)
         active_batch = self.state_store.get_active_batch()
         if active_batch is None:
@@ -591,6 +599,7 @@ class LibraryOrchestrator:
             requeued += 1
         result = summary.as_dict()
         result["requeued_failed"] += requeued
+        self._sync_dashboard(active_batch.batch_id, "Repair completed.")
         return result
 
     def _stop_requested(self) -> bool:
