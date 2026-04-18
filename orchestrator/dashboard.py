@@ -14,6 +14,7 @@ AGENT_ORDER = [
     "unpack",
     "splitter",
     "prepare",
+    "duplicate_check",
     "archivarius",
     "expert",
     "pack",
@@ -139,7 +140,7 @@ class TerminalDashboard:
         sys.stdout.flush()
 
     def _agent_table(self, width: int) -> str:
-        name_width = 12
+        name_width = max(12, max(len(name) for name in AGENT_ORDER) + 2)
         count_samples = ["done"]
         for agent_name in AGENT_ORDER:
             count = self.state.agent_done_counts.get(agent_name, 0)

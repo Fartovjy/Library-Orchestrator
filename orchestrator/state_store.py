@@ -610,6 +610,30 @@ class StateStore:
                 (content_hash,),
             ).fetchone()
 
+    def find_source_duplicate(self, source_hash: str, item_id: str, created_at: str) -> sqlite3.Row | None:
+        if not source_hash:
+            return None
+        with self._lock, self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT item_id, final_path, status, created_at
+                FROM items
+                WHERE source_hash = ?
+                  AND item_id != ?
+                  AND created_at <= ?
+                  AND status NOT IN (?, ?)
+                ORDER BY created_at, item_id
+                LIMIT 1
+                """,
+                (
+                    source_hash,
+                    item_id,
+                    created_at,
+                    ItemStatus.FAILED.value,
+                    ItemStatus.DAMAGED.value,
+                ),
+            ).fetchone()
+
     def delete_task(self, batch_id: str, item_id: str, stage: TaskStage) -> None:
         with self._lock, self._connect() as connection:
             connection.execute(

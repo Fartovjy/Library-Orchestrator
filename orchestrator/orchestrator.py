@@ -12,6 +12,7 @@ from pathlib import Path
 from .agents import (
     AgentContext,
     ArchivariusAgent,
+    DuplicateCheckAgent,
     ExpertAgent,
     PackAgent,
     PlacementAgent,
@@ -72,6 +73,7 @@ class LibraryOrchestrator:
         self.dashboard.set_hotkey_hint(self.hotkeys.hint())
         self.unpack_agent = UnpackAgent()
         self.archivarius_agent = ArchivariusAgent()
+        self.duplicate_check_agent = DuplicateCheckAgent()
         self.expert_agent = ExpertAgent()
         self.pack_agent = PackAgent()
         self.placement_agent = PlacementAgent()
@@ -140,7 +142,7 @@ class LibraryOrchestrator:
                         self._run_stage_loop,
                         batch.batch_id,
                         f"light-{index + 1}",
-                        [TaskStage.SPLITTER, TaskStage.PREPARE, TaskStage.ARCHIVARIUS],
+                        [TaskStage.SPLITTER, TaskStage.PREPARE, TaskStage.DUPLICATE_CHECK, TaskStage.ARCHIVARIUS],
                     )
                 )
             for index in range(max(1, self.config.limits.max_parallel_heavy_agents)):
@@ -268,6 +270,8 @@ class LibraryOrchestrator:
             return self._process_splitter_task(batch_id, item)
         if stage == TaskStage.PREPARE:
             return self._process_prepare_task(batch_id, item)
+        if stage == TaskStage.DUPLICATE_CHECK:
+            return self._process_duplicate_check_task(batch_id, item)
         if stage == TaskStage.ARCHIVARIUS:
             return self._process_archivarius_task(batch_id, item)
         if stage == TaskStage.EXPERT:
@@ -398,8 +402,24 @@ class LibraryOrchestrator:
                 "excerpt_words": len(item.prepared_excerpt.split()),
             },
         )
-        self.state_store.ensure_task(batch_id, item.item_id, TaskStage.ARCHIVARIUS)
+        self.state_store.ensure_task(batch_id, item.item_id, TaskStage.DUPLICATE_CHECK)
         return item.message, None
+
+    def _process_duplicate_check_task(self, batch_id: str, item) -> tuple[str, float | None]:
+        duplicate = self.duplicate_check_agent.run(self.context, item)
+        if duplicate is not None:
+            duplicate_label = duplicate["item_id"]
+            if duplicate["final_path"]:
+                duplicate_label = f"{duplicate_label} ({duplicate['final_path']})"
+            self._route_to_special(
+                item,
+                self.config.paths.duplicates_root,
+                ItemStatus.DUPLICATE,
+                f"Early duplicate of {duplicate_label}",
+            )
+            return item.message, None
+        self.state_store.ensure_task(batch_id, item.item_id, TaskStage.ARCHIVARIUS)
+        return "No early duplicate found.", None
 
     def _process_archivarius_task(self, batch_id: str, item) -> tuple[str, float | None]:
         item, needs_deep = self.archivarius_agent.run(self.context, item, item.prepared_excerpt)

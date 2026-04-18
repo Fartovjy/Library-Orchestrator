@@ -60,6 +60,7 @@ class TaskStage(StrEnum):
     UNPACK = "unpack"
     SPLITTER = "splitter"
     PREPARE = "prepare"
+    DUPLICATE_CHECK = "duplicate_check"
     ARCHIVARIUS = "archivarius"
     EXPERT = "expert"
     PACK = "pack"

@@ -1,5 +1,6 @@
 from .archivarius import ArchivariusAgent
 from .base import AgentContext, BaseAgent
+from .duplicate import DuplicateCheckAgent
 from .expert import ExpertAgent
 from .pack import PackAgent
 from .placement import PlacementAgent
@@ -12,6 +13,7 @@ __all__ = [
     "BaseAgent",
     "UnpackAgent",
     "SplitterAgent",
+    "DuplicateCheckAgent",
     "ArchivariusAgent",
     "ExpertAgent",
     "PackAgent",
