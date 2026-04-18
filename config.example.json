@@ -26,6 +26,7 @@
     "max_parallel_heavy_agents": 1,
     "max_parallel_unpack": 1,
     "max_parallel_pack": 1,
+    "max_nested_archive_depth": 3,
     "hdd_busy_threshold_percent": 85.0,
     "sleep_if_busy_seconds": 5.0
   },

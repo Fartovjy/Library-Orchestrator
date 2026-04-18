@@ -320,13 +320,20 @@ class LibraryOrchestrator:
                 self.config.lmstudio.fast_excerpt_words,
             )
         else:
-            item.unpack_dir = stage_source(item.source_path, self.context.workspace_root / item.item_id)
+            item.unpack_dir, nested_count = stage_source(
+                item.source_path,
+                self.context.workspace_root / item.item_id,
+                max_nested_depth=self.config.limits.max_nested_archive_depth,
+            )
             excerpt = collect_excerpt(item.unpack_dir, self.config.lmstudio.fast_excerpt_words)
             self.state_store.add_event(
                 item.item_id,
                 "prepare",
                 "Source staged into workspace without archive unpack.",
-                payload={"unpack_dir": str(item.unpack_dir)},
+                payload={
+                    "unpack_dir": str(item.unpack_dir),
+                    "nested_archives_expanded": nested_count,
+                },
             )
 
         item.prepared_excerpt = excerpt

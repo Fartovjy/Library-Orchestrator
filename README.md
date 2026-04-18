@@ -134,6 +134,7 @@ orchestrator_project/
 
 - Supported unpack now: directories, plain files, ZIP-like archives, FB2, PDF, `rar`, and `7z`
 - `rar` and `7z` support uses installed Windows tools such as `7-Zip` or `WinRAR`
+- Nested `zip`/`epub`/`rar`/`7z` archives are unpacked recursively in temp workspace with a configurable depth limit
 - Output normalization is always a ZIP archive with LZMA compression level 9
 - The pipeline is stateful, resumable, and processes multiple source items in parallel
 - DB-first workers can resume after stop/restart by resetting claimed tasks back to pending
@@ -144,6 +145,7 @@ orchestrator_project/
 - Discovery order is breadth-first: current folder level first, then subfolders
 - Smaller files are scheduled before larger ones within each folder level
 - Obvious code/program sources are filtered before `Archivarius`, which improves useful recognition rate
+- `max_nested_archive_depth` controls how many archive layers are expanded inside temp workspace
 - LM Studio input is capped by approximate token budgets, not only by word counts
 
 ## First Run

@@ -58,6 +58,7 @@ class LimitsConfig:
     max_parallel_heavy_agents: int = 1
     max_parallel_unpack: int = 1
     max_parallel_pack: int = 1
+    max_nested_archive_depth: int = 3
     hdd_busy_threshold_percent: float = 85.0
     sleep_if_busy_seconds: float = 5.0
 

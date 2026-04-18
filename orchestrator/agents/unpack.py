@@ -17,11 +17,23 @@ class UnpackAgent(BaseAgent):
             return item, ""
 
         unpack_dir = context.workspace_root / item.item_id
-        item.unpack_dir = unpack_source(item.source_path, unpack_dir)
+        item.unpack_dir, nested_count = unpack_source(
+            item.source_path,
+            unpack_dir,
+            max_nested_depth=context.config.limits.max_nested_archive_depth,
+        )
         item.status = ItemStatus.UNPACKED
-        item.message = "Source unpacked into workspace."
+        if nested_count > 0:
+            item.message = f"Source unpacked into workspace. Expanded {nested_count} nested archive(s)."
+        else:
+            item.message = "Source unpacked into workspace."
         context.state_store.save_item(item)
-        context.state_store.add_event(item.item_id, self.name, item.message)
+        context.state_store.add_event(
+            item.item_id,
+            self.name,
+            item.message,
+            payload={"nested_archives_expanded": nested_count},
+        )
         excerpt_source = item.unpack_dir or item.source_path
         excerpt = collect_excerpt(excerpt_source, context.config.lmstudio.fast_excerpt_words)
         return item, excerpt

@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import zipfile
+from collections import deque
 from pathlib import Path
 
 from .models import ContainerKind
@@ -214,34 +215,44 @@ def is_supported_unpack_kind(kind: ContainerKind) -> bool:
     } or (kind in {ContainerKind.RAR, ContainerKind.SEVEN_Z} and tool is not None)
 
 
-def stage_source(source_path: Path, destination_dir: Path) -> Path:
+def is_unpackable_archive_kind(kind: ContainerKind) -> bool:
+    return kind in {ContainerKind.ZIP, ContainerKind.EPUB, ContainerKind.RAR, ContainerKind.SEVEN_Z}
+
+
+def stage_source(source_path: Path, destination_dir: Path, max_nested_depth: int = 0) -> tuple[Path, int]:
     destination_dir.mkdir(parents=True, exist_ok=True)
     staged_dir = destination_dir / "payload"
     staged_dir.mkdir(parents=True, exist_ok=True)
     if source_path.is_dir():
         shutil.copytree(source_path, staged_dir, dirs_exist_ok=True)
-        return staged_dir
+        nested_count = expand_nested_archives(staged_dir, max_nested_depth)
+        return staged_dir, nested_count
     shutil.copy2(source_path, staged_dir / source_path.name)
-    return staged_dir
+    nested_count = expand_nested_archives(staged_dir, max_nested_depth)
+    return staged_dir, nested_count
 
 
-def unpack_source(source_path: Path, destination_dir: Path) -> Path:
+def unpack_source(source_path: Path, destination_dir: Path, max_nested_depth: int = 0) -> tuple[Path, int]:
     destination_dir.mkdir(parents=True, exist_ok=True)
     kind = detect_container_kind(source_path)
     unpack_dir = destination_dir / "payload"
     unpack_dir.mkdir(parents=True, exist_ok=True)
     if kind == ContainerKind.DIRECTORY:
         shutil.copytree(source_path, unpack_dir, dirs_exist_ok=True)
-        return unpack_dir
+        nested_count = expand_nested_archives(unpack_dir, max_nested_depth)
+        return unpack_dir, nested_count
     if kind in {ContainerKind.ZIP, ContainerKind.EPUB}:
         with zipfile.ZipFile(source_path) as archive:
             archive.extractall(unpack_dir)
-        return unpack_dir
+        nested_count = expand_nested_archives(unpack_dir, max_nested_depth)
+        return unpack_dir, nested_count
     if kind in {ContainerKind.RAR, ContainerKind.SEVEN_Z}:
         extract_with_external_tool(source_path, unpack_dir)
-        return unpack_dir
+        nested_count = expand_nested_archives(unpack_dir, max_nested_depth)
+        return unpack_dir, nested_count
     shutil.copy2(source_path, unpack_dir / source_path.name)
-    return unpack_dir
+    nested_count = expand_nested_archives(unpack_dir, max_nested_depth)
+    return unpack_dir, nested_count
 
 
 def collect_excerpt(source_path: Path, max_words: int) -> str:
@@ -357,6 +368,57 @@ def _looks_like_source_code(path: Path) -> bool:
         for token in ("{", "}", ";", "/*", "*/", "->", "::", "<?php", "class ", "struct ")
     )
     return marker_hits >= 1 and syntax_hits >= 2
+
+
+def expand_nested_archives(root_dir: Path, max_depth: int) -> int:
+    if max_depth <= 0 or not root_dir.exists():
+        return 0
+
+    expanded_count = 0
+    pending: deque[tuple[Path, int]] = deque((path, 1) for path in sorted(root_dir.rglob("*")) if path.is_file())
+    seen: set[str] = set()
+    while pending:
+        archive_path, depth = pending.popleft()
+        if not archive_path.exists() or not archive_path.is_file():
+            continue
+        archive_key = str(archive_path.resolve())
+        if archive_key in seen:
+            continue
+        seen.add(archive_key)
+        kind = detect_container_kind(archive_path)
+        if not is_unpackable_archive_kind(kind) or not is_supported_unpack_kind(kind):
+            continue
+        if depth > max_depth:
+            continue
+
+        expanded_dir = _nested_expanded_dir(archive_path)
+        temp_dir = archive_path.parent / f".__extracting_{archive_path.stem}"
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        payload_dir, _ = unpack_source(archive_path, temp_dir, max_nested_depth=0)
+        shutil.move(str(payload_dir), expanded_dir)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        archive_path.unlink(missing_ok=True)
+        expanded_count += 1
+
+        if depth < max_depth:
+            nested_files = [path for path in sorted(expanded_dir.rglob("*")) if path.is_file()]
+            pending.extend((path, depth + 1) for path in nested_files)
+    return expanded_count
+
+
+def _nested_expanded_dir(archive_path: Path) -> Path:
+    base_name = normalize_title(archive_path.stem) or archive_path.stem or "nested_archive"
+    candidate = archive_path.with_name(base_name)
+    if not candidate.exists() and candidate != archive_path:
+        return candidate
+    index = 2
+    while True:
+        fallback = archive_path.with_name(f"{base_name} ({index})")
+        if not fallback.exists():
+            return fallback
+        index += 1
 
 
 def _normalize_text(content: str, max_words: int) -> str:
