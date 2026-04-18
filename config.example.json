@@ -33,6 +33,7 @@
   "behavior": {
     "cleanup_workspace": true,
     "move_outputs": true,
+    "detect_duplicates": true,
     "allowed_genres": [
       "Фантастика",
       "Фэнтези",

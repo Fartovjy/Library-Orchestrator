@@ -113,6 +113,7 @@ orchestrator_project/
 ## What Is Already Implemented
 
 - JSON config with runtime paths, models, limits, and behavior flags
+- `behavior.detect_duplicates` lets you disable duplicate routing entirely when you want every packed book placed into the library tree
 - separate `output_root` for final outputs so results do not loop back into the source tree
 - default temp workspace at `C:/Users/Home/Documents/orchestrator_project/temp`
 - SQLite state store for items, events, and known content hashes

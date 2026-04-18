@@ -15,7 +15,9 @@ class PlacementAgent(BaseAgent):
         if item.packed_path is None:
             raise RuntimeError("Cannot place item without packed archive.")
 
-        duplicate = context.state_store.find_duplicate(item.packed_hash)
+        duplicate = None
+        if context.config.behavior.detect_duplicates:
+            duplicate = context.state_store.find_duplicate(item.packed_hash)
         if duplicate is not None and duplicate["item_id"] != item.item_id:
             target_dir = context.config.paths.duplicates_root
             item.status = ItemStatus.DUPLICATE

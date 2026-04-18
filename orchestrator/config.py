@@ -67,6 +67,7 @@ class LimitsConfig:
 class BehaviorConfig:
     cleanup_workspace: bool = True
     move_outputs: bool = False
+    detect_duplicates: bool = True
     allowed_genres: list[str] = field(default_factory=list)
     trash_extensions: list[str] = field(default_factory=list)
 
