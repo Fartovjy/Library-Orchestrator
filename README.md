@@ -19,6 +19,7 @@ The system is centered around an `Orchestrator` that manages queues, state, reso
 Primary agents:
 
 - `Unpack Agent`
+- `Splitter Agent` for multi-book containers
 - `Archivarius` fast recognition agent via LM Studio
 - `Expert` deep-analysis agent for low-confidence cases
 - `Pack Agent`
@@ -52,11 +53,12 @@ Special branches:
 2. Create discovery tasks for the whole batch in SQLite.
 3. Route trash and obvious non-book sources before LM classification.
 4. Unpack only archive sources into a temporary workspace.
-5. Prepare excerpts from temp workspace and run fast recognition.
-6. Escalate only low-confidence cases to deep analysis.
-7. Normalize the work result into a single ZIP archive.
-8. Compute hashes, resolve duplicates, and place outputs into the target tree.
-9. Persist every task transition into the state store for safe resume after restart.
+5. Split unpacked shelves into child book items when one container clearly contains multiple books.
+6. Prepare excerpts from temp workspace and run fast recognition.
+7. Escalate only low-confidence cases to deep analysis.
+8. Normalize the work result into a single ZIP archive.
+9. Compute hashes, resolve duplicates, and place outputs into the target tree.
+10. Persist every task transition into the state store for safe resume after restart.
 
 ## Implementation Direction
 
@@ -115,6 +117,7 @@ orchestrator_project/
 - default temp workspace at `C:/Users/Home/Documents/orchestrator_project/temp`
 - SQLite state store for items, events, and known content hashes
 - SQLite batch/task queue so workers claim work by stage instead of keeping the pipeline in RAM
+- parent/root item tracking in SQLite so one archive can expand into many child book items
 - resource monitor with IO busy sampling via `psutil`
 - LM Studio client for fast and deep classification passes
 - unpack, fast-classify, deep-classify, pack, and placement agents
@@ -124,6 +127,7 @@ orchestrator_project/
 - dashboard percent now uses each stage's own denominator:
   - `discovery` from the selected batch size
   - `unpack` only from archive items in the batch
+  - `splitter` only from containers that need bookshelf analysis
   - `expert` only from low-confidence items that actually escalated
 - dashboard agent table includes both completion percent and average recognition percent for classifiers
 - file-type detection by magic bytes before LM Studio classification
@@ -135,6 +139,7 @@ orchestrator_project/
 - Supported unpack now: directories, plain files, ZIP-like archives, FB2, PDF, `rar`, and `7z`
 - `rar` and `7z` support uses installed Windows tools such as `7-Zip` or `WinRAR`
 - Nested `zip`/`epub`/`rar`/`7z` archives are unpacked recursively in temp workspace with a configurable depth limit
+- Multi-book archives are split into child items before `Archivarius`, so a shelf of books is no longer forced into one record
 - Output normalization is always a ZIP archive with LZMA compression level 9
 - The pipeline is stateful, resumable, and processes multiple source items in parallel
 - DB-first workers can resume after stop/restart by resetting claimed tasks back to pending

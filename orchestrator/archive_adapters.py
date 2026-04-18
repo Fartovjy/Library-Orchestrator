@@ -15,6 +15,42 @@ from .models import ContainerKind
 
 TEXT_EXTENSIONS = {".txt", ".md", ".rtf", ".fb2", ".html", ".htm"}
 BOOK_LIKE_EXTENSIONS = {".txt", ".md", ".rtf", ".fb2", ".html", ".htm", ".pdf", ".epub", ".djvu", ".doc", ".docx"}
+SPLIT_STANDALONE_BOOK_EXTENSIONS = {
+    ".fb2",
+    ".epub",
+    ".pdf",
+    ".djvu",
+    ".doc",
+    ".docx",
+    ".rtf",
+    ".txt",
+    ".mobi",
+    ".azw",
+    ".azw3",
+}
+HTML_COLLECTION_ASSET_EXTENSIONS = {
+    ".css",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".bmp",
+    ".webp",
+    ".svg",
+    ".js",
+}
+NON_BOOK_BOOKSHELF_NAMES = {
+    "readme",
+    "about",
+    "license",
+    "licence",
+    "notes",
+    "note",
+    "toc",
+    "contents",
+    "content",
+    "index",
+}
 NON_BOOK_EXTENSIONS = {
     ".c",
     ".cc",
@@ -271,6 +307,34 @@ def collect_excerpt(source_path: Path, max_words: int) -> str:
     return _excerpt_from_file(source_path, max_words)
 
 
+def detect_book_candidates(container_dir: Path) -> list[Path]:
+    if not container_dir.exists() or not container_dir.is_dir():
+        return []
+
+    root = container_dir.resolve()
+    directory_candidates: list[Path] = []
+    chosen_dirs: set[Path] = set()
+    for dir_path in sorted(path for path in root.rglob("*") if path.is_dir()):
+        if any(parent in chosen_dirs for parent in dir_path.parents):
+            continue
+        if _is_html_collection_dir(dir_path):
+            directory_candidates.append(dir_path)
+            chosen_dirs.add(dir_path)
+
+    file_candidates: list[Path] = []
+    for file_path in sorted(path for path in root.rglob("*") if path.is_file()):
+        if any(parent in chosen_dirs for parent in file_path.parents):
+            continue
+        if _is_split_book_file_candidate(file_path):
+            file_candidates.append(file_path)
+
+    # If the container itself looks like a single HTML book, keep it whole.
+    if not directory_candidates and len(file_candidates) <= 1 and _is_html_collection_dir(root):
+        return []
+
+    return directory_candidates + file_candidates
+
+
 def pack_directory_to_zip(source_dir: Path, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(
@@ -368,6 +432,40 @@ def _looks_like_source_code(path: Path) -> bool:
         for token in ("{", "}", ";", "/*", "*/", "->", "::", "<?php", "class ", "struct ")
     )
     return marker_hits >= 1 and syntax_hits >= 2
+
+
+def _is_html_collection_dir(path: Path) -> bool:
+    try:
+        children = list(path.iterdir())
+    except OSError:
+        return False
+    html_files = [child for child in children if child.is_file() and child.suffix.lower() in {".html", ".htm"}]
+    if not html_files:
+        return False
+    if any(child.name.lower() in {"index.html", "index.htm", "toc.html", "toc.htm"} for child in html_files):
+        return True
+    asset_files = [
+        child for child in children
+        if child.is_file() and child.suffix.lower() in HTML_COLLECTION_ASSET_EXTENSIONS
+    ]
+    return len(html_files) >= 2 and (len(asset_files) >= 1 or len(children) > len(html_files))
+
+
+def _is_split_book_file_candidate(path: Path) -> bool:
+    suffix = path.suffix.lower()
+    if suffix not in SPLIT_STANDALONE_BOOK_EXTENSIONS:
+        return False
+    stem = path.stem.strip().lower()
+    if stem in NON_BOOK_BOOKSHELF_NAMES:
+        return False
+    if suffix not in {".txt", ".rtf"}:
+        return True
+    try:
+        sample = path.read_text(encoding="utf-8", errors="ignore")[:8192]
+    except OSError:
+        return False
+    words = re.findall(r"\S+", sample)
+    return len(words) >= 40
 
 
 def expand_nested_archives(root_dir: Path, max_depth: int) -> int:

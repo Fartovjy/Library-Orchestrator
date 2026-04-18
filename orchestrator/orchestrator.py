@@ -13,6 +13,7 @@ from .agents import (
     ExpertAgent,
     PackAgent,
     PlacementAgent,
+    SplitterAgent,
     UnpackAgent,
 )
 from .archive_adapters import (
@@ -37,6 +38,7 @@ TERMINAL_STATUSES = {
     ItemStatus.PLACED,
     ItemStatus.DUPLICATE,
     ItemStatus.NON_BOOK,
+    ItemStatus.SPLIT,
     ItemStatus.MANUAL_REVIEW,
     ItemStatus.TRASH,
     ItemStatus.DAMAGED,
@@ -67,6 +69,7 @@ class LibraryOrchestrator:
         self.expert_agent = ExpertAgent()
         self.pack_agent = PackAgent()
         self.placement_agent = PlacementAgent()
+        self.splitter_agent = SplitterAgent()
         self._unpack_slots = threading.Semaphore(max(1, self.config.limits.max_parallel_unpack))
         self._pack_slots = threading.Semaphore(max(1, self.config.limits.max_parallel_pack))
         self._placement_lock = threading.Lock()
@@ -123,7 +126,7 @@ class LibraryOrchestrator:
                         self._run_stage_loop,
                         batch.batch_id,
                         f"light-{index + 1}",
-                        [TaskStage.PREPARE, TaskStage.ARCHIVARIUS],
+                        [TaskStage.SPLITTER, TaskStage.PREPARE, TaskStage.ARCHIVARIUS],
                     )
                 )
             for index in range(max(1, self.config.limits.max_parallel_heavy_agents)):
@@ -245,6 +248,8 @@ class LibraryOrchestrator:
             return self._process_discovery_task(batch_id, item)
         if stage == TaskStage.UNPACK:
             return self._process_unpack_task(batch_id, item)
+        if stage == TaskStage.SPLITTER:
+            return self._process_splitter_task(batch_id, item)
         if stage == TaskStage.PREPARE:
             return self._process_prepare_task(batch_id, item)
         if stage == TaskStage.ARCHIVARIUS:
@@ -299,6 +304,8 @@ class LibraryOrchestrator:
         )
         if should_unpack_with_agent(item.container_kind):
             self.state_store.ensure_task(batch_id, item.item_id, TaskStage.UNPACK)
+        elif item.source_path.is_dir():
+            self.state_store.ensure_task(batch_id, item.item_id, TaskStage.SPLITTER)
         else:
             self.state_store.ensure_task(batch_id, item.item_id, TaskStage.PREPARE)
         return item.message, None
@@ -310,7 +317,33 @@ class LibraryOrchestrator:
         self.state_store.save_item(item)
         if item.status in TERMINAL_STATUSES:
             return item.message, None
-        self.state_store.ensure_task(batch_id, item.item_id, TaskStage.PREPARE)
+        self.state_store.ensure_task(batch_id, item.item_id, TaskStage.SPLITTER)
+        return item.message, None
+
+    def _process_splitter_task(self, batch_id: str, item) -> tuple[str, float | None]:
+        if item.unpack_dir is None or not item.unpack_dir.exists():
+            item.unpack_dir, nested_count = stage_source(
+                item.source_path,
+                self.context.workspace_root / item.item_id,
+                max_nested_depth=self.config.limits.max_nested_archive_depth,
+            )
+            self.state_store.add_event(
+                item.item_id,
+                "splitter_stage",
+                "Source staged for splitter analysis.",
+                payload={
+                    "unpack_dir": str(item.unpack_dir),
+                    "nested_archives_expanded": nested_count,
+                },
+            )
+
+        item, child_items = self.splitter_agent.run(self.context, item)
+        if not child_items:
+            self.state_store.ensure_task(batch_id, item.item_id, TaskStage.PREPARE)
+            return item.message, None
+
+        for child_item in child_items:
+            self._schedule_child_item(batch_id, child_item)
         return item.message, None
 
     def _process_prepare_task(self, batch_id: str, item) -> tuple[str, float | None]:
@@ -386,6 +419,7 @@ class LibraryOrchestrator:
                 self._remove_source_path(item.source_path)
         if self.config.behavior.cleanup_workspace and item.unpack_dir:
             shutil.rmtree(item.unpack_dir.parent, ignore_errors=True)
+        self._cleanup_root_workspace_if_complete(item.root_item_id)
         return item.message, None
 
     def _sync_dashboard(self, batch_id: str, message: str = "") -> None:
@@ -486,6 +520,7 @@ class LibraryOrchestrator:
         self.state_store.add_event(item.item_id, "route", message, payload={"final_path": str(target)})
         if self.config.behavior.cleanup_workspace and item.unpack_dir:
             shutil.rmtree(item.unpack_dir.parent, ignore_errors=True)
+        self._cleanup_root_workspace_if_complete(item.root_item_id)
 
     def create_stop_file(self) -> Path:
         stop_file = self.config.paths.stop_file
@@ -565,3 +600,24 @@ class LibraryOrchestrator:
             if not candidate.exists():
                 return candidate
             index += 1
+
+    def _schedule_child_item(self, batch_id: str, item) -> None:
+        if should_unpack_with_agent(item.container_kind):
+            self.state_store.ensure_task(batch_id, item.item_id, TaskStage.UNPACK)
+        elif item.source_path.is_dir():
+            self.state_store.ensure_task(batch_id, item.item_id, TaskStage.SPLITTER)
+        else:
+            self.state_store.ensure_task(batch_id, item.item_id, TaskStage.PREPARE)
+
+    def _cleanup_root_workspace_if_complete(self, root_item_id: str) -> None:
+        if not self.config.behavior.cleanup_workspace:
+            return
+        if not self.state_store.root_is_complete(root_item_id):
+            return
+        root_item = self.state_store.get_item_by_id(root_item_id)
+        if root_item is None:
+            return
+        if root_item.status == ItemStatus.SPLIT and self.config.behavior.move_outputs:
+            self._remove_source_path(root_item.source_path)
+        if root_item.unpack_dir:
+            shutil.rmtree(root_item.unpack_dir.parent, ignore_errors=True)

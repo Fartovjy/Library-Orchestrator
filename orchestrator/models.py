@@ -13,6 +13,7 @@ def utc_now() -> str:
 class ItemStatus(StrEnum):
     DISCOVERED = "discovered"
     UNPACKED = "unpacked"
+    SPLIT = "split"
     PREPARED = "prepared"
     CLASSIFIED_FAST = "classified_fast"
     CLASSIFIED_DEEP = "classified_deep"
@@ -57,6 +58,7 @@ class QueueStage(StrEnum):
 class TaskStage(StrEnum):
     DISCOVERY = "discovery"
     UNPACK = "unpack"
+    SPLITTER = "splitter"
     PREPARE = "prepare"
     ARCHIVARIUS = "archivarius"
     EXPERT = "expert"
@@ -84,6 +86,8 @@ class Classification:
 class WorkItem:
     item_id: str
     batch_id: str
+    parent_item_id: str | None
+    root_item_id: str
     source_path: Path
     source_name: str
     container_kind: ContainerKind

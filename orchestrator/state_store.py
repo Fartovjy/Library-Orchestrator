@@ -49,6 +49,8 @@ class StateStore:
                 CREATE TABLE IF NOT EXISTS items (
                     item_id TEXT PRIMARY KEY,
                     batch_id TEXT NOT NULL DEFAULT '',
+                    parent_item_id TEXT,
+                    root_item_id TEXT NOT NULL DEFAULT '',
                     source_path TEXT NOT NULL UNIQUE,
                     source_name TEXT NOT NULL,
                     container_kind TEXT NOT NULL,
@@ -101,8 +103,17 @@ class StateStore:
                 """
             )
             self._ensure_column(connection, "items", "batch_id", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(connection, "items", "parent_item_id", "TEXT")
+            self._ensure_column(connection, "items", "root_item_id", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(connection, "items", "prepared_excerpt", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(connection, "tasks", "confidence", "REAL")
+            connection.execute(
+                """
+                UPDATE items
+                SET root_item_id = item_id
+                WHERE root_item_id = ''
+                """
+            )
 
     def _ensure_column(self, connection: sqlite3.Connection, table_name: str, column_name: str, spec: str) -> None:
         columns = {
@@ -193,15 +204,50 @@ class StateStore:
                 existing.batch_id = batch_id
                 self.save_item(existing)
             return existing
+        item_id = str(uuid.uuid4())
         item = WorkItem(
-            item_id=str(uuid.uuid4()),
+            item_id=item_id,
             batch_id=batch_id,
+            parent_item_id=None,
+            root_item_id=item_id,
             source_path=source_path,
             source_name=source_path.name,
             container_kind=container_kind,
         )
         self.save_item(item)
         self.add_event(item.item_id, "discover", "Source object discovered.")
+        return item
+
+    def create_child_item(
+        self,
+        parent_item: WorkItem,
+        source_path: Path,
+        container_kind: ContainerKind,
+    ) -> WorkItem:
+        existing = self.get_item_by_source(source_path)
+        if existing is not None:
+            if existing.batch_id != parent_item.batch_id:
+                existing.batch_id = parent_item.batch_id
+                existing.parent_item_id = parent_item.item_id
+                existing.root_item_id = parent_item.root_item_id or parent_item.item_id
+                self.save_item(existing)
+            return existing
+        item = WorkItem(
+            item_id=str(uuid.uuid4()),
+            batch_id=parent_item.batch_id,
+            parent_item_id=parent_item.item_id,
+            root_item_id=parent_item.root_item_id or parent_item.item_id,
+            source_path=source_path,
+            source_name=source_path.name,
+            container_kind=container_kind,
+        )
+        self.save_item(item)
+        self.add_event(
+            item.item_id,
+            "spawned_from_split",
+            "Created child item from multi-book container.",
+            payload={"parent_item_id": parent_item.item_id},
+        )
         return item
 
     def get_item_by_source(self, source_path: Path) -> WorkItem | None:
@@ -225,13 +271,14 @@ class StateStore:
             ItemStatus.PLACED.value,
             ItemStatus.DUPLICATE.value,
             ItemStatus.NON_BOOK.value,
+            ItemStatus.SPLIT.value,
             ItemStatus.MANUAL_REVIEW.value,
             ItemStatus.TRASH.value,
             ItemStatus.DAMAGED.value,
         )
         with self._lock, self._connect() as connection:
             rows = connection.execute(
-                "SELECT source_path FROM items WHERE status IN (?, ?, ?, ?, ?, ?)",
+                "SELECT source_path FROM items WHERE status IN (?, ?, ?, ?, ?, ?, ?)",
                 terminal_statuses,
             ).fetchall()
         return {row["source_path"] for row in rows}
@@ -242,12 +289,14 @@ class StateStore:
             connection.execute(
                 """
                 INSERT INTO items (
-                    item_id, batch_id, source_path, source_name, container_kind, status, author, title,
+                    item_id, batch_id, parent_item_id, root_item_id, source_path, source_name, container_kind, status, author, title,
                     genre, confidence, source_hash, packed_hash, prepared_excerpt, unpack_dir, packed_path,
                     final_path, message, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(item_id) DO UPDATE SET
                     batch_id=excluded.batch_id,
+                    parent_item_id=excluded.parent_item_id,
+                    root_item_id=excluded.root_item_id,
                     status=excluded.status,
                     author=excluded.author,
                     title=excluded.title,
@@ -265,6 +314,8 @@ class StateStore:
                 (
                     item.item_id,
                     item.batch_id,
+                    item.parent_item_id,
+                    item.root_item_id or item.item_id,
                     str(item.source_path),
                     item.source_name,
                     item.container_kind.value,
@@ -406,14 +457,26 @@ class StateStore:
             terminal_row = connection.execute(
                 """
                 SELECT COUNT(*) AS count
-                FROM items
-                WHERE batch_id = ? AND status IN (?, ?, ?, ?, ?, ?)
+                FROM (
+                    SELECT root_item_id
+                    FROM items
+                    WHERE batch_id = ?
+                    GROUP BY root_item_id
+                    HAVING SUM(
+                        CASE
+                            WHEN status IN (?, ?, ?, ?, ?, ?, ?)
+                            THEN 0
+                            ELSE 1
+                        END
+                    ) = 0
+                ) AS completed_roots
                 """,
                 (
                     batch_id,
                     ItemStatus.PLACED.value,
                     ItemStatus.DUPLICATE.value,
                     ItemStatus.NON_BOOK.value,
+                    ItemStatus.SPLIT.value,
                     ItemStatus.MANUAL_REVIEW.value,
                     ItemStatus.TRASH.value,
                     ItemStatus.DAMAGED.value,
@@ -474,6 +537,28 @@ class StateStore:
             },
         )
 
+    def root_is_complete(self, root_item_id: str) -> bool:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM items
+                WHERE root_item_id = ?
+                  AND status NOT IN (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    root_item_id,
+                    ItemStatus.PLACED.value,
+                    ItemStatus.DUPLICATE.value,
+                    ItemStatus.NON_BOOK.value,
+                    ItemStatus.SPLIT.value,
+                    ItemStatus.MANUAL_REVIEW.value,
+                    ItemStatus.TRASH.value,
+                    ItemStatus.DAMAGED.value,
+                ),
+            ).fetchone()
+        return bool(row and int(row["count"]) == 0)
+
     def add_event(self, item_id: str, stage: str, message: str, payload: dict | None = None) -> None:
         with self._lock, self._connect() as connection:
             connection.execute(
@@ -533,6 +618,8 @@ class StateStore:
         return WorkItem(
             item_id=row["item_id"],
             batch_id=row["batch_id"] or "",
+            parent_item_id=row["parent_item_id"],
+            root_item_id=row["root_item_id"] or row["item_id"],
             source_path=Path(row["source_path"]),
             source_name=row["source_name"],
             container_kind=ContainerKind(row["container_kind"]),
