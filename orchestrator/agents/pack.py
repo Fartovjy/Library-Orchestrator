@@ -17,6 +17,8 @@ class PackAgent(BaseAgent):
         output_path = staging_root / output_name
         if item.unpack_dir is None:
             raise RuntimeError("Cannot pack item without unpack_dir.")
+        if not any(path.is_file() for path in item.unpack_dir.rglob("*")):
+            raise RuntimeError("Cannot pack empty workspace.")
         pack_directory_to_zip(item.unpack_dir, output_path)
         item.packed_path = output_path
         item.packed_hash = compute_sha256(output_path)
