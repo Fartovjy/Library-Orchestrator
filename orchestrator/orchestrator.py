@@ -589,6 +589,7 @@ class LibraryOrchestrator:
         self._cleanup_root_workspace_if_complete(item.root_item_id)
 
     def create_stop_file(self) -> Path:
+        self.clear_pause_file()
         stop_file = self.config.paths.stop_file
         stop_file.parent.mkdir(parents=True, exist_ok=True)
         stop_file.write_text("stop\n", encoding="utf-8")
@@ -675,6 +676,7 @@ class LibraryOrchestrator:
         shutil.rmtree(self.config.paths.workspace_root, ignore_errors=True)
         self.config.paths.workspace_root.mkdir(parents=True, exist_ok=True)
         self.state_store.abort_batch(batch_id)
+        self.clear_pause_file()
 
     def _reset_item_for_fresh_run(self, item) -> None:
         item.batch_id = ""

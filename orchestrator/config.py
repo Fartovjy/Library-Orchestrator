@@ -112,7 +112,7 @@ class AppConfig:
         damaged_root = path_values.get("damaged_root", output_root / "_Damaged")
         failed_root = path_values.get("failed_root", output_root / "_Failed")
         workspace_root = path_values.get("workspace_root", repo_root / "temp")
-        runtime_root = repo_root / "runtime"
+        runtime_root = AppConfig._detect_runtime_root(path_values, repo_root)
         return PathsConfig(
             source_root=path_values["source_root"],
             output_root=output_root,
@@ -130,3 +130,20 @@ class AppConfig:
             pause_file=path_values.get("pause_file", runtime_root / "PAUSE"),
             run_lock_file=path_values.get("run_lock_file", runtime_root / "RUNNING.lock"),
         )
+
+    @staticmethod
+    def _detect_runtime_root(path_values: dict[str, Path], repo_root: Path) -> Path:
+        if "pause_file" in path_values:
+            return path_values["pause_file"].parent
+        if "stop_file" in path_values:
+            return path_values["stop_file"].parent
+        if "run_lock_file" in path_values:
+            return path_values["run_lock_file"].parent
+        if "logs_root" in path_values:
+            return path_values["logs_root"].parent
+        if "state_db" in path_values:
+            state_parent = path_values["state_db"].parent
+            if state_parent.name.lower() == "state":
+                return state_parent.parent
+            return state_parent
+        return repo_root / "runtime"
