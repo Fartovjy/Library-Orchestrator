@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import sys
 
 if sys.platform == "win32":
@@ -8,27 +9,42 @@ else:  # pragma: no cover
     msvcrt = None
 
 
-class StopHotkeyWatcher:
+@dataclass(slots=True)
+class HotkeyAction:
+    action: str
+    label: str
+
+
+class RuntimeHotkeyWatcher:
     def __init__(self) -> None:
         self.last_trigger: str = ""
 
-    def poll_stop_requested(self) -> bool:
+    def poll_action(self) -> HotkeyAction | None:
         if msvcrt is None:
-            return False
-        triggered = False
+            return None
+        detected: HotkeyAction | None = None
         while msvcrt.kbhit():
             key = msvcrt.getch()
-            if key in {b"\x18", b"\x1b", b"q", b"Q"}:
-                self.last_trigger = self._describe_key(key)
-                triggered = True
-        return triggered
+            action = self._map_key(key)
+            if action is None:
+                continue
+            self.last_trigger = action.label
+            detected = action
+        return detected
 
     def hint(self) -> str:
         if msvcrt is None:
-            return "Use CLI stop command"
-        return "Ctrl+X or Esc or Q = safe stop"
+            return "pause/resume via CLI, stop via CLI"
+        return "Ctrl+X / Esc / Q = pause-resume | Ctrl+S = safe stop"
 
-    def _describe_key(self, key: bytes) -> str:
+    def _map_key(self, key: bytes) -> HotkeyAction | None:
+        if key in {b"\x18", b"\x1b", b"q", b"Q"}:
+            return HotkeyAction("pause_toggle", self._describe_pause_key(key))
+        if key == b"\x13":
+            return HotkeyAction("stop", "Ctrl+S")
+        return None
+
+    def _describe_pause_key(self, key: bytes) -> str:
         if key == b"\x18":
             return "Ctrl+X"
         if key == b"\x1b":

@@ -20,6 +20,7 @@ class PathsConfig:
     state_db: Path
     logs_root: Path
     stop_file: Path
+    pause_file: Path
     run_lock_file: Path
 
     def ensure_directories(self) -> None:
@@ -126,5 +127,6 @@ class AppConfig:
             state_db=path_values.get("state_db", runtime_root / "state" / "orchestrator.db"),
             logs_root=path_values.get("logs_root", runtime_root / "logs"),
             stop_file=path_values.get("stop_file", runtime_root / "STOP"),
+            pause_file=path_values.get("pause_file", runtime_root / "PAUSE"),
             run_lock_file=path_values.get("run_lock_file", runtime_root / "RUNNING.lock"),
         )

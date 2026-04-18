@@ -32,7 +32,7 @@ from .archive_adapters import (
 )
 from .config import AppConfig
 from .dashboard import TerminalDashboard
-from .hotkeys import StopHotkeyWatcher
+from .hotkeys import RuntimeHotkeyWatcher
 from .lmstudio import LmStudioClient
 from .models import BatchRun, ItemStatus, TaskStage
 from .queues import StageQueues
@@ -69,7 +69,7 @@ class LibraryOrchestrator:
             queues=self.queues,
         )
         self.dashboard = TerminalDashboard()
-        self.hotkeys = StopHotkeyWatcher()
+        self.hotkeys = RuntimeHotkeyWatcher()
         self.dashboard.reset(hotkey_hint=self.hotkeys.hint(), render=False)
         self.unpack_agent = UnpackAgent()
         self.archivarius_agent = ArchivariusAgent()
@@ -177,10 +177,19 @@ class LibraryOrchestrator:
             )
 
             while any(not future.done() for future in futures):
+                self._poll_runtime_action()
                 self._sync_dashboard(batch.batch_id)
-                if self._poll_stop_requested():
+                if self._stop_requested():
                     self._stop_event.set()
                     break
+                if self._pause_requested():
+                    self.dashboard.set_current(
+                        self.config.paths.source_root,
+                        "paused",
+                        "Dispatch paused. Press Ctrl+X / Esc / Q again or run resume.",
+                    )
+                    time.sleep(0.2)
+                    continue
                 if not self.state_store.batch_has_pending_work(batch.batch_id):
                     self.state_store.finalize_batch(batch.batch_id)
                     self._stop_event.set()
@@ -219,9 +228,13 @@ class LibraryOrchestrator:
 
     def _run_stage_loop(self, batch_id: str, worker_name: str, stages: list[TaskStage]) -> None:
         while not self._stop_event.is_set():
-            if self._poll_stop_requested():
+            self._poll_runtime_action()
+            if self._stop_requested():
                 self._stop_event.set()
                 return
+            if self._pause_requested():
+                time.sleep(0.2)
+                continue
 
             claimed = self._claim_from_stages(batch_id, worker_name, stages)
             if claimed is None:
@@ -476,7 +489,8 @@ class LibraryOrchestrator:
         while self.resource_monitor.should_throttle() and not self._stop_event.is_set():
             self.dashboard.set_current(source_path, "throttle", "Waiting for disk load to drop.")
             time.sleep(self.config.limits.sleep_if_busy_seconds)
-            if self._poll_stop_requested():
+            self._poll_runtime_action()
+            if self._stop_requested():
                 self._stop_event.set()
                 return
 
@@ -566,9 +580,19 @@ class LibraryOrchestrator:
         stop_file.write_text("stop\n", encoding="utf-8")
         return stop_file
 
+    def create_pause_file(self) -> Path:
+        pause_file = self.config.paths.pause_file
+        pause_file.parent.mkdir(parents=True, exist_ok=True)
+        pause_file.write_text("pause\n", encoding="utf-8")
+        return pause_file
+
     def clear_stop_file(self) -> None:
         if self.config.paths.stop_file.exists():
             self.config.paths.stop_file.unlink()
+
+    def clear_pause_file(self) -> None:
+        if self.config.paths.pause_file.exists():
+            self.config.paths.pause_file.unlink()
 
     def repair_database(self) -> dict[str, int]:
         self.dashboard.reset(
@@ -605,16 +629,26 @@ class LibraryOrchestrator:
     def _stop_requested(self) -> bool:
         return self.config.paths.stop_file.exists()
 
-    def _poll_stop_requested(self) -> bool:
-        if self._stop_requested():
-            return True
-        if not self.hotkeys.poll_stop_requested():
-            return False
-        self.create_stop_file()
+    def _pause_requested(self) -> bool:
+        return self.config.paths.pause_file.exists()
+
+    def _poll_runtime_action(self) -> None:
+        action = self.hotkeys.poll_action()
+        if action is None:
+            return
         current_item = self.dashboard.state.current_item
         target = self.config.paths.source_root if current_item == "-" else Path(current_item)
-        self.dashboard.set_current(target, "stop_requested", f"Safe stop requested by {self.hotkeys.last_trigger}.")
-        return True
+        if action.action == "pause_toggle":
+            if self._pause_requested():
+                self.clear_pause_file()
+                self.dashboard.set_current(target, "resume_requested", f"Resuming by {action.label}.")
+            else:
+                self.create_pause_file()
+                self.dashboard.set_current(target, "paused", f"Pause requested by {action.label}.")
+            return
+        if action.action == "stop":
+            self.create_stop_file()
+            self.dashboard.set_current(target, "stop_requested", f"Safe stop requested by {action.label}.")
 
     def _is_skipped(self, path: Path, skip_roots: set[Path]) -> bool:
         for skip_root in skip_roots:

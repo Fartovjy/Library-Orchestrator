@@ -30,6 +30,7 @@ class ItemStatus(StrEnum):
 class BatchStatus(StrEnum):
     ACTIVE = "active"
     COMPLETED = "completed"
+    ABORTED = "aborted"
 
 
 class ContainerKind(StrEnum):
