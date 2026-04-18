@@ -6,7 +6,8 @@
     "failed_root": "E:/Результат/_Failed",
     "state_db": "E:/Разобрать/orchestrator_project/runtime/state/orchestrator.db",
     "logs_root": "E:/Разобрать/orchestrator_project/runtime/logs",
-    "stop_file": "E:/Разобрать/orchestrator_project/runtime/STOP"
+    "stop_file": "E:/Разобрать/orchestrator_project/runtime/STOP",
+    "run_lock_file": "E:/Разобрать/orchestrator_project/runtime/RUNNING.lock"
   },
   "lmstudio": {
     "base_url": "http://127.0.0.1:1234/v1",

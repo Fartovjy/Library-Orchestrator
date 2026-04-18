@@ -123,6 +123,7 @@ orchestrator_project/
 - JSON config with runtime paths, models, limits, and behavior flags
 - `behavior.detect_duplicates` lets you disable duplicate routing entirely when you want every packed book placed into the library tree
 - `behavior.safe_mode` defaults to `true` and prevents source deletion even if `move_outputs` is enabled
+- `paths.run_lock_file` prevents a second orchestrator process from attaching to the same batch at the same time
 - separate `output_root` for final outputs so results do not loop back into the source tree
 - default temp workspace at `C:/Users/Home/Documents/orchestrator_project/temp`
 - SQLite state store for items, events, and known content hashes
@@ -155,6 +156,7 @@ orchestrator_project/
 - DB-first workers can resume after stop/restart by resetting claimed tasks back to pending
 - Fast trash/non-book/manual-review routing can proceed while LM Studio is classifying other files
 - Safe mode keeps original source files in place by default; outputs are copied, not used to destroy the source corpus
+- Only one `python -m orchestrator.main run ...` process may work with a runtime at a time; a second process now exits instead of reusing the active batch concurrently
 - Typical tuning is 4 light workers with 1 shared heavy LM classification slot
 - Light workers work from SQLite tasks and keep temp excerpts in the DB before heavy processing
 - Queue abstraction, worker limits, and HDD throttling are in place for controlled scaling

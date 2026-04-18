@@ -20,6 +20,7 @@ class PathsConfig:
     state_db: Path
     logs_root: Path
     stop_file: Path
+    run_lock_file: Path
 
     def ensure_directories(self) -> None:
         for path in (
@@ -34,6 +35,7 @@ class PathsConfig:
             self.failed_root,
             self.state_db.parent,
             self.logs_root,
+            self.run_lock_file.parent,
         ):
             path.mkdir(parents=True, exist_ok=True)
 
@@ -124,4 +126,5 @@ class AppConfig:
             state_db=path_values.get("state_db", runtime_root / "state" / "orchestrator.db"),
             logs_root=path_values.get("logs_root", runtime_root / "logs"),
             stop_file=path_values.get("stop_file", runtime_root / "STOP"),
+            run_lock_file=path_values.get("run_lock_file", runtime_root / "RUNNING.lock"),
         )

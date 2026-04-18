@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import shutil
 import threading
 import time
@@ -80,6 +82,13 @@ class LibraryOrchestrator:
         self._stop_event = threading.Event()
 
     def run(self, limit: int | None = None) -> dict[str, int]:
+        self._acquire_run_lock()
+        try:
+            return self._run_with_lock(limit)
+        finally:
+            self._release_run_lock()
+
+    def _run_with_lock(self, limit: int | None = None) -> dict[str, int]:
         if self._stop_requested():
             self.clear_stop_file()
             self.dashboard.set_current(
@@ -412,6 +421,7 @@ class LibraryOrchestrator:
         return item.message, item.confidence
 
     def _process_pack_task(self, batch_id: str, item) -> tuple[str, float | None]:
+        item = self._ensure_workspace_ready_for_pack(item)
         with self._pack_slots:
             item = self.pack_agent.run(self.context, item)
         self.state_store.ensure_task(batch_id, item.item_id, TaskStage.PLACEMENT)
@@ -737,6 +747,42 @@ class LibraryOrchestrator:
         with self._pack_slots:
             return self.pack_agent.run(self.context, item)
 
+    def _ensure_workspace_ready_for_pack(self, item):
+        if self._workspace_has_files(item.unpack_dir):
+            return item
+
+        if not item.source_path.exists():
+            raise RuntimeError("Workspace is empty and source data is unavailable.")
+
+        if should_unpack_with_agent(item.container_kind):
+            with self._unpack_slots:
+                item, excerpt = self.unpack_agent.run(self.context, item)
+            item.prepared_excerpt = item.prepared_excerpt or excerpt
+            self.state_store.save_item(item)
+            self.state_store.add_event(
+                item.item_id,
+                "repack_stage",
+                "Workspace restored from source before pack.",
+                payload={"unpack_dir": str(item.unpack_dir) if item.unpack_dir else ""},
+            )
+            return item
+
+        item.unpack_dir, nested_count = stage_source(
+            item.source_path,
+            self.context.workspace_root / item.item_id,
+            max_nested_depth=self.config.limits.max_nested_archive_depth,
+        )
+        self.state_store.add_event(
+            item.item_id,
+            "repack_stage",
+            "Workspace restaged from source before pack.",
+            payload={
+                "unpack_dir": str(item.unpack_dir),
+                "nested_archives_expanded": nested_count,
+            },
+        )
+        return item
+
     def _failure_target_for_error(self, stage: TaskStage, message: str) -> tuple[Path, ItemStatus]:
         normalized = message.lower()
         if stage == TaskStage.UNPACK and (
@@ -754,3 +800,51 @@ class LibraryOrchestrator:
 
     def _should_move_source_for_special_route(self) -> bool:
         return self.config.behavior.move_outputs and not self.config.behavior.safe_mode
+
+    def _workspace_has_files(self, unpack_dir: Path | None) -> bool:
+        if unpack_dir is None or not unpack_dir.exists():
+            return False
+        return any(path.is_file() for path in unpack_dir.rglob("*"))
+
+    def _acquire_run_lock(self) -> None:
+        lock_path = self.config.paths.run_lock_file
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if lock_path.exists():
+            try:
+                payload = json.loads(lock_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            lock_pid = int(payload.get("pid", 0) or 0)
+            if lock_pid and self._pid_is_running(lock_pid) and lock_pid != os.getpid():
+                raise RuntimeError(
+                    f"Another orchestrator run is already active (pid={lock_pid}). "
+                    "Stop it first or wait for it to finish."
+                )
+        lock_payload = {
+            "pid": os.getpid(),
+            "started_at": time.time(),
+            "source_root": str(self.config.paths.source_root),
+            "state_db": str(self.config.paths.state_db),
+        }
+        lock_path.write_text(json.dumps(lock_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _release_run_lock(self) -> None:
+        lock_path = self.config.paths.run_lock_file
+        if not lock_path.exists():
+            return
+        try:
+            payload = json.loads(lock_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        lock_pid = int(payload.get("pid", 0) or 0)
+        if lock_pid in {0, os.getpid()}:
+            lock_path.unlink(missing_ok=True)
+
+    def _pid_is_running(self, pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
