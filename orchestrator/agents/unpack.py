@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..archive_adapters import collect_excerpt, is_supported_unpack_kind, unpack_source
+from ..archive_adapters import is_supported_unpack_kind, unpack_source
 from ..models import ItemStatus
 from .base import AgentContext, BaseAgent
 
@@ -14,7 +14,7 @@ class UnpackAgent(BaseAgent):
             item.message = f"Unsupported container kind: {item.container_kind.value}"
             context.state_store.save_item(item)
             context.state_store.add_event(item.item_id, self.name, item.message)
-            return item, ""
+            return item
 
         unpack_dir = context.workspace_root / item.item_id
         item.unpack_dir, nested_count = unpack_source(
@@ -34,6 +34,4 @@ class UnpackAgent(BaseAgent):
             item.message,
             payload={"nested_archives_expanded": nested_count},
         )
-        excerpt_source = item.unpack_dir or item.source_path
-        excerpt = collect_excerpt(excerpt_source, context.config.lmstudio.fast_excerpt_words)
-        return item, excerpt
+        return item

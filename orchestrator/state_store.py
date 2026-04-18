@@ -117,6 +117,13 @@ class StateStore:
             )
             connection.execute(
                 """
+                UPDATE items
+                SET prepared_excerpt = ''
+                WHERE prepared_excerpt != ''
+                """
+            )
+            connection.execute(
+                """
                 DELETE FROM known_hashes
                 WHERE content_hash = ?
                 """,

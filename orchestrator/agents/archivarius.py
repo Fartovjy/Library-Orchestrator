@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ..archive_adapters import collect_excerpt
 from ..models import ItemStatus
 from .base import AgentContext, BaseAgent
 
@@ -7,7 +8,9 @@ from .base import AgentContext, BaseAgent
 class ArchivariusAgent(BaseAgent):
     name = "archivarius"
 
-    def run(self, context: AgentContext, item, excerpt: str):
+    def run(self, context: AgentContext, item):
+        excerpt_source = item.unpack_dir or item.source_path
+        excerpt = collect_excerpt(excerpt_source, context.config.lmstudio.fast_excerpt_words)
         classification = context.lmstudio.classify_book(
             filename=item.source_name,
             excerpt=excerpt,

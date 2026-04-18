@@ -332,8 +332,7 @@ class LibraryOrchestrator:
 
     def _process_unpack_task(self, batch_id: str, item) -> tuple[str, float | None]:
         with self._unpack_slots:
-            item, excerpt = self.unpack_agent.run(self.context, item)
-        item.prepared_excerpt = excerpt
+            item = self.unpack_agent.run(self.context, item)
         self.state_store.save_item(item)
         if item.status in TERMINAL_STATUSES:
             return item.message, None
@@ -368,10 +367,7 @@ class LibraryOrchestrator:
 
     def _process_prepare_task(self, batch_id: str, item) -> tuple[str, float | None]:
         if item.unpack_dir and item.unpack_dir.exists():
-            excerpt = item.prepared_excerpt or collect_excerpt(
-                item.unpack_dir,
-                self.config.lmstudio.fast_excerpt_words,
-            )
+            excerpt = collect_excerpt(item.unpack_dir, self.config.lmstudio.fast_excerpt_words)
         else:
             item.unpack_dir, nested_count = stage_source(
                 item.source_path,
@@ -389,7 +385,6 @@ class LibraryOrchestrator:
                 },
             )
 
-        item.prepared_excerpt = excerpt
         item.status = ItemStatus.PREPARED
         item.message = "Prepared for fast classification."
         self.state_store.save_item(item)
@@ -399,7 +394,7 @@ class LibraryOrchestrator:
             item.message,
             payload={
                 "unpack_dir": str(item.unpack_dir) if item.unpack_dir else "",
-                "excerpt_words": len(item.prepared_excerpt.split()),
+                "excerpt_words": len(excerpt.split()),
             },
         )
         self.state_store.ensure_task(batch_id, item.item_id, TaskStage.DUPLICATE_CHECK)
@@ -422,7 +417,7 @@ class LibraryOrchestrator:
         return "No early duplicate found.", None
 
     def _process_archivarius_task(self, batch_id: str, item) -> tuple[str, float | None]:
-        item, needs_deep = self.archivarius_agent.run(self.context, item, item.prepared_excerpt)
+        item, needs_deep = self.archivarius_agent.run(self.context, item)
         if needs_deep:
             item.message = "Queued for deep classification."
             self.state_store.save_item(item)
@@ -774,8 +769,7 @@ class LibraryOrchestrator:
                 raise RuntimeError("Packed archive is invalid and source data is unavailable.")
             if should_unpack_with_agent(item.container_kind):
                 with self._unpack_slots:
-                    item, excerpt = self.unpack_agent.run(self.context, item)
-                item.prepared_excerpt = excerpt
+                    item = self.unpack_agent.run(self.context, item)
                 self.state_store.save_item(item)
             else:
                 item.unpack_dir, nested_count = stage_source(
@@ -805,8 +799,7 @@ class LibraryOrchestrator:
 
         if should_unpack_with_agent(item.container_kind):
             with self._unpack_slots:
-                item, excerpt = self.unpack_agent.run(self.context, item)
-            item.prepared_excerpt = item.prepared_excerpt or excerpt
+                item = self.unpack_agent.run(self.context, item)
             self.state_store.save_item(item)
             self.state_store.add_event(
                 item.item_id,
