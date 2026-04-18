@@ -19,10 +19,16 @@ class ItemStatus(StrEnum):
     PACKED = "packed"
     PLACED = "placed"
     DUPLICATE = "duplicate"
+    NON_BOOK = "non_book"
     MANUAL_REVIEW = "manual_review"
     TRASH = "trash"
     DAMAGED = "damaged"
     FAILED = "failed"
+
+
+class BatchStatus(StrEnum):
+    ACTIVE = "active"
+    COMPLETED = "completed"
 
 
 class ContainerKind(StrEnum):
@@ -48,6 +54,22 @@ class QueueStage(StrEnum):
     DONE = "done"
 
 
+class TaskStage(StrEnum):
+    DISCOVERY = "discovery"
+    UNPACK = "unpack"
+    PREPARE = "prepare"
+    ARCHIVARIUS = "archivarius"
+    EXPERT = "expert"
+    PACK = "pack"
+    PLACEMENT = "placement"
+
+
+class TaskStatus(StrEnum):
+    PENDING = "pending"
+    CLAIMED = "claimed"
+    DONE = "done"
+
+
 @dataclass(slots=True)
 class Classification:
     author: str = ""
@@ -61,6 +83,7 @@ class Classification:
 @dataclass(slots=True)
 class WorkItem:
     item_id: str
+    batch_id: str
     source_path: Path
     source_name: str
     container_kind: ContainerKind
@@ -86,3 +109,24 @@ class ResourceSnapshot:
     io_busy_percent: float
     cpu_percent: float
     sampled_at: str = field(default_factory=utc_now)
+
+
+@dataclass(slots=True)
+class BatchRun:
+    batch_id: str
+    requested_limit: int
+    selected_count: int
+    status: BatchStatus = BatchStatus.ACTIVE
+    created_at: str = field(default_factory=utc_now)
+    updated_at: str = field(default_factory=utc_now)
+
+
+@dataclass(slots=True)
+class BatchProgress:
+    batch_id: str
+    total_items: int
+    processed_items: int
+    stage_totals: dict[str, int] = field(default_factory=dict)
+    stage_done: dict[str, int] = field(default_factory=dict)
+    status_counts: dict[str, int] = field(default_factory=dict)
+    recognition_avgs: dict[str, float] = field(default_factory=dict)

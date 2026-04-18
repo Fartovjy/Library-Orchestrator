@@ -2,7 +2,7 @@
   "paths": {
     "source_root": "E:/Разобрать",
     "output_root": "E:/Результат",
-    "workspace_root": "E:/Разобрать/orchestrator_project/runtime/workspace",
+    "workspace_root": "C:/Users/Home/Documents/orchestrator_project/temp",
     "state_db": "E:/Разобрать/orchestrator_project/runtime/state/orchestrator.db",
     "logs_root": "E:/Разобрать/orchestrator_project/runtime/logs",
     "stop_file": "E:/Разобрать/orchestrator_project/runtime/STOP"

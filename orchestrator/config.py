@@ -12,6 +12,7 @@ class PathsConfig:
     workspace_root: Path
     library_root: Path
     duplicates_root: Path
+    non_book_root: Path
     manual_review_root: Path
     trash_root: Path
     damaged_root: Path
@@ -25,6 +26,7 @@ class PathsConfig:
             self.workspace_root,
             self.library_root,
             self.duplicates_root,
+            self.non_book_root,
             self.manual_review_root,
             self.trash_root,
             self.damaged_root,
@@ -90,24 +92,29 @@ class AppConfig:
     @staticmethod
     def _load_paths(raw_paths: dict) -> PathsConfig:
         path_values = {key: Path(value) for key, value in raw_paths.items()}
+        repo_root = Path(__file__).resolve().parents[1]
         output_root = path_values.get("output_root")
         if output_root is None:
-            output_root = path_values.get("library_root", Path.cwd() / "organized_output").parent
+            output_root = path_values.get("library_root", repo_root / "organized_output").parent
         library_root = path_values.get("library_root", output_root / "Library")
         duplicates_root = path_values.get("duplicates_root", output_root / "_Duplicates")
+        non_book_root = path_values.get("non_book_root", output_root / "_Non_Books")
         manual_review_root = path_values.get("manual_review_root", output_root / "_Manual_Review")
         trash_root = path_values.get("trash_root", output_root / "_Trash")
         damaged_root = path_values.get("damaged_root", output_root / "_Damaged")
+        workspace_root = path_values.get("workspace_root", repo_root / "temp")
+        runtime_root = repo_root / "runtime"
         return PathsConfig(
             source_root=path_values["source_root"],
             output_root=output_root,
-            workspace_root=path_values["workspace_root"],
+            workspace_root=workspace_root,
             library_root=library_root,
             duplicates_root=duplicates_root,
+            non_book_root=non_book_root,
             manual_review_root=manual_review_root,
             trash_root=trash_root,
             damaged_root=damaged_root,
-            state_db=path_values["state_db"],
-            logs_root=path_values["logs_root"],
-            stop_file=path_values["stop_file"],
+            state_db=path_values.get("state_db", runtime_root / "state" / "orchestrator.db"),
+            logs_root=path_values.get("logs_root", runtime_root / "logs"),
+            stop_file=path_values.get("stop_file", runtime_root / "STOP"),
         )

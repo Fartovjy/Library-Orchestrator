@@ -14,6 +14,69 @@ from .models import ContainerKind
 
 TEXT_EXTENSIONS = {".txt", ".md", ".rtf", ".fb2", ".html", ".htm"}
 BOOK_LIKE_EXTENSIONS = {".txt", ".md", ".rtf", ".fb2", ".html", ".htm", ".pdf", ".epub", ".djvu", ".doc", ".docx"}
+NON_BOOK_EXTENSIONS = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".h",
+    ".hh",
+    ".hpp",
+    ".hxx",
+    ".java",
+    ".kt",
+    ".kts",
+    ".cs",
+    ".go",
+    ".rs",
+    ".swift",
+    ".scala",
+    ".vb",
+    ".py",
+    ".pyw",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".php",
+    ".rb",
+    ".pl",
+    ".pm",
+    ".lua",
+    ".r",
+    ".pas",
+    ".asm",
+    ".s",
+    ".y",
+    ".yy",
+    ".cup",
+    ".lex",
+    ".l",
+    ".mak",
+    ".mk",
+    ".cmake",
+    ".gradle",
+    ".vcxproj",
+    ".sln",
+    ".csproj",
+    ".fsproj",
+}
+SOURCE_CODE_MARKERS = (
+    "#include",
+    "using namespace",
+    "public static void main",
+    "int main(",
+    "def __init__(",
+    "fn main(",
+    "package main",
+    "console.log(",
+    "import java.",
+    "select ",
+    "create table",
+    "typedef ",
+)
 NORMALIZABLE_TITLE_SUFFIXES = (
     ".zip",
     ".rar",
@@ -126,6 +189,10 @@ def classify_file_role(path: Path) -> str:
         return "trash"
     if magic_kind in {"image", "video", "audio", "executable", "sqlite"}:
         return "trash"
+    if suffix in NON_BOOK_EXTENSIONS:
+        return "non_book"
+    if magic_kind == "text" and _looks_like_source_code(path):
+        return "non_book"
     if magic_kind in {"zip", "pdf", "rar", "7z", "text", "chm", "iso"}:
         return "book_or_container"
     if suffix in BOOK_LIKE_EXTENSIONS:
@@ -272,6 +339,24 @@ def _excerpt_from_file(path: Path, max_words: int) -> str:
     except OSError:
         return ""
     return _normalize_text(content, max_words)
+
+
+def _looks_like_source_code(path: Path) -> bool:
+    if path.suffix.lower() in {".html", ".htm", ".fb2", ".rtf"}:
+        return False
+    try:
+        content = path.read_text(encoding="utf-8", errors="ignore")[:4096]
+    except OSError:
+        return False
+    if not content.strip():
+        return False
+    lowered = content.lower()
+    marker_hits = sum(1 for marker in SOURCE_CODE_MARKERS if marker in lowered)
+    syntax_hits = sum(
+        token in content
+        for token in ("{", "}", ";", "/*", "*/", "->", "::", "<?php", "class ", "struct ")
+    )
+    return marker_hits >= 1 and syntax_hits >= 2
 
 
 def _normalize_text(content: str, max_words: int) -> str:

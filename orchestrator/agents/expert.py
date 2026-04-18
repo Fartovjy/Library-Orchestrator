@@ -9,7 +9,8 @@ class ExpertAgent(BaseAgent):
     name = "expert"
 
     def run(self, context: AgentContext, item):
-        excerpt = collect_excerpt(item.source_path, context.config.lmstudio.deep_excerpt_words)
+        excerpt_source = item.unpack_dir or item.source_path
+        excerpt = collect_excerpt(excerpt_source, context.config.lmstudio.deep_excerpt_words)
         classification = context.lmstudio.classify_book(
             filename=item.source_name,
             excerpt=excerpt,
