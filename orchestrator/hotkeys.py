@@ -34,19 +34,12 @@ class RuntimeHotkeyWatcher:
 
     def hint(self) -> str:
         if msvcrt is None:
-            return "pause/resume via CLI, stop via CLI"
-        return "Ctrl+X / Esc / Q = pause-resume | Ctrl+S = safe stop"
+            return "pause via CLI, full stop via CLI"
+        return "Esc = pause current run | Ctrl+S = full stop batch"
 
     def _map_key(self, key: bytes) -> HotkeyAction | None:
-        if key in {b"\x18", b"\x1b", b"q", b"Q"}:
-            return HotkeyAction("pause_toggle", self._describe_pause_key(key))
-        if key == b"\x13":
-            return HotkeyAction("stop", "Ctrl+S")
-        return None
-
-    def _describe_pause_key(self, key: bytes) -> str:
-        if key == b"\x18":
-            return "Ctrl+X"
         if key == b"\x1b":
-            return "Esc"
-        return "Q"
+            return HotkeyAction("pause_run", "Esc")
+        if key == b"\x13":
+            return HotkeyAction("full_stop", "Ctrl+S")
+        return None

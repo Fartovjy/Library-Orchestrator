@@ -21,9 +21,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("repair", help="Repair SQLite state against current files.")
     subparsers.add_parser("status", help="Print state summary.")
-    subparsers.add_parser("pause", help="Pause dispatching new work.")
-    subparsers.add_parser("resume", help="Resume a paused run.")
-    subparsers.add_parser("stop", help="Request safe stop.")
+    subparsers.add_parser("pause", help="Stop current run and keep batch for resume.")
+    subparsers.add_parser("resume", help="Clear stale pause request.")
+    subparsers.add_parser("stop", help="Full stop: end batch and clear temp workspace.")
     subparsers.add_parser("clear-stop", help="Remove stop request.")
     return parser
 

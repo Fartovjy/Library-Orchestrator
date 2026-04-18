@@ -188,6 +188,18 @@ class StateStore:
                 (BatchStatus.COMPLETED.value, now, batch_id),
             )
 
+    def abort_batch(self, batch_id: str) -> None:
+        now = utc_now()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE batches
+                SET status = ?, updated_at = ?
+                WHERE batch_id = ?
+                """,
+                (BatchStatus.ABORTED.value, now, batch_id),
+            )
+
     def batch_has_pending_work(self, batch_id: str) -> bool:
         with self._lock, self._connect() as connection:
             row = connection.execute(
@@ -690,6 +702,45 @@ class StateStore:
                 """,
                 (batch_id, item_id),
             )
+
+    def delete_all_tasks_for_batch(self, batch_id: str) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM tasks
+                WHERE batch_id = ?
+                """,
+                (batch_id,),
+            )
+
+    def delete_item(self, item_id: str) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute("DELETE FROM events WHERE item_id = ?", (item_id,))
+            connection.execute("DELETE FROM items WHERE item_id = ?", (item_id,))
+
+    def root_has_terminal_descendants(self, root_item_id: str) -> bool:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM items
+                WHERE root_item_id = ?
+                  AND item_id != root_item_id
+                  AND status IN (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    root_item_id,
+                    ItemStatus.PLACED.value,
+                    ItemStatus.DUPLICATE.value,
+                    ItemStatus.NON_BOOK.value,
+                    ItemStatus.SPLIT.value,
+                    ItemStatus.MANUAL_REVIEW.value,
+                    ItemStatus.TRASH.value,
+                    ItemStatus.DAMAGED.value,
+                    ItemStatus.FAILED.value,
+                ),
+            ).fetchone()
+        return bool(row and int(row["count"]) > 0)
 
     def status_counts(self) -> dict[str, int]:
         with self._lock, self._connect() as connection:

@@ -97,12 +97,19 @@ class LibraryOrchestrator:
             self._release_run_lock()
 
     def _run_with_lock(self, limit: int | None = None) -> dict[str, int]:
+        if self._pause_requested():
+            self.clear_pause_file()
+            self.dashboard.set_current(
+                self.config.paths.source_root,
+                "resume",
+                "Cleared stale pause request from previous run.",
+            )
         if self._stop_requested():
             self.clear_stop_file()
             self.dashboard.set_current(
                 self.config.paths.source_root,
                 "resume",
-                "Cleared stale stop request from previous run.",
+                "Cleared stale full-stop request from previous run.",
             )
 
         batch = self._prepare_batch(limit)
@@ -185,11 +192,11 @@ class LibraryOrchestrator:
                 if self._pause_requested():
                     self.dashboard.set_current(
                         self.config.paths.source_root,
-                        "paused",
-                        "Dispatch paused. Press Ctrl+X / Esc / Q again or run resume.",
+                        "pause_requested",
+                        "Pausing after current tasks finish.",
                     )
-                    time.sleep(0.2)
-                    continue
+                    self._stop_event.set()
+                    break
                 if not self.state_store.batch_has_pending_work(batch.batch_id):
                     self.state_store.finalize_batch(batch.batch_id)
                     self._stop_event.set()
@@ -198,6 +205,16 @@ class LibraryOrchestrator:
 
             for future in futures:
                 future.result()
+
+        if self._stop_requested():
+            self._full_stop_batch(batch.batch_id)
+            self._sync_dashboard(batch.batch_id, "Batch fully stopped.")
+            self.clear_stop_file()
+            return self.state_store.batch_status_counts(batch.batch_id)
+        if self._pause_requested():
+            self._sync_dashboard(batch.batch_id, "Run paused. Resume with the next launch.")
+            self.clear_pause_file()
+            return self.state_store.batch_status_counts(batch.batch_id)
 
         self._sync_dashboard(batch.batch_id, "Batch completed.")
         return self.state_store.batch_status_counts(batch.batch_id)
@@ -229,12 +246,9 @@ class LibraryOrchestrator:
     def _run_stage_loop(self, batch_id: str, worker_name: str, stages: list[TaskStage]) -> None:
         while not self._stop_event.is_set():
             self._poll_runtime_action()
-            if self._stop_requested():
+            if self._stop_requested() or self._pause_requested():
                 self._stop_event.set()
                 return
-            if self._pause_requested():
-                time.sleep(0.2)
-                continue
 
             claimed = self._claim_from_stages(batch_id, worker_name, stages)
             if claimed is None:
@@ -490,7 +504,7 @@ class LibraryOrchestrator:
             self.dashboard.set_current(source_path, "throttle", "Waiting for disk load to drop.")
             time.sleep(self.config.limits.sleep_if_busy_seconds)
             self._poll_runtime_action()
-            if self._stop_requested():
+            if self._stop_requested() or self._pause_requested():
                 self._stop_event.set()
                 return
 
@@ -638,17 +652,57 @@ class LibraryOrchestrator:
             return
         current_item = self.dashboard.state.current_item
         target = self.config.paths.source_root if current_item == "-" else Path(current_item)
-        if action.action == "pause_toggle":
-            if self._pause_requested():
-                self.clear_pause_file()
-                self.dashboard.set_current(target, "resume_requested", f"Resuming by {action.label}.")
-            else:
-                self.create_pause_file()
-                self.dashboard.set_current(target, "paused", f"Pause requested by {action.label}.")
+        if action.action == "pause_run":
+            self.create_pause_file()
+            self.dashboard.set_current(target, "pause_requested", f"Pause requested by {action.label}.")
             return
-        if action.action == "stop":
+        if action.action == "full_stop":
             self.create_stop_file()
-            self.dashboard.set_current(target, "stop_requested", f"Safe stop requested by {action.label}.")
+            self.dashboard.set_current(target, "full_stop_requested", f"Full stop requested by {action.label}.")
+
+    def _full_stop_batch(self, batch_id: str) -> None:
+        self.state_store.delete_all_tasks_for_batch(batch_id)
+        for item in self.state_store.list_items(batch_id=batch_id):
+            if item.status in TERMINAL_STATUSES:
+                if item.status != ItemStatus.SPLIT:
+                    continue
+                if self.state_store.root_has_terminal_descendants(item.root_item_id):
+                    continue
+            if self._is_temp_child_item(item):
+                self.state_store.delete_item(item.item_id)
+                continue
+            self._reset_item_for_fresh_run(item)
+        shutil.rmtree(self.config.paths.workspace_root, ignore_errors=True)
+        self.config.paths.workspace_root.mkdir(parents=True, exist_ok=True)
+        self.state_store.abort_batch(batch_id)
+
+    def _reset_item_for_fresh_run(self, item) -> None:
+        item.batch_id = ""
+        item.parent_item_id = None
+        item.root_item_id = item.item_id
+        item.status = ItemStatus.DISCOVERED
+        item.author = ""
+        item.title = ""
+        item.genre = "Не распознано"
+        item.confidence = 0.0
+        item.source_hash = ""
+        item.packed_hash = ""
+        item.unpack_dir = None
+        item.packed_path = None
+        item.final_path = None
+        item.message = "Reset after full stop."
+        self.state_store.save_item(item)
+        self.state_store.add_event(item.item_id, "full_stop_reset", item.message)
+
+    def _is_temp_child_item(self, item) -> bool:
+        if item.parent_item_id is None:
+            return False
+        try:
+            source_path = item.source_path.resolve()
+            workspace_root = self.config.paths.workspace_root.resolve()
+        except OSError:
+            return True
+        return source_path == workspace_root or workspace_root in source_path.parents
 
     def _is_skipped(self, path: Path, skip_roots: set[Path]) -> bool:
         for skip_root in skip_roots:
