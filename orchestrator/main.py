@@ -21,8 +21,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("repair", help="Repair SQLite state against current files.")
     subparsers.add_parser("status", help="Print state summary.")
-    subparsers.add_parser("pause", help="Stop current run and keep batch for resume.")
-    subparsers.add_parser("resume", help="Clear stale pause request.")
     subparsers.add_parser("stop", help="Full stop: end batch and clear temp workspace.")
     subparsers.add_parser("clear-stop", help="Remove stop request.")
     return parser
@@ -57,16 +55,6 @@ def main() -> int:
     if args.command == "repair":
         summary = orchestrator.repair_database()
         print(json.dumps(summary, ensure_ascii=False, indent=2))
-        return 0
-
-    if args.command == "pause":
-        pause_file = orchestrator.create_pause_file()
-        print(f"Pause requested: {pause_file}")
-        return 0
-
-    if args.command == "resume":
-        orchestrator.clear_pause_file()
-        print("Pause cleared.")
         return 0
 
     if args.command == "stop":

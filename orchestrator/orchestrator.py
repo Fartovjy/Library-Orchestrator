@@ -97,13 +97,6 @@ class LibraryOrchestrator:
             self._release_run_lock()
 
     def _run_with_lock(self, limit: int | None = None) -> dict[str, int]:
-        if self._pause_requested():
-            self.clear_pause_file()
-            self.dashboard.set_current(
-                self.config.paths.source_root,
-                "resume",
-                "Cleared stale pause request from previous run.",
-            )
         if self._stop_requested():
             self.clear_stop_file()
             self.dashboard.set_current(
@@ -189,14 +182,6 @@ class LibraryOrchestrator:
                 if self._stop_requested():
                     self._stop_event.set()
                     break
-                if self._pause_requested():
-                    self.dashboard.set_current(
-                        self.config.paths.source_root,
-                        "pause_requested",
-                        "Pausing after current tasks finish.",
-                    )
-                    self._stop_event.set()
-                    break
                 if not self.state_store.batch_has_pending_work(batch.batch_id):
                     self.state_store.finalize_batch(batch.batch_id)
                     self._stop_event.set()
@@ -210,10 +195,6 @@ class LibraryOrchestrator:
             self._full_stop_batch(batch.batch_id)
             self._sync_dashboard(batch.batch_id, "Batch fully stopped.")
             self.clear_stop_file()
-            return self.state_store.batch_status_counts(batch.batch_id)
-        if self._pause_requested():
-            self._sync_dashboard(batch.batch_id, "Run paused. Resume with the next launch.")
-            self.clear_pause_file()
             return self.state_store.batch_status_counts(batch.batch_id)
 
         self._sync_dashboard(batch.batch_id, "Batch completed.")
@@ -246,7 +227,7 @@ class LibraryOrchestrator:
     def _run_stage_loop(self, batch_id: str, worker_name: str, stages: list[TaskStage]) -> None:
         while not self._stop_event.is_set():
             self._poll_runtime_action()
-            if self._stop_requested() or self._pause_requested():
+            if self._stop_requested():
                 self._stop_event.set()
                 return
 
@@ -504,7 +485,7 @@ class LibraryOrchestrator:
             self.dashboard.set_current(source_path, "throttle", "Waiting for disk load to drop.")
             time.sleep(self.config.limits.sleep_if_busy_seconds)
             self._poll_runtime_action()
-            if self._stop_requested() or self._pause_requested():
+            if self._stop_requested():
                 self._stop_event.set()
                 return
 
@@ -594,25 +575,14 @@ class LibraryOrchestrator:
         self._cleanup_root_workspace_if_complete(item.root_item_id)
 
     def create_stop_file(self) -> Path:
-        self.clear_pause_file()
         stop_file = self.config.paths.stop_file
         stop_file.parent.mkdir(parents=True, exist_ok=True)
         stop_file.write_text("stop\n", encoding="utf-8")
         return stop_file
 
-    def create_pause_file(self) -> Path:
-        pause_file = self.config.paths.pause_file
-        pause_file.parent.mkdir(parents=True, exist_ok=True)
-        pause_file.write_text("pause\n", encoding="utf-8")
-        return pause_file
-
     def clear_stop_file(self) -> None:
         if self.config.paths.stop_file.exists():
             self.config.paths.stop_file.unlink()
-
-    def clear_pause_file(self) -> None:
-        if self.config.paths.pause_file.exists():
-            self.config.paths.pause_file.unlink()
 
     def repair_database(self) -> dict[str, int]:
         self.dashboard.reset(
@@ -649,22 +619,15 @@ class LibraryOrchestrator:
     def _stop_requested(self) -> bool:
         return self.config.paths.stop_file.exists()
 
-    def _pause_requested(self) -> bool:
-        return self.config.paths.pause_file.exists()
-
     def _poll_runtime_action(self) -> None:
         action = self.hotkeys.poll_action()
         if action is None:
             return
-        current_item = self.dashboard.state.current_item
-        target = self.config.paths.source_root if current_item == "-" else Path(current_item)
-        if action.action == "pause_run":
-            self.create_pause_file()
-            self.dashboard.set_current(target, "pause_requested", f"Pause requested by {action.label}.")
-            return
         if action.action == "full_stop":
+            target = self.dashboard.state.current_item
+            path_target = self.config.paths.source_root if target == "-" else Path(target)
             self.create_stop_file()
-            self.dashboard.set_current(target, "full_stop_requested", f"Full stop requested by {action.label}.")
+            self.dashboard.set_current(path_target, "full_stop_requested", f"Full stop requested by {action.label}.")
 
     def _full_stop_batch(self, batch_id: str) -> None:
         self.state_store.delete_all_tasks_for_batch(batch_id)
@@ -681,11 +644,12 @@ class LibraryOrchestrator:
         shutil.rmtree(self.config.paths.workspace_root, ignore_errors=True)
         self.config.paths.workspace_root.mkdir(parents=True, exist_ok=True)
         self.state_store.abort_batch(batch_id)
-        self.clear_pause_file()
 
     def _reset_item_for_fresh_run(self, item) -> None:
+        # Preserve parent_item_id to maintain parent-child relationships
+        preserved_parent_id = item.parent_item_id
         item.batch_id = ""
-        item.parent_item_id = None
+        item.parent_item_id = preserved_parent_id
         item.root_item_id = item.item_id
         item.status = ItemStatus.DISCOVERED
         item.author = ""
