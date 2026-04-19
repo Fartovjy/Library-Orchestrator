@@ -97,13 +97,6 @@ class LibraryOrchestrator:
             self._release_run_lock()
 
     def _run_with_lock(self, limit: int | None = None) -> dict[str, int]:
-        if self._pause_requested():
-            self.clear_pause_file()
-            self.dashboard.set_current(
-                self.config.paths.source_root,
-                "resume",
-                "Cleared stale pause request from previous run.",
-            )
         if self._stop_requested():
             self.clear_stop_file()
             self.dashboard.set_current(
@@ -189,14 +182,6 @@ class LibraryOrchestrator:
                 if self._stop_requested():
                     self._stop_event.set()
                     break
-                if self._pause_requested():
-                    self.dashboard.set_current(
-                        self.config.paths.source_root,
-                        "pause_requested",
-                        "Pausing after current tasks finish.",
-                    )
-                    self._stop_event.set()
-                    break
                 if not self.state_store.batch_has_pending_work(batch.batch_id):
                     self.state_store.finalize_batch(batch.batch_id)
                     self._stop_event.set()
@@ -210,10 +195,6 @@ class LibraryOrchestrator:
             self._full_stop_batch(batch.batch_id)
             self._sync_dashboard(batch.batch_id, "Batch fully stopped.")
             self.clear_stop_file()
-            return self.state_store.batch_status_counts(batch.batch_id)
-        if self._pause_requested():
-            self._sync_dashboard(batch.batch_id, "Run paused. Resume with the next launch.")
-            self.clear_pause_file()
             return self.state_store.batch_status_counts(batch.batch_id)
 
         self._sync_dashboard(batch.batch_id, "Batch completed.")
@@ -246,7 +227,7 @@ class LibraryOrchestrator:
     def _run_stage_loop(self, batch_id: str, worker_name: str, stages: list[TaskStage]) -> None:
         while not self._stop_event.is_set():
             self._poll_runtime_action()
-            if self._stop_requested() or self._pause_requested():
+            if self._stop_requested():
                 self._stop_event.set()
                 return
 
@@ -504,7 +485,7 @@ class LibraryOrchestrator:
             self.dashboard.set_current(source_path, "throttle", "Waiting for disk load to drop.")
             time.sleep(self.config.limits.sleep_if_busy_seconds)
             self._poll_runtime_action()
-            if self._stop_requested() or self._pause_requested():
+            if self._stop_requested():
                 self._stop_event.set()
                 return
 
@@ -528,6 +509,7 @@ class LibraryOrchestrator:
         if source_root != project_root and project_root not in source_root.parents:
             skip_roots.add(project_root)
         sources: list[Path] = []
+        directory_size_cache: dict[Path, int] = {}
         queue: deque[Path] = deque([self.config.paths.source_root])
         while queue:
             if limit is not None and len(sources) >= limit:
@@ -548,10 +530,14 @@ class LibraryOrchestrator:
                 if str(child) in existing:
                     continue
                 if child.is_dir():
+                    size_hint = directory_size_cache.get(child)
+                    if size_hint is None:
+                        size_hint = self._directory_priority_size(child)
+                        directory_size_cache[child] = size_hint
                     if self._directory_has_subdirs(child, skip_roots):
-                        branch_dirs.append((self._directory_size(child), child))
+                        branch_dirs.append((size_hint, child))
                     else:
-                        leaf_dirs.append((self._directory_size(child), child))
+                        leaf_dirs.append((size_hint, child))
                 else:
                     eligible_files.append((self._file_size(child), child))
 
@@ -589,25 +575,14 @@ class LibraryOrchestrator:
         self._cleanup_root_workspace_if_complete(item.root_item_id)
 
     def create_stop_file(self) -> Path:
-        self.clear_pause_file()
         stop_file = self.config.paths.stop_file
         stop_file.parent.mkdir(parents=True, exist_ok=True)
         stop_file.write_text("stop\n", encoding="utf-8")
         return stop_file
 
-    def create_pause_file(self) -> Path:
-        pause_file = self.config.paths.pause_file
-        pause_file.parent.mkdir(parents=True, exist_ok=True)
-        pause_file.write_text("pause\n", encoding="utf-8")
-        return pause_file
-
     def clear_stop_file(self) -> None:
         if self.config.paths.stop_file.exists():
             self.config.paths.stop_file.unlink()
-
-    def clear_pause_file(self) -> None:
-        if self.config.paths.pause_file.exists():
-            self.config.paths.pause_file.unlink()
 
     def repair_database(self) -> dict[str, int]:
         self.dashboard.reset(
@@ -644,22 +619,15 @@ class LibraryOrchestrator:
     def _stop_requested(self) -> bool:
         return self.config.paths.stop_file.exists()
 
-    def _pause_requested(self) -> bool:
-        return self.config.paths.pause_file.exists()
-
     def _poll_runtime_action(self) -> None:
         action = self.hotkeys.poll_action()
         if action is None:
             return
-        current_item = self.dashboard.state.current_item
-        target = self.config.paths.source_root if current_item == "-" else Path(current_item)
-        if action.action == "pause_run":
-            self.create_pause_file()
-            self.dashboard.set_current(target, "pause_requested", f"Pause requested by {action.label}.")
-            return
         if action.action == "full_stop":
+            target = self.dashboard.state.current_item
+            path_target = self.config.paths.source_root if target == "-" else Path(target)
             self.create_stop_file()
-            self.dashboard.set_current(target, "full_stop_requested", f"Full stop requested by {action.label}.")
+            self.dashboard.set_current(path_target, "full_stop_requested", f"Full stop requested by {action.label}.")
 
     def _full_stop_batch(self, batch_id: str) -> None:
         self.state_store.delete_all_tasks_for_batch(batch_id)
@@ -676,11 +644,12 @@ class LibraryOrchestrator:
         shutil.rmtree(self.config.paths.workspace_root, ignore_errors=True)
         self.config.paths.workspace_root.mkdir(parents=True, exist_ok=True)
         self.state_store.abort_batch(batch_id)
-        self.clear_pause_file()
 
     def _reset_item_for_fresh_run(self, item) -> None:
+        # Preserve parent_item_id to maintain parent-child relationships
+        preserved_parent_id = item.parent_item_id
         item.batch_id = ""
-        item.parent_item_id = None
+        item.parent_item_id = preserved_parent_id
         item.root_item_id = item.item_id
         item.status = ItemStatus.DISCOVERED
         item.author = ""
@@ -730,12 +699,17 @@ class LibraryOrchestrator:
         except OSError:
             return 0
 
-    def _directory_size(self, path: Path) -> int:
+    def _directory_priority_size(self, path: Path, sample_limit: int = 512) -> int:
+        # Lightweight estimate: scan only immediate children to avoid deep O(N) walks.
         total = 0
+        sampled = 0
         try:
-            for child in path.rglob("*"):
+            for child in path.iterdir():
+                if sampled >= sample_limit:
+                    break
                 if child.is_file():
                     total += self._file_size(child)
+                sampled += 1
         except OSError:
             return total
         return total
@@ -821,6 +795,7 @@ class LibraryOrchestrator:
                 TaskStage.UNPACK,
                 TaskStage.SPLITTER,
                 TaskStage.PREPARE,
+                TaskStage.DUPLICATE_CHECK,
                 TaskStage.ARCHIVARIUS,
                 TaskStage.EXPERT,
                 TaskStage.PACK,
@@ -950,36 +925,60 @@ class LibraryOrchestrator:
     def _acquire_run_lock(self) -> None:
         lock_path = self.config.paths.run_lock_file
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        if lock_path.exists():
-            try:
-                payload = json.loads(lock_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                payload = {}
-            lock_pid = int(payload.get("pid", 0) or 0)
-            if lock_pid and self._pid_is_running(lock_pid) and lock_pid != os.getpid():
-                raise RuntimeError(
-                    f"Another orchestrator run is already active (pid={lock_pid}). "
-                    "Stop it first or wait for it to finish."
-                )
         lock_payload = {
             "pid": os.getpid(),
             "started_at": time.time(),
             "source_root": str(self.config.paths.source_root),
             "state_db": str(self.config.paths.state_db),
         }
-        lock_path.write_text(json.dumps(lock_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        create_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        for _ in range(4):
+            try:
+                file_descriptor = os.open(lock_path, create_flags)
+            except FileExistsError:
+                payload = self._read_lock_payload(lock_path)
+                lock_pid = self._payload_pid(payload)
+                if lock_pid and self._pid_is_running(lock_pid):
+                    raise RuntimeError(
+                        f"Another orchestrator run is already active (pid={lock_pid}). "
+                        "Stop it first or wait for it to finish."
+                    )
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    raise RuntimeError(f"Cannot clear stale run lock {lock_path}: {error}") from error
+                continue
+            with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(lock_payload, ensure_ascii=False, indent=2))
+                handle.write("\n")
+            return
+        raise RuntimeError(
+            "Unable to acquire run lock after multiple attempts. "
+            "Another process may be racing with this run."
+        )
 
     def _release_run_lock(self) -> None:
         lock_path = self.config.paths.run_lock_file
         if not lock_path.exists():
             return
-        try:
-            payload = json.loads(lock_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            payload = {}
-        lock_pid = int(payload.get("pid", 0) or 0)
+        payload = self._read_lock_payload(lock_path)
+        lock_pid = self._payload_pid(payload)
         if lock_pid in {0, os.getpid()}:
             lock_path.unlink(missing_ok=True)
+
+    def _read_lock_payload(self, lock_path: Path) -> dict:
+        try:
+            return json.loads(lock_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _payload_pid(self, payload: dict) -> int:
+        try:
+            return int(payload.get("pid", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
 
     def _pid_is_running(self, pid: int) -> bool:
         if pid <= 0:

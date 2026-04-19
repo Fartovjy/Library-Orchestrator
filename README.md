@@ -143,7 +143,7 @@ orchestrator_project/
 - dashboard agent table includes both completion percent and average recognition percent for classifiers
 - file-type detection by magic bytes before LM Studio classification
 - Windows terminal dashboard with ANSI re-rendering and active-agent indicator
-- Safe stop hotkeys in the running console: `Ctrl+X`, `Esc`, or `Q`
+- Safe stop hotkeys in the running console: `Ctrl+S` (full stop) or `Esc` (pause)
 
 ## Current Scope Of This First Build
 
