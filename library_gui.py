@@ -481,8 +481,13 @@ class LibraryGUIApp:
         ctrl.pack(fill=tk.X, pady=(6, 6))
         self.ctrl_frame = ctrl
 
-        button_panel = tk.Frame(ctrl, bg=self._c("ctrl_bg"), width=self.agent_cell_width)
-        button_panel.grid(row=0, column=0, rowspan=2, sticky="new")
+        button_panel = tk.Frame(
+            ctrl,
+            bg=self._c("ctrl_bg"),
+            width=self.agent_cell_width,
+            height=64,
+        )
+        button_panel.grid(row=0, column=0, rowspan=2, sticky="nsew")
         button_panel.grid_propagate(False)
         button_panel.grid_columnconfigure(0, weight=1, uniform="ctrl_buttons")
         button_panel.grid_columnconfigure(1, weight=1, uniform="ctrl_buttons")
