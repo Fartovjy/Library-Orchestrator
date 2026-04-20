@@ -133,12 +133,6 @@ A8 Упаковка
 Сколько найденных книг уже дошли до финального результата: упакованы, признаны дубликатами или завершились ошибкой как книжные задачи.
 
 ```text
-Упаковано
-```
-
-Сколько книг успешно упаковал `A8`.
-
-```text
 Дубликаты
 ```
 
@@ -173,6 +167,25 @@ Q = очередь
 ```
 
 Это счетчики стадий, а не счетчики книг. Например, `A2` может обработать много архивов-контейнеров, а `A3` увидит только обычные файлы, извлеченные из этих архивов.
+
+## Язык Интерфейса И Выключение ПК
+
+GUI поддерживает два языка интерфейса:
+
+```text
+ui_ru.json
+ui_en.json
+```
+
+Переключение выполняется кнопками `RU` и `EN` внизу окна, без перезапуска программы.
+
+Справа внизу находится чекбокс:
+
+```text
+⏻ Выключить ПК после завершения
+```
+
+По умолчанию он выключен. Если включить его, приложение выполнит принудительное выключение компьютера только после успешного завершения всех операций конвейера. При остановке вручную или ошибке выключение не запускается.
 
 ## Дубликаты
 
@@ -437,37 +450,31 @@ Small unknown binary files are also rejected as non-books.
 Top-level counters count books, not pipeline operations.
 
 ```text
-Книг найдено
+Books found
 ```
 
 Number of files that `A3` accepted as books.
 
 ```text
-Книг завершено
+Books done
 ```
 
 Number of accepted books that reached a final result: packed, duplicate, or failed as a book task.
 
 ```text
-Упаковано
-```
-
-Number of books successfully packed by `A8`.
-
-```text
-Дубликаты
+Duplicates
 ```
 
 Number of book duplicates found by XXH64.
 
 ```text
-Не книги
+Not books
 ```
 
 Number of files that `A3` rejected as non-books. This counter is not part of book progress.
 
 ```text
-Ошибки книг
+Book errors
 ```
 
 Number of book tasks that ended with an error.
@@ -475,7 +482,7 @@ Number of book tasks that ended with an error.
 Progress percentage and ETA are calculated only from book progress:
 
 ```text
-Книг завершено / Книг найдено
+Books done / Books found
 ```
 
 ## Agent Counters
@@ -489,6 +496,25 @@ Q = queue
 ```
 
 These are stage counters, not book counters. For example, `A2` can process many archive containers, while `A3` only sees regular files extracted from those archives.
+
+## Interface Language And PC Shutdown
+
+The GUI supports two interface languages:
+
+```text
+ui_ru.json
+ui_en.json
+```
+
+The language can be switched live with the `RU` and `EN` buttons at the bottom of the window. No restart is required.
+
+The bottom-right checkbox controls automatic shutdown:
+
+```text
+⏻ Shut down PC when done
+```
+
+It is disabled by default. If enabled, the application forcibly shuts down the computer only after the pipeline finishes all operations successfully. Manual stop or pipeline errors do not trigger shutdown.
 
 ## Duplicates
 

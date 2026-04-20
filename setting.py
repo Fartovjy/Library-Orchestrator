@@ -22,7 +22,7 @@ UNPACK_WORKERS = 6
 DETECT_WORKERS = 2
 DEDUPE_WORKERS = 3
 TAG_WORKERS = 3
-LM_WORKERS = 1
+LM_WORKERS = 2
 RENAME_WORKERS = 1
 PACK_WORKERS = 6
 
@@ -51,6 +51,7 @@ LM_MIN_SNIPPET_LETTERS = 24
 # Window is fixed (min=max) and clamped in code to keep compact dashboard layout.
 GUI_WINDOW_WIDTH = 960
 GUI_WINDOW_HEIGHT = 530
+GUI_DEFAULT_LANGUAGE = "ru"
 
 # Font settings for GUI:
 GUI_FONT_FAMILY = "Segoe UI"

@@ -15,6 +15,7 @@ Requirements requested by user:
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -134,13 +135,9 @@ THEME_LIGHT = {
     "progress_dark": "#15803d",
 }
 
-MODE_LABELS_RU = {
-    "IDLE": "Ожидание",
-    "INIT": "Подготовка",
-    "RUNNING": "Работает",
-    "STOP_CLEANUP": "Остановка",
-    "END": "Завершено",
-    "END_ERROR": "Ошибка",
+LANGUAGE_FILES = {
+    "ru": "ui_ru.json",
+    "en": "ui_en.json",
 }
 
 
@@ -235,6 +232,14 @@ class LibraryGUIApp:
         self.agent_colors = (
             AGENT_COLORS_DARK if self.theme_mode == "dark" else AGENT_COLORS_LIGHT
         )
+        self.translations = self._load_translations()
+        self.language = self._default_language()
+        self.last_snapshot: Optional[dict] = None
+        self.current_mode = "IDLE"
+        self.current_log_path: object = "-"
+        self.status_key = "status_ready"
+        self.status_kwargs: dict[str, object] = {}
+        self.shutdown_started = False
 
         font_family = "Segoe UI"
         if setting is not None:
@@ -317,9 +322,9 @@ class LibraryGUIApp:
         # По запросу: при запуске GUI выбор SOURCE_DIRS всегда пустой.
         self.source_var = tk.StringVar(value="")
         self.target_var = tk.StringVar(value=fix_mojibake(str(lp.DEFAULT_TARGET_DIR)))
-        self.mode_var = tk.StringVar(value=MODE_LABELS_RU["IDLE"])
+        self.mode_var = tk.StringVar(value=self._mode_label("IDLE"))
         self.time_var = tk.StringVar(value="00:00:00/~--:--:--")
-        self.status_var = tk.StringVar(value="Готово")
+        self.status_var = tk.StringVar(value=self.tr("status_ready"))
         self.progress_text_var = tk.StringVar(value="0%")
         self.seen_var = tk.StringVar(value="0")
         self.done_var = tk.StringVar(value="0")
@@ -327,14 +332,17 @@ class LibraryGUIApp:
         self.dupes_var = tk.StringVar(value="0")
         self.nobook_var = tk.StringVar(value="0")
         self.failed_var = tk.StringVar(value="0")
-        self.event_var = tk.StringVar(value="События: -")
-        self.log_var = tk.StringVar(value="LOG: -")
+        self.event_var = tk.StringVar(value=f"{self.tr('events_prefix')}: -")
+        self.log_var = tk.StringVar(value=f"{self.tr('log_prefix')}: -")
+        self.shutdown_after_done_var = tk.BooleanVar(value=False)
 
         self.agent_processed: dict[str, tk.StringVar] = {}
         self.agent_errors: dict[str, tk.StringVar] = {}
         self.agent_queue: dict[str, tk.StringVar] = {}
         self.agent_cards: dict[str, tk.Frame] = {}
         self.agent_labels: dict[str, list[tk.Widget]] = {}
+        self.stat_label_widgets: dict[str, tk.Label] = {}
+        self.agent_title_labels: dict[str, tk.Label] = {}
         self.agent_last_processed: dict[str, int] = {k: 0 for k in lp.AGENT_KEYS}
         self.agent_active_until: dict[str, float] = {k: 0.0 for k in lp.AGENT_KEYS}
         self.agent_active_bg: dict[str, str] = {
@@ -348,8 +356,95 @@ class LibraryGUIApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(300, self._poll_pipeline)
 
+    def _load_translations(self) -> dict[str, dict[str, str]]:
+        base = Path(__file__).resolve().parent
+        loaded: dict[str, dict[str, str]] = {}
+        for lang, filename in LANGUAGE_FILES.items():
+            path = base / filename
+            try:
+                data = json.loads(path.read_text(encoding="utf-8-sig"))
+            except Exception:
+                data = {}
+            loaded[lang] = {str(k): str(v) for k, v in data.items()}
+        return loaded
+
+    def _default_language(self) -> str:
+        value = "ru"
+        if setting is not None:
+            try:
+                value = str(getattr(setting, "GUI_DEFAULT_LANGUAGE", value)).strip().lower()
+            except Exception:
+                value = "ru"
+        return value if value in LANGUAGE_FILES else "ru"
+
+    def tr(self, key: str, **kwargs: object) -> str:
+        text = (
+            self.translations.get(self.language, {}).get(key)
+            or self.translations.get("ru", {}).get(key)
+            or key
+        )
+        if kwargs:
+            try:
+                return text.format(**kwargs)
+            except Exception:
+                return text
+        return text
+
+    def _set_status(self, key: str, **kwargs: object) -> None:
+        self.status_key = key
+        self.status_kwargs = dict(kwargs)
+        self.status_var.set(self.tr(key, **kwargs))
+
+    def _set_language(self, language: str) -> None:
+        if language not in LANGUAGE_FILES:
+            return
+        self.language = language
+        self._apply_language()
+
+    def _apply_language(self) -> None:
+        self.root.title(self.tr("window_title"))
+        self.mode_var.set(self._mode_label(self.current_mode))
+        self.status_var.set(self.tr(self.status_key, **self.status_kwargs))
+        self.log_var.set(self._log_text(self.current_log_path))
+
+        for key, label in self.stat_label_widgets.items():
+            label.configure(text=self.tr(key))
+        for key, label in self.agent_title_labels.items():
+            label.configure(text=self._agent_title(key))
+
+        if hasattr(self, "drop_title_label"):
+            self.drop_title_label.configure(text=self.tr("drop_title"))
+        if hasattr(self, "drop_hint_label"):
+            self.drop_hint_label.configure(
+                text=self.tr("drop_hint" if self.dnd_available else "dnd_unavailable")
+            )
+        if hasattr(self, "source_label"):
+            self.source_label.configure(text=self.tr("source_label"))
+        if hasattr(self, "target_label"):
+            self.target_label.configure(text=self.tr("target_label"))
+        if hasattr(self, "source_btn"):
+            self.source_btn.configure(text=self.tr("browse"))
+        if hasattr(self, "target_btn"):
+            self.target_btn.configure(text=self.tr("browse"))
+        if hasattr(self, "multi_source_label"):
+            self.multi_source_label.configure(text=self.tr("multi_source_hint"))
+        if hasattr(self, "start_btn"):
+            self.start_btn.configure(text=self.tr("start"))
+        if hasattr(self, "stop_btn"):
+            self.stop_btn.configure(text=self.tr("stop"))
+        if hasattr(self, "legend_label"):
+            self.legend_label.configure(text=self.tr("legend_agents"))
+        if hasattr(self, "lang_ru_btn"):
+            self.lang_ru_btn.configure(text=self.tr("language_ru"))
+        if hasattr(self, "lang_en_btn"):
+            self.lang_en_btn.configure(text=self.tr("language_en"))
+        if hasattr(self, "shutdown_check"):
+            self.shutdown_check.configure(text=self.tr("shutdown_after_done"))
+
+        self._render_events(self.last_snapshot)
+
     def _build_window(self) -> None:
-        self.root.title("Library Sorter GUI")
+        self.root.title(self.tr("window_title"))
         self.root.geometry(f"{self.window_width}x{self.window_height}")
         self.root.minsize(self.window_width, self.window_height)
         self.root.maxsize(self.window_width, self.window_height)
@@ -388,27 +483,29 @@ class LibraryGUIApp:
 
         drop_title = tk.Label(
             drop,
-            text="SOURCE_DIRS\nDrop зона",
+            text=self.tr("drop_title"),
             font=self.font_title,
             bg=self._c("drop_bg"),
             fg=self._c("text_primary"),
             justify=tk.CENTER,
         )
         drop_title.pack(fill=tk.X, pady=(6, 4))
+        self.drop_title_label = drop_title
 
         dnd_text = (
-            "Перетащите папку сюда\n(добавляет путь в SOURCE_DIRS)"
+            self.tr("drop_hint")
             if self.dnd_available
-            else "DnD недоступен\nУстановите tkinterdnd2"
+            else self.tr("dnd_unavailable")
         )
-        tk.Label(
+        self.drop_hint_label = tk.Label(
             drop,
             text=dnd_text,
             font=self.font_drop_hint,
             bg=self._c("drop_bg"),
             fg=self._c("text_secondary"),
             justify=tk.CENTER,
-        ).pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        )
+        self.drop_hint_label.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
         if self.dnd_available and DND_FILES:
             drop.drop_target_register(DND_FILES)
@@ -417,18 +514,19 @@ class LibraryGUIApp:
         paths = tk.Frame(top, bg=self._c("panel_bg"))
         paths.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        tk.Label(
+        self.source_label = tk.Label(
             paths,
-            text="SOURCE_DIRS:",
+            text=self.tr("source_label"),
             font=self.font_main,
             bg=self._c("panel_bg"),
             fg=self._c("text_primary"),
-        ).grid(row=0, column=0, sticky="w", pady=(0, 6))
+        )
+        self.source_label.grid(row=0, column=0, sticky="w", pady=(0, 6))
         self.source_entry = tk.Entry(paths, textvariable=self.source_var, font=self.font_main)
         self.source_entry.grid(row=0, column=1, sticky="ew", padx=(8, 8), pady=(0, 6))
         self.source_btn = tk.Button(
             paths,
-            text="Обзор...",
+            text=self.tr("browse"),
             font=self.font_main,
             command=self._browse_source,
             bg=self._c("btn_secondary_bg"),
@@ -438,18 +536,19 @@ class LibraryGUIApp:
         )
         self.source_btn.grid(row=0, column=2, sticky="ew", pady=(0, 6))
 
-        tk.Label(
+        self.target_label = tk.Label(
             paths,
-            text="TARGET_DIR:",
+            text=self.tr("target_label"),
             font=self.font_main,
             bg=self._c("panel_bg"),
             fg=self._c("text_primary"),
-        ).grid(row=1, column=0, sticky="w", pady=(0, 6))
+        )
+        self.target_label.grid(row=1, column=0, sticky="w", pady=(0, 6))
         self.target_entry = tk.Entry(paths, textvariable=self.target_var, font=self.font_main)
         self.target_entry.grid(row=1, column=1, sticky="ew", padx=(8, 8), pady=(0, 6))
         self.target_btn = tk.Button(
             paths,
-            text="Обзор...",
+            text=self.tr("browse"),
             font=self.font_main,
             command=self._browse_target,
             bg=self._c("btn_secondary_bg"),
@@ -459,13 +558,14 @@ class LibraryGUIApp:
         )
         self.target_btn.grid(row=1, column=2, sticky="ew", pady=(0, 6))
 
-        tk.Label(
+        self.multi_source_label = tk.Label(
             paths,
-            text="Несколько источников: разделяйте ';' или новой строкой",
+            text=self.tr("multi_source_hint"),
             font=self.font_legend,
             bg=self._c("panel_bg"),
             fg=self._c("text_muted"),
-        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        )
+        self.multi_source_label.grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
         paths.grid_columnconfigure(1, weight=1)
         paths.grid_columnconfigure(2, minsize=self.browse_cell_width, uniform="browse_buttons")
 
@@ -495,7 +595,7 @@ class LibraryGUIApp:
 
         self.start_btn = tk.Button(
             button_panel,
-            text="Старт",
+            text=self.tr("start"),
             font=self.font_main,
             command=self._start_pipeline,
             bg=self._c("btn_start_bg"),
@@ -507,7 +607,7 @@ class LibraryGUIApp:
 
         self.stop_btn = tk.Button(
             button_panel,
-            text="Стоп",
+            text=self.tr("stop"),
             font=self.font_main,
             command=self._stop_pipeline,
             bg=self._c("btn_stop_bg"),
@@ -575,23 +675,24 @@ class LibraryGUIApp:
         stats.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(6, 0))
         for idx, (label, var) in enumerate(
             [
-                ("Книг найдено", self.seen_var),
-                ("Книг завершено", self.done_var),
-                ("Упаковано", self.packed_var),
-                ("Дубликаты", self.dupes_var),
-                ("Не книги", self.nobook_var),
-                ("Ошибки книг", self.failed_var),
+                ("stats_books_found", self.seen_var),
+                ("stats_books_done", self.done_var),
+                ("stats_duplicates", self.dupes_var),
+                ("stats_nobooks", self.nobook_var),
+                ("stats_book_errors", self.failed_var),
             ]
         ):
             item = tk.Frame(stats, bg=self._c("ctrl_bg"))
-            item.grid(row=0, column=idx, sticky="w", padx=(0, 12))
-            tk.Label(
+            item.grid(row=0, column=idx, sticky="w", padx=(0, 14))
+            label_widget = tk.Label(
                 item,
-                text=label,
+                text=self.tr(label),
                 font=self.font_counter_label,
                 bg=self._c("ctrl_bg"),
                 fg=self._c("text_muted"),
-            ).pack(side=tk.LEFT)
+            )
+            label_widget.pack(side=tk.LEFT)
+            self.stat_label_widgets[label] = label_widget
             tk.Label(
                 item,
                 textvariable=var,
@@ -637,10 +738,9 @@ class LibraryGUIApp:
             self.agent_cards[key] = card
             self.agent_labels[key] = []
 
-            title = f"{key} {fix_mojibake(lp.AGENT_LABELS.get(key, key))}"
             title_lbl = tk.Label(
                 card,
-                text=title,
+                text=self._agent_title(key),
                 font=self.font_agent_title,
                 bg=bg,
                 fg=fg,
@@ -648,6 +748,7 @@ class LibraryGUIApp:
             )
             title_lbl.pack(fill=tk.X)
             self.agent_labels[key].append(title_lbl)
+            self.agent_title_labels[key] = title_lbl
 
             p = tk.StringVar(value="0")
             e = tk.StringVar(value="0")
@@ -681,15 +782,16 @@ class LibraryGUIApp:
                 value_lbl.pack(side=tk.LEFT, anchor="w", padx=(2, 8))
                 self.agent_labels[key].append(value_lbl)
 
-        tk.Label(
+        self.legend_label = tk.Label(
             outer,
-            text="P = обработано   E = ошибок   Q = очередь",
+            text=self.tr("legend_agents"),
             font=self.font_legend,
             bg=self._c("root_bg"),
             fg=self._c("legend_fg"),
             anchor="w",
             justify=tk.LEFT,
-        ).pack(fill=tk.X, pady=(2, 0))
+        )
+        self.legend_label.pack(fill=tk.X, pady=(2, 0))
 
         footer_height = max(109, int(self.window_height * 0.21))
         footer = tk.Frame(
@@ -733,6 +835,52 @@ class LibraryGUIApp:
             justify=tk.LEFT,
         ).pack(fill=tk.X)
 
+        footer_controls = tk.Frame(footer, bg=self._c("ctrl_bg"))
+        footer_controls.pack(side=tk.BOTTOM, fill=tk.X, pady=(3, 0))
+        self.footer_controls = footer_controls
+
+        lang_frame = tk.Frame(footer_controls, bg=self._c("ctrl_bg"))
+        lang_frame.pack(side=tk.LEFT, anchor="sw")
+
+        self.lang_ru_btn = tk.Button(
+            lang_frame,
+            text=self.tr("language_ru"),
+            font=self.font_legend,
+            width=4,
+            command=lambda: self._set_language("ru"),
+            bg=self._c("btn_secondary_bg"),
+            fg=self._c("btn_secondary_fg"),
+            activebackground=self._c("btn_secondary_active_bg"),
+            activeforeground=self._c("btn_secondary_active_fg"),
+        )
+        self.lang_ru_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.lang_en_btn = tk.Button(
+            lang_frame,
+            text=self.tr("language_en"),
+            font=self.font_legend,
+            width=4,
+            command=lambda: self._set_language("en"),
+            bg=self._c("btn_secondary_bg"),
+            fg=self._c("btn_secondary_fg"),
+            activebackground=self._c("btn_secondary_active_bg"),
+            activeforeground=self._c("btn_secondary_active_fg"),
+        )
+        self.lang_en_btn.pack(side=tk.LEFT)
+
+        self.shutdown_check = tk.Checkbutton(
+            footer_controls,
+            text=self.tr("shutdown_after_done"),
+            variable=self.shutdown_after_done_var,
+            font=self.font_legend,
+            bg=self._c("ctrl_bg"),
+            fg=self._c("text_secondary"),
+            activebackground=self._c("ctrl_bg"),
+            activeforeground=self._c("text_primary"),
+            selectcolor=self._c("ctrl_bg"),
+        )
+        self.shutdown_check.pack(side=tk.RIGHT, anchor="se")
+
     def _apply_initial_dirs(self) -> None:
         # SOURCE_DIRS не подставляем автоматически при старте.
         self.source_var.set("")
@@ -747,18 +895,18 @@ class LibraryGUIApp:
 
     def _browse_source(self) -> None:
         initial = self._best_existing_dir(self.source_var.get())
-        picked = filedialog.askdirectory(title="Добавить SOURCE_DIR", initialdir=initial)
+        picked = filedialog.askdirectory(title=self.tr("dialog_source_title"), initialdir=initial)
         if picked:
             self._append_source_dir(Path(picked))
-            self.status_var.set("SOURCE_DIRS обновлен")
+            self._set_status("status_source_updated")
 
     def _browse_target(self) -> None:
         initial = self._best_existing_dir(self.target_var.get())
-        picked = filedialog.askdirectory(title="Выберите TARGET_DIR", initialdir=initial)
+        picked = filedialog.askdirectory(title=self.tr("dialog_target_title"), initialdir=initial)
         if picked:
             self.target_var.set(str(Path(picked)))
             self._persist_target_dir(Path(picked))
-            self.status_var.set("TARGET_DIR обновлен и сохранен в setting.py")
+            self._set_status("status_target_updated")
 
     def _best_existing_dir(self, candidate: str) -> str:
         try:
@@ -781,9 +929,9 @@ class LibraryGUIApp:
                 self._append_source_dir(p)
                 added += 1
         if added > 0:
-            self.status_var.set(f"SOURCE_DIRS обновлен через Drop: +{added}")
+            self._set_status("status_source_drop_updated", count=added)
             return
-        messagebox.showwarning("Drop", "Нужно перетащить папку для SOURCE_DIRS.")
+        messagebox.showwarning(self.tr("dialog_drop_title"), self.tr("dialog_drop_folder_only"))
 
     def _append_source_dir(self, path: Path) -> None:
         existing = lp.parse_sources_input([self.source_var.get()])
@@ -812,17 +960,17 @@ class LibraryGUIApp:
         target_raw = self.target_var.get().strip()
         source_dirs = lp.parse_sources_input([source_raw])
         if not source_dirs:
-            messagebox.showerror("Пути", "SOURCE_DIRS не задан.")
+            messagebox.showerror(self.tr("dialog_paths_title"), self.tr("dialog_source_missing"))
             return False
         existing_sources = [src for src in source_dirs if src.exists()]
         if not existing_sources:
             messagebox.showerror(
-                "Пути",
-                "Ни один SOURCE_DIRS не найден. Проверьте выбранные папки.",
+                self.tr("dialog_paths_title"),
+                self.tr("dialog_source_not_found"),
             )
             return False
         if not target_raw:
-            messagebox.showerror("Пути", "TARGET_DIR не задан.")
+            messagebox.showerror(self.tr("dialog_paths_title"), self.tr("dialog_target_missing"))
             return False
         target = Path(target_raw)
 
@@ -836,12 +984,15 @@ class LibraryGUIApp:
             temp_base.mkdir(parents=True, exist_ok=True)
             (temp_base / "extract").mkdir(parents=True, exist_ok=True)
         except Exception as exc:
-            messagebox.showerror("Пути", f"Ошибка создания папок:\n{exc}")
-            self.status_var.set(f"Ошибка путей: {exc}")
+            messagebox.showerror(
+                self.tr("dialog_paths_title"),
+                self.tr("dialog_path_create_error", error=exc),
+            )
+            self._set_status("status_paths_error", error=exc)
             return False
 
         self._persist_target_dir(target)
-        self.status_var.set(f"Пути проверены. Источников: {len(source_dirs)}")
+        self._set_status("status_paths_checked", count=len(source_dirs))
         return True
 
     def _persist_target_dir(self, target: Path) -> None:
@@ -970,7 +1121,7 @@ class LibraryGUIApp:
 
     def _start_pipeline(self) -> None:
         if self.pipeline_running:
-            self.status_var.set("Конвейер уже запущен")
+            self._set_status("status_already_running")
             return
         if not self._check_and_create_paths():
             return
@@ -984,16 +1135,19 @@ class LibraryGUIApp:
             sorter.ui = _NoopController()
             sorter.keyboard = _NoopController()
         except Exception as exc:
-            messagebox.showerror("Старт", f"Не удалось запустить конвейер:\n{exc}")
-            self.status_var.set(f"Ошибка старта: {exc}")
+            messagebox.showerror(self.tr("start"), self.tr("status_start_error", error=exc))
+            self._set_status("status_start_error", error=exc)
             return
 
         self.sorter = sorter
         self.pipeline_running = True
+        self.shutdown_started = False
+        self.current_mode = "RUNNING"
         self.mode_var.set(self._mode_label("RUNNING"))
         self.time_var.set("00:00:00/~--:--:--")
-        self.status_var.set("Конвейер запущен")
-        self.log_var.set(f"LOG: {sorter.log_file}")
+        self._set_status("status_started")
+        self.current_log_path = sorter.log_file
+        self.log_var.set(self._log_text(self.current_log_path))
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
 
@@ -1016,11 +1170,12 @@ class LibraryGUIApp:
 
     def _stop_pipeline(self) -> None:
         if not self.pipeline_running or not self.sorter:
-            self.status_var.set("Конвейер не запущен")
+            self._set_status("status_not_running")
             return
         self.sorter.request_stop_and_cleanup()
+        self.current_mode = "STOP_CLEANUP"
         self.mode_var.set(self._mode_label("STOP_CLEANUP"))
-        self.status_var.set("Остановка конвейера и очистка временных папок...")
+        self._set_status("status_stopping_cleanup")
 
     def _poll_pipeline(self) -> None:
         if self.sorter:
@@ -1036,21 +1191,26 @@ class LibraryGUIApp:
             self.stop_btn.config(state=tk.DISABLED)
             exit_code = self.pipeline_exit_code if self.pipeline_exit_code is not None else 2
             if exit_code == 0:
-                self.status_var.set("Конвейер завершен успешно")
+                self._set_status("status_finished_ok")
             else:
                 if self.pipeline_error:
-                    self.status_var.set(f"Ошибка выполнения: {self.pipeline_error}")
+                    self._set_status("status_execution_error", error=self.pipeline_error)
                 else:
-                    self.status_var.set(f"Конвейер завершен с кодом {exit_code}")
-            self.mode_var.set(self._mode_label("END" if exit_code == 0 else "END_ERROR"))
+                    self._set_status("status_finished_code", code=exit_code)
+            self.current_mode = "END" if exit_code == 0 else "END_ERROR"
+            self.mode_var.set(self._mode_label(self.current_mode))
+            if exit_code == 0 and self.shutdown_after_done_var.get():
+                self._shutdown_computer()
 
         self.root.after(300, self._poll_pipeline)
 
     def _render_snapshot(self, snap: dict) -> None:
+        self.last_snapshot = snap
         pct = float(snap.get("pct", 0.0))
         self.progress["value"] = max(0.0, min(100.0, pct))
         self.progress_text_var.set(f"{int(round(pct))}%")
-        self.mode_var.set(self._mode_label(str(snap.get("mode", "RUNNING"))))
+        self.current_mode = fix_mojibake(str(snap.get("mode", "RUNNING")))
+        self.mode_var.set(self._mode_label(self.current_mode))
         self.time_var.set(self._time_label(snap))
 
         seen = int(snap.get("seen", 0))
@@ -1076,24 +1236,56 @@ class LibraryGUIApp:
             self.agent_queue[key].set(self._fmt_num(qsize))
             self._update_agent_visual_state(key, processed, qsize)
 
-        events = snap.get("events", []) or []
-        if events:
-            top = fix_mojibake(str(events[0]).strip())
-            self.event_var.set(f"События: {top}")
-        else:
-            self.event_var.set("События: -")
+        self._render_events(snap)
 
     def _fmt_num(self, value: int) -> str:
         return f"{value:,}".replace(",", " ")
 
     def _mode_label(self, mode: str) -> str:
         fixed = fix_mojibake(str(mode or ""))
-        return MODE_LABELS_RU.get(fixed, fixed)
+        if not fixed:
+            return self.tr("mode_IDLE")
+        key = f"mode_{fixed}"
+        text = self.tr(key)
+        return fixed if text == key else text
 
     def _time_label(self, snap: dict) -> str:
         elapsed = fix_mojibake(str(snap.get("elapsed", "00:00:00")))
         eta = fix_mojibake(str(snap.get("eta", "--:--:--")))
         return f"{elapsed}/~{eta}"
+
+    def _agent_title(self, key: str) -> str:
+        return f"{key} {self.tr(f'agent_{key}')}"
+
+    def _log_text(self, path: object = "-") -> str:
+        return f"{self.tr('log_prefix')}: {path}"
+
+    def _render_events(self, snap: Optional[dict]) -> None:
+        events = (snap or {}).get("events", []) or []
+        if events:
+            top = fix_mojibake(str(events[0]).strip())
+            self.event_var.set(f"{self.tr('events_prefix')}: {top}")
+        else:
+            self.event_var.set(f"{self.tr('events_prefix')}: -")
+
+    def _shutdown_computer(self) -> None:
+        if self.shutdown_started:
+            return
+        self.shutdown_started = True
+        self._set_status("status_shutdown_started")
+        try:
+            subprocess.Popen(
+                ["shutdown", "/s", "/f", "/t", "0"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            self.shutdown_started = False
+            self._set_status("status_shutdown_failed", error=exc)
+            messagebox.showerror(
+                self.tr("dialog_shutdown_title"),
+                self.tr("dialog_shutdown_failed", error=exc),
+            )
 
     def _update_agent_visual_state(self, key: str, processed: int, qsize: int) -> None:
         now = time.time()
@@ -1125,7 +1317,7 @@ class LibraryGUIApp:
     def _on_close(self) -> None:
         if self.pipeline_running:
             self._stop_pipeline()
-            self.status_var.set("Закрытие после остановки и очистки...")
+            self._set_status("status_closing_after_stop")
             self.root.after(250, self._close_when_stopped)
             return
         self.root.destroy()
