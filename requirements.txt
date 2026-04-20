@@ -1,0 +1,4 @@
+xxhash>=3.5.0
+requests>=2.32.0
+pypdf>=5.0.0
+tkinterdnd2>=0.4.2
