@@ -1134,6 +1134,7 @@ class LibrarySorter:
         self._archive_state_lock = threading.Lock()
         self._archive_pending: dict[Path, int] = defaultdict(int)
         self._archive_failed: set[Path] = set()
+        self._archive_has_book: set[Path] = set()
 
         self.q12 = queue.Queue(maxsize=config.queue_size)
         self.q23 = queue.Queue(maxsize=config.queue_size)
@@ -1671,11 +1672,18 @@ class LibrarySorter:
                     continue
                 self.metrics.mark_stage("A2")
                 if is_archive(task.path):
-                    self._extract_archive_and_route(task)
-                    self._finalize_task(task, result="archive_unpacked")
+                    extracted_count = self._extract_archive_and_route(task)
+                    if extracted_count == 0 and task.origin == "source":
+                        reason = "empty_archive"
+                        self._handle_nobook(task, reason)
+                        self.db.mark_file(task, "nobook", reason)
+                        self._finalize_task(task, result="nobook")
+                    else:
+                        self._finalize_task(task, result="archive_unpacked")
+                        self.db.mark_file(task, "unpack_done", "")
                 else:
                     self._put_with_stop(self.q23, task)
-                self.db.mark_file(task, "unpack_done", "")
+                    self.db.mark_file(task, "unpack_done", "")
             except Exception as exc:
                 self.logger.exception("Agent2: ошибка %s: %s", task.path, exc)
                 self.metrics.mark_stage("A2", error=True)
@@ -1686,7 +1694,7 @@ class LibrarySorter:
                 self.q12.task_done()
         self.metrics.add_event(f"Agent2/W{worker_idx}: завершен")
 
-    def _extract_archive_and_route(self, task: FileTask) -> None:
+    def _extract_archive_and_route(self, task: FileTask) -> int:
         temp_root = self.config.temp_base / "extract" / f"{task.task_id}_{uuid.uuid4().hex[:6]}"
         temp_root.mkdir(parents=True, exist_ok=True)
         source_archive = task.archive_source
@@ -1709,11 +1717,11 @@ class LibrarySorter:
                 f"{format_subprocess_error(completed, 300)}"
             )
 
-        found_any = False
+        extracted_count = 0
         for file_path in iter_files(temp_root):
             if self.should_stop():
                 break
-            found_any = True
+            extracted_count += 1
             new_task = FileTask(
                 task_id=str(uuid.uuid4()),
                 path=file_path,
@@ -1737,9 +1745,10 @@ class LibrarySorter:
                     break
                 self._register_archive_child(source_archive)
 
-        if not found_any:
+        if extracted_count == 0:
             shutil.rmtree(temp_root, ignore_errors=True)
             self.metrics.add_event(f"Пустой архив: {task.path.name}")
+        return extracted_count
 
     def _detect_loop(self, worker_idx: int) -> None:
         self.metrics.add_event(f"Agent3/W{worker_idx}: старт")
@@ -1759,6 +1768,7 @@ class LibrarySorter:
                 is_book_file, reason = self._is_book_candidate(task)
                 if is_book_file:
                     task.is_book_candidate = True
+                    self._mark_archive_has_book(task.archive_source)
                     if not task.book_seen_counted:
                         task.book_seen_counted = True
                         self.metrics.mark_book_seen()
@@ -2048,24 +2058,47 @@ class LibrarySorter:
         return True, "fallback_keep"
 
     def _handle_nobook(self, task: FileTask, reason: str) -> None:
-        target_base = self.config.nobook_dir
         if task.origin == "source":
-            base = task.source_root or (
-                self.config.source_dirs[0] if self.config.source_dirs else task.path.parent
-            )
-            rel = safe_relative(task.path, base)
-            dst = ensure_unique_file_path(target_base / rel)
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            safe_move(task.path, dst)
+            dst = self._move_source_to_nobook(task.path, task.source_root, reason)
             self.metrics.add_event(f"NoBook -> {dst.name} ({reason})")
         else:
             if self.config.keep_temp_nobooks:
                 chain_dir = "__".join(sanitize_component(x) for x in task.archive_chain[-3:])
                 ext = task.path.suffix.lower()
                 filename = sanitize_component(task.path.stem) + ext
-                out = ensure_unique_file_path(target_base / "FromArchives" / chain_dir / filename)
+                out = ensure_unique_file_path(
+                    self.config.nobook_dir / "FromArchives" / chain_dir / filename
+                )
                 out.parent.mkdir(parents=True, exist_ok=True)
                 safe_move(task.path, out)
+
+    def _move_source_to_nobook(
+        self,
+        path: Path,
+        source_root: Optional[Path],
+        reason: str,
+    ) -> Path:
+        base = source_root or self._source_root_for_path(path)
+        rel = safe_relative(path, base)
+        dst = ensure_unique_file_path(self.config.nobook_dir / rel)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        safe_move(path, dst)
+        self.logger.info("NoBook move source=%s dest=%s reason=%s", path, dst, reason)
+        return dst
+
+    def _source_root_for_path(self, path: Path) -> Path:
+        try:
+            resolved = path.resolve(strict=False)
+        except Exception:
+            resolved = path
+        for source_dir in self.config.source_dirs:
+            try:
+                root = source_dir.resolve(strict=False)
+                resolved.relative_to(root)
+                return source_dir
+            except Exception:
+                continue
+        return path.parent
 
     def _extract_metadata(self, task: FileTask) -> Metadata:
         md = Metadata()
@@ -2446,12 +2479,18 @@ class LibrarySorter:
         with self._archive_state_lock:
             self._archive_pending[archive_path] += 1
 
+    def _mark_archive_has_book(self, archive_path: Optional[Path]) -> None:
+        if not archive_path:
+            return
+        with self._archive_state_lock:
+            self._archive_has_book.add(archive_path)
+
     def _mark_archive_progress(self, task: FileTask, result: str) -> None:
         archive_path = task.archive_source
         if not archive_path:
             return
 
-        should_delete = False
+        action = ""
         with self._archive_state_lock:
             if archive_path not in self._archive_pending:
                 return
@@ -2465,16 +2504,33 @@ class LibrarySorter:
 
             if pending <= 0:
                 del self._archive_pending[archive_path]
+                has_book = archive_path in self._archive_has_book
+                self._archive_has_book.discard(archive_path)
                 self._archive_failed.discard(archive_path)
-                should_delete = (not failed) and self.config.delete_source_after_pack
+                if not failed and self.config.delete_source_after_pack:
+                    action = "delete" if has_book else "move_nobook"
 
-        if should_delete and archive_path.exists():
+        if action == "delete" and archive_path.exists():
             try:
                 archive_path.unlink(missing_ok=True)
                 self.metrics.add_event(f"Source archive removed after pipeline: {archive_path.name}")
             except Exception as exc:
                 self.logger.warning(
                     "Не удалось удалить исходный архив %s: %s", archive_path, exc
+                )
+        elif action == "move_nobook" and archive_path.exists():
+            try:
+                dst = self._move_source_to_nobook(
+                    archive_path,
+                    self._source_root_for_path(archive_path),
+                    "archive_without_books",
+                )
+                self.metrics.add_event(f"NoBook archive -> {dst.name} (archive_without_books)")
+            except Exception as exc:
+                self.logger.warning(
+                    "Не удалось перенести исходный архив в NoBook %s: %s",
+                    archive_path,
+                    exc,
                 )
 
     def _run_cmd_with_cancel(

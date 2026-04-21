@@ -250,6 +250,8 @@ temperature = 0.1
 
 Если файл из `SOURCE_DIRS` признан не книгой, он переносится в `NOBOOK_DIR`.
 
+Если исходный архив распакован и после проверки внутри не найдено ни одной книги, исходный архив переносится целиком в `NOBOOK_DIR`. Его временно извлеченные файлы удаляются вместе с temp-папкой и не отправляются в `A7/A8`.
+
 Файлы, извлеченные во временную папку из архивов, являются рабочими копиями. После завершения конвейера временная папка очищается.
 
 ## Остановка
@@ -578,6 +580,8 @@ A source file is deleted only after successful ZIP creation and archive test in 
 For source archives, similar logic is used: if an archive was unpacked, all its book tasks finished successfully, and there were no failures, the source archive may be deleted after all child tasks are complete.
 
 If a file from `SOURCE_DIRS` is classified as non-book, it is moved to `NOBOOK_DIR`.
+
+If a source archive is unpacked and no books are found inside it, the original source archive is moved as a whole to `NOBOOK_DIR`. Its temporary extracted files are deleted with the temp folder and are not sent to `A7/A8`.
 
 Files extracted into the temporary folder from archives are working copies. The temporary folder is cleaned after completion or stop.
 
