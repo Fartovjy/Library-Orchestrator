@@ -1178,14 +1178,13 @@ class LibraryGUIApp:
         self._set_status("status_stopping_cleanup")
 
     def _poll_pipeline(self) -> None:
-        if self.sorter:
-            try:
-                snap = self.sorter.metrics.snapshot(self.sorter.queue_sizes())
-                self._render_snapshot(snap)
-            except Exception:
-                pass
-
         if self.pipeline_running and self.pipeline_thread and not self.pipeline_thread.is_alive():
+            if self.sorter:
+                try:
+                    snap = self.sorter.metrics.snapshot(self.sorter.queue_sizes())
+                    self._render_snapshot(snap)
+                except Exception:
+                    pass
             self.pipeline_running = False
             self.start_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
@@ -1201,6 +1200,12 @@ class LibraryGUIApp:
             self.mode_var.set(self._mode_label(self.current_mode))
             if exit_code == 0 and self.shutdown_after_done_var.get():
                 self._shutdown_computer()
+        elif self.sorter and self.pipeline_running:
+            try:
+                snap = self.sorter.metrics.snapshot(self.sorter.queue_sizes())
+                self._render_snapshot(snap)
+            except Exception:
+                pass
 
         self.root.after(300, self._poll_pipeline)
 
