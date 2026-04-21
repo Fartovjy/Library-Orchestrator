@@ -1258,7 +1258,13 @@ class LibraryGUIApp:
     def _time_label(self, snap: dict) -> str:
         elapsed = fix_mojibake(str(snap.get("elapsed", "00:00:00")))
         eta = fix_mojibake(str(snap.get("eta", "--:--:--")))
-        return f"{elapsed}/~{eta}"
+        return f"{self._time_without_seconds(elapsed)}/~{self._time_without_seconds(eta)}"
+
+    def _time_without_seconds(self, value: str) -> str:
+        parts = str(value or "").split(":")
+        if len(parts) >= 3:
+            return ":".join(parts[:2])
+        return str(value or "--:--")
 
     def _agent_title(self, key: str) -> str:
         return f"{key} {self.tr(f'agent_{key}')}"
