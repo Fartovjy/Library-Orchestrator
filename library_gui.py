@@ -672,7 +672,7 @@ class LibraryGUIApp:
         ).pack(fill=tk.X)
 
         stats = tk.Frame(ctrl, bg=self._c("ctrl_bg"))
-        stats.grid(row=1, column=1, sticky="w", padx=(10, 10), pady=(6, 0))
+        stats.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=(6, 0))
         self.stats_frame = stats
         for idx, (label, var) in enumerate(
             [
