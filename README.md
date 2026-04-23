@@ -24,7 +24,7 @@ pip install -r requirements.txt
 3. Запустите GUI:
 
 ```powershell
-python .\library_gui.py
+python .\run.py
 ```
 
 4. В GUI выберите один или несколько `SOURCE_DIRS`, проверьте `TARGET_DIR`, нажмите `Старт`.
@@ -376,7 +376,7 @@ pip install -r requirements.txt
 3. Start the GUI:
 
 ```powershell
-python .\library_gui.py
+python .\run.py
 ```
 
 4. In the GUI, select one or more `SOURCE_DIRS`, check `TARGET_DIR`, and press `Старт`.

@@ -20,7 +20,6 @@ import re
 import subprocess
 import sys
 import threading
-import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -181,42 +180,6 @@ def detect_system_theme_mode() -> str:
     return "dark"
 
 
-def lighten_hex(color: str, factor: float = 0.3) -> str:
-    if not isinstance(color, str):
-        return color
-    raw = color.strip().lstrip("#")
-    if len(raw) != 6:
-        return color
-    try:
-        r = int(raw[0:2], 16)
-        g = int(raw[2:4], 16)
-        b = int(raw[4:6], 16)
-    except Exception:
-        return color
-    r = int(r + (255 - r) * factor)
-    g = int(g + (255 - g) * factor)
-    b = int(b + (255 - b) * factor)
-    return f"#{r:02x}{g:02x}{b:02x}"
-
-
-def darken_hex(color: str, factor: float = 0.18) -> str:
-    if not isinstance(color, str):
-        return color
-    raw = color.strip().lstrip("#")
-    if len(raw) != 6:
-        return color
-    try:
-        r = int(raw[0:2], 16)
-        g = int(raw[2:4], 16)
-        b = int(raw[4:6], 16)
-    except Exception:
-        return color
-    r = int(r * (1.0 - factor))
-    g = int(g * (1.0 - factor))
-    b = int(b * (1.0 - factor))
-    return f"#{r:02x}{g:02x}{b:02x}"
-
-
 def fix_mojibake(text: str) -> str:
     """
     Восстанавливает типичный mojibake в строках.
@@ -361,19 +324,11 @@ class LibraryGUIApp:
         self.agent_queue: dict[str, tk.StringVar] = {}
         self.agent_cards: dict[str, tk.Frame] = {}
         self.agent_indicator_bars: dict[str, tk.Frame] = {}
+        self.agent_indicator_segments: dict[str, list[tk.Frame]] = {}
+        self.agent_indicator_totals: dict[str, int] = {}
         self.agent_labels: dict[str, list[tk.Widget]] = {}
         self.stat_label_widgets: dict[str, tk.Label] = {}
         self.agent_title_labels: dict[str, tk.Label] = {}
-        self.agent_last_processed: dict[str, int] = {k: 0 for k in lp.AGENT_KEYS}
-        self.agent_active_until: dict[str, float] = {k: 0.0 for k in lp.AGENT_KEYS}
-        if self.theme_mode == "dark":
-            self.agent_active_bg = {
-                k: lighten_hex(self.agent_colors[k][0], 0.55) for k in lp.AGENT_KEYS
-            }
-        else:
-            self.agent_active_bg = {
-                k: darken_hex(self.agent_colors[k][0], 0.18) for k in lp.AGENT_KEYS
-            }
 
         self._build_window()
         self._build_ui()
@@ -436,8 +391,7 @@ class LibraryGUIApp:
         for key, label in self.stat_label_widgets.items():
             label.configure(text=self.tr(key))
         for key, label in self.agent_title_labels.items():
-            active = time.time() < self.agent_active_until.get(key, 0.0)
-            label.configure(text=self._agent_title_text(key, active))
+            label.configure(text=self._agent_title(key))
 
         if hasattr(self, "drop_title_label"):
             self.drop_title_label.configure(text=self.tr("drop_title"))
@@ -775,14 +729,15 @@ class LibraryGUIApp:
             content.grid(row=0, column=0, sticky="nsew")
             self.agent_labels[key].append(content)
 
-            indicator = tk.Frame(card, bg=self._agent_indicator_color(key, False), width=5)
+            indicator = tk.Frame(card, bg=self._c("root_bg"), width=6)
             indicator.grid(row=0, column=1, sticky="ns", padx=(4, 0))
             indicator.grid_propagate(False)
             self.agent_indicator_bars[key] = indicator
+            self._rebuild_agent_indicator_segments(key)
 
             title_lbl = tk.Label(
                 content,
-                text=self._agent_title_text(key, False),
+                text=self._agent_title(key),
                 font=self.font_agent_title,
                 bg=bg,
                 fg=fg,
@@ -1195,6 +1150,8 @@ class LibraryGUIApp:
             return
 
         self.sorter = sorter
+        for key in lp.AGENT_KEYS:
+            self._rebuild_agent_indicator_segments(key)
         self.pipeline_running = True
         self.shutdown_started = False
         self.stop_requested_by_user = False
@@ -1306,6 +1263,7 @@ class LibraryGUIApp:
         stage_processed = snap.get("stage_processed", {}) or {}
         stage_errors = snap.get("stage_errors", {}) or {}
         queue_sizes = snap.get("queue_sizes", {}) or {}
+        active_stage_slots = snap.get("active_stage_slots", {}) or {}
         for key in lp.AGENT_KEYS:
             processed = int(stage_processed.get(key, 0))
             errors = int(stage_errors.get(key, 0))
@@ -1313,7 +1271,7 @@ class LibraryGUIApp:
             self.agent_processed[key].set(self._fmt_num(processed))
             self.agent_errors[key].set(self._fmt_num(errors))
             self.agent_queue[key].set(self._fmt_num(qsize))
-            self._update_agent_visual_state(key, processed, qsize)
+            self._update_agent_visual_state(key, active_stage_slots.get(key, []))
 
         self._render_events(snap)
 
@@ -1342,14 +1300,57 @@ class LibraryGUIApp:
     def _agent_title(self, key: str) -> str:
         return f"{key} {self.tr(f'agent_{key}')}"
 
-    def _agent_title_text(self, key: str, active: bool) -> str:
-        prefix = "\u25ae " if active else "\u25af "
-        return f"{prefix}{self._agent_title(key)}"
-
     def _agent_indicator_color(self, key: str, active: bool) -> str:
         if active:
             return "#ffd166" if self.theme_mode == "dark" else "#b45309"
         return "#1f2937" if self.theme_mode == "dark" else "#cbd5e1"
+
+    def _agent_worker_total(self, key: str) -> int:
+        if key == "A1":
+            return 1
+        worker_map = {
+            "A2": ("unpack_workers", "UNPACK_WORKERS", lp.DEFAULT_UNPACK_WORKERS),
+            "A3": ("detect_workers", "DETECT_WORKERS", lp.DEFAULT_DETECT_WORKERS),
+            "A4": ("dedupe_workers", "DEDUPE_WORKERS", lp.DEFAULT_DEDUPE_WORKERS),
+            "A5": ("tag_workers", "TAG_WORKERS", lp.DEFAULT_TAG_WORKERS),
+            "A6": ("lm_workers", "LM_WORKERS", lp.DEFAULT_LM_WORKERS),
+            "A7": ("rename_workers", "RENAME_WORKERS", lp.DEFAULT_RENAME_WORKERS),
+            "A8": ("pack_workers", "PACK_WORKERS", lp.DEFAULT_PACK_WORKERS),
+        }
+        attr_name, setting_name, default = worker_map.get(key, ("", "", 1))
+        sorter = getattr(self, "sorter", None)
+        if sorter is not None and attr_name:
+            try:
+                return max(1, int(getattr(sorter.config, attr_name, default)))
+            except Exception:
+                pass
+        if setting_name:
+            return self._setting_int(setting_name, default, min_value=1)
+        return 1
+
+    def _rebuild_agent_indicator_segments(self, key: str) -> None:
+        bar = self.agent_indicator_bars.get(key)
+        if not bar:
+            return
+        total = self._agent_worker_total(key)
+        previous_total = self.agent_indicator_totals.get(key, 0)
+        if previous_total == total and self.agent_indicator_segments.get(key):
+            return
+        for child in bar.winfo_children():
+            child.destroy()
+        for row in range(max(previous_total, total)):
+            bar.grid_rowconfigure(row, weight=0, uniform="")
+        bar.grid_columnconfigure(0, weight=1)
+
+        gap = 1 if total <= 12 else 0
+        segments: list[tk.Frame] = []
+        for row in range(total):
+            bar.grid_rowconfigure(row, weight=1, uniform=f"{key}_indicator")
+            segment = tk.Frame(bar, bg=self._agent_indicator_color(key, False), height=1)
+            segment.grid(row=row, column=0, sticky="nsew", pady=(gap, 0))
+            segments.append(segment)
+        self.agent_indicator_segments[key] = segments
+        self.agent_indicator_totals[key] = total
 
     def _log_text(self, path: object = "-") -> str:
         return f"{self.tr('log_prefix')}: {path}"
@@ -1393,42 +1394,21 @@ class LibraryGUIApp:
                 self.tr("dialog_shutdown_failed", error=exc),
             )
 
-    def _update_agent_visual_state(self, key: str, processed: int, qsize: int) -> None:
-        now = time.time()
-        prev_processed = self.agent_last_processed.get(key, 0)
-        if processed > prev_processed:
-            self.agent_active_until[key] = max(self.agent_active_until.get(key, 0.0), now + 1.6)
-        self.agent_last_processed[key] = processed
-
-        if qsize > 0:
-            self.agent_active_until[key] = max(self.agent_active_until.get(key, 0.0), now + 0.8)
-
-        is_active = now < self.agent_active_until.get(key, 0.0)
-        bg = self.agent_active_bg[key] if is_active else self.agent_colors[key][0]
-        self._set_agent_card_bg(key, bg)
-        self._set_agent_activity_indicator(key, is_active)
-
-    def _set_agent_card_bg(self, key: str, bg: str) -> None:
-        card = self.agent_cards.get(key)
-        if not card:
-            return
-        try:
-            if str(card.cget("bg")) == str(bg):
-                return
-            card.configure(bg=bg)
-            for lbl in self.agent_labels.get(key, []):
-                lbl.configure(bg=bg)
-        except Exception:
-            return
-
-    def _set_agent_activity_indicator(self, key: str, active: bool) -> None:
+    def _update_agent_visual_state(self, key: str, active_slots: object) -> None:
         try:
             title = self.agent_title_labels.get(key)
             if title:
-                title.configure(text=self._agent_title_text(key, active))
-            bar = self.agent_indicator_bars.get(key)
-            if bar:
-                bar.configure(bg=self._agent_indicator_color(key, active))
+                title.configure(text=self._agent_title(key))
+            self._rebuild_agent_indicator_segments(key)
+
+            if isinstance(active_slots, (list, tuple, set)):
+                active_set = {fix_mojibake(str(slot)) for slot in active_slots}
+            else:
+                active_set = set()
+
+            for idx, segment in enumerate(self.agent_indicator_segments.get(key, []), start=1):
+                active = f"W{idx}" in active_set
+                segment.configure(bg=self._agent_indicator_color(key, active))
         except Exception:
             return
 

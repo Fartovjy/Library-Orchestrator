@@ -497,6 +497,20 @@ class Metrics:
             out[stage] = stage_map[slot]
         return out
 
+    def _snapshot_active_counts(self) -> dict[str, int]:
+        return {
+            stage: len(stage_map)
+            for stage, stage_map in self.active_stage_items.items()
+            if stage_map
+        }
+
+    def _snapshot_active_slots(self) -> dict[str, list[str]]:
+        return {
+            stage: sorted(stage_map.keys())
+            for stage, stage_map in self.active_stage_items.items()
+            if stage_map
+        }
+
     def mark_task_seen(self) -> None:
         with self.lock:
             self.total_tasks_seen += 1
@@ -668,6 +682,8 @@ class Metrics:
                 "lm_stats": lm_stats,
                 "events": list(self.events),
                 "active_stage_items": self._snapshot_active_items(),
+                "active_stage_counts": self._snapshot_active_counts(),
+                "active_stage_slots": self._snapshot_active_slots(),
                 "queue_sizes": queue_sizes,
                 "stage_flags": dict(stage_flags or {}),
                 "eta_model": "A1/A2/A3/A4",
@@ -2022,6 +2038,8 @@ class LibrarySorter:
 
     def _scanner_loop(self) -> None:
         self.metrics.add_event("Agent1: поиск файлов...")
+        active_slot = "W1"
+        self.metrics.set_active_item("A1", active_slot, "scan")
         try:
             for source_root in self.config.source_dirs:
                 if self.should_stop() or self.cleanup_event.is_set():
@@ -2031,6 +2049,7 @@ class LibrarySorter:
                     if self.cleanup_event.is_set():
                         break
                     cur = stack.pop()
+                    self.metrics.set_active_item("A1", active_slot, cur.name or str(cur))
                     try:
                         with os.scandir(cur) as it:
                             for entry in it:
@@ -2063,11 +2082,13 @@ class LibrarySorter:
                         )
                         self.metrics.mark_stage("A1", error=True)
         finally:
+            self.metrics.clear_active_item("A1", active_slot)
             self.scan_done.set()
             self.metrics.add_event("Agent1: поиск завершен")
 
     def _unpack_loop(self, worker_idx: int) -> None:
         self.metrics.add_event(f"Agent2/W{worker_idx}: старт")
+        active_slot = f"W{worker_idx}"
         while True:
             if self.cleanup_event.is_set():
                 break
@@ -2087,6 +2108,7 @@ class LibrarySorter:
             try:
                 if self.cleanup_event.is_set():
                     continue
+                self.metrics.set_active_item("A2", active_slot, task.path.name)
                 self.metrics.mark_stage("A2")
                 if is_archive(task.path):
                     extracted_count = self._extract_archive_and_route(task)
@@ -2107,6 +2129,7 @@ class LibrarySorter:
                 self.db.mark_file(task, "unpack_failed", str(exc))
                 self._finalize_task(task, result="failed")
             finally:
+                self.metrics.clear_active_item("A2", active_slot)
                 self.unpack_active.dec()
                 self.q12.task_done()
         self.metrics.add_event(f"Agent2/W{worker_idx}: завершен")
@@ -2169,6 +2192,7 @@ class LibrarySorter:
 
     def _detect_loop(self, worker_idx: int) -> None:
         self.metrics.add_event(f"Agent3/W{worker_idx}: старт")
+        active_slot = f"W{worker_idx}"
         while True:
             if self.cleanup_event.is_set():
                 break
@@ -2181,6 +2205,7 @@ class LibrarySorter:
                     break
                 continue
             try:
+                self.metrics.set_active_item("A3", active_slot, task.path.name)
                 self.metrics.mark_stage("A3")
                 is_book_file, reason = self._is_book_candidate(task)
                 if is_book_file:
@@ -2213,11 +2238,13 @@ class LibrarySorter:
                 self.db.mark_file(task, "detect_failed", str(exc))
                 self._finalize_task(task, result="failed")
             finally:
+                self.metrics.clear_active_item("A3", active_slot)
                 self.q23.task_done()
         self.metrics.add_event(f"Agent3/W{worker_idx}: завершен")
 
     def _tags_loop(self, worker_idx: int) -> None:
         self.metrics.add_event(f"Agent5/W{worker_idx}: старт")
+        active_slot = f"W{worker_idx}"
         while True:
             if self.cleanup_event.is_set():
                 break
@@ -2230,6 +2257,7 @@ class LibrarySorter:
                     break
                 continue
             try:
+                self.metrics.set_active_item("A5", active_slot, task.path.name)
                 self.metrics.mark_stage("A5")
                 task.metadata = self._extract_metadata(task)
                 self.logger.info("A5 tags path=%s %s", task.path, self._md_brief(task.metadata))
@@ -2241,6 +2269,7 @@ class LibrarySorter:
                 self.db.mark_file(task, "tags_failed", str(exc))
                 self._put_with_stop(self.q56, task)
             finally:
+                self.metrics.clear_active_item("A5", active_slot)
                 self.q45.task_done()
         self.metrics.add_event(f"Agent5/W{worker_idx}: завершен")
 
@@ -2373,6 +2402,7 @@ class LibrarySorter:
 
     def _rename_loop(self, worker_idx: int) -> None:
         self.metrics.add_event(f"Agent7/W{worker_idx}: старт")
+        active_slot = f"W{worker_idx}"
         while True:
             if self.cleanup_event.is_set():
                 break
@@ -2385,6 +2415,7 @@ class LibrarySorter:
                     break
                 continue
             try:
+                self.metrics.set_active_item("A7", active_slot, task.path.name)
                 self.metrics.mark_stage("A7")
                 task.dest_zip = self._build_destination(task)
                 self.logger.info("A7 route path=%s dest=%s", task.path, task.dest_zip)
@@ -2396,11 +2427,13 @@ class LibrarySorter:
                 self.db.mark_file(task, "rename_failed", str(exc))
                 self._finalize_task(task, result="failed")
             finally:
+                self.metrics.clear_active_item("A7", active_slot)
                 self.q67.task_done()
         self.metrics.add_event(f"Agent7/W{worker_idx}: завершен")
 
     def _dedupe_loop(self, worker_idx: int) -> None:
         self.metrics.add_event(f"Agent4/W{worker_idx}: старт")
+        active_slot = f"W{worker_idx}"
         while True:
             if self.cleanup_event.is_set():
                 break
@@ -2413,6 +2446,7 @@ class LibrarySorter:
                     break
                 continue
             try:
+                self.metrics.set_active_item("A4", active_slot, task.path.name)
                 self.metrics.mark_stage("A4")
                 xxh = xxh64_file(task.path)
                 task.xxh64 = xxh
@@ -2448,11 +2482,13 @@ class LibrarySorter:
                 self.db.mark_file(task, "dedupe_failed", str(exc))
                 self._finalize_task(task, result="failed")
             finally:
+                self.metrics.clear_active_item("A4", active_slot)
                 self.q34.task_done()
         self.metrics.add_event(f"Agent4/W{worker_idx}: завершен")
 
     def _pack_loop(self, worker_idx: int) -> None:
         self.metrics.add_event(f"Agent8/W{worker_idx}: старт")
+        active_slot = f"W{worker_idx}"
         while True:
             if self.cleanup_event.is_set():
                 break
@@ -2465,6 +2501,7 @@ class LibrarySorter:
                     break
                 continue
             try:
+                self.metrics.set_active_item("A8", active_slot, task.path.name)
                 self.metrics.mark_stage("A8")
                 self._pack_task(task)
                 if task.xxh64 and task.dest_zip:
@@ -2494,6 +2531,7 @@ class LibrarySorter:
                 )
                 self._finalize_task(task, result="failed")
             finally:
+                self.metrics.clear_active_item("A8", active_slot)
                 self.q78.task_done()
         self.metrics.add_event(f"Agent8/W{worker_idx}: завершен")
 
