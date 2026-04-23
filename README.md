@@ -116,6 +116,10 @@ A8 Упаковка
 
 Маленькие неизвестные бинарные файлы также отсекаются как не книги.
 
+`A3` дополнительно использует библиотеку `filetype` и проверяет сигнатуру файла. Если сигнатура уверенно указывает на изображение, аудио, видео, шрифт, исполняемый файл или другой стандартный не-книжный тип, файл переносится в `NOBOOK_DIR` до `A4` и не попадает в дедупликацию, теги и LM Studio.
+
+Книжные форматы пропускаются дальше только по известным книжным сигнатурам или по известным книжным расширениям. Текстовые форматы без книжных признаков (`ISBN`, `глава`, `chapter`, `автор`) теперь не отправляются дальше как книги.
+
 ## Счетчики В GUI
 
 Верхние счетчики считают книги, а не операции.
@@ -150,11 +154,20 @@ A8 Упаковка
 
 Сколько книжных задач завершились ошибкой.
 
-Процент выполнения и примерное оставшееся время считаются только от книжного прогресса:
+`Книг найдено` и `Книг завершено` остаются фактическими книжными счетчиками.
+
+Процент выполнения и примерное оставшееся время теперь считаются по ранним стадиям `A1/A2/A3/A4`:
 
 ```text
-Книг завершено / Книг найдено
+done / оценка общего количества книг
 ```
+
+Где оценка строится так:
+
+1. `A2` дает среднее расширение очереди после распаковки.
+2. `A3` дает долю файлов, которые оказываются книгами.
+3. `A4` учитывается в ETA как отдельный фронт дедупликации.
+4. Пока `A1` еще сканирует источники, ETA остается приблизительной и становится точнее после завершения сканирования.
 
 ## Счетчики Агентов
 
@@ -185,7 +198,7 @@ ui_en.json
 ⏻ Выключить ПК после завершения
 ```
 
-По умолчанию он выключен. Если включить его, приложение выполнит принудительное выключение компьютера только после успешного завершения всех операций конвейера. При остановке вручную или ошибке выключение не запускается.
+По умолчанию он выключен. Если включить его, приложение выполнит принудительное выключение компьютера только после успешного завершения всех операций конвейера, с задержкой 300 секунд. При остановке вручную или ошибке выключение не запускается.
 
 ## Дубликаты
 
@@ -211,7 +224,11 @@ URL по умолчанию:
 http://127.0.0.1:1234/v1/chat/completions
 ```
 
-Приложение не отправляет в модель всю книгу. В LM Studio отправляется:
+Приложение не отправляет в модель всю книгу. Перед тяжелым запросом `A6` сначала выполняет быстрый V3 precheck по имени файла, пути, цепочке архивов и метаданным `A5`.
+
+Быстрый ответ принимается только если модель вернула `title`, `author`, `genre` и уверенность не ниже `LM_FAST_CONFIDENCE_MIN`. Если быстрый ответ слабый или неполный, `A6` переходит к прежнему полному запросу.
+
+В полный запрос LM Studio отправляется:
 
 1. короткий текстовый фрагмент, если его удалось безопасно извлечь;
 2. или fallback-контекст: имя файла, расширение, папка, цепочка архивов и предположения из имени файла.
@@ -242,9 +259,13 @@ temperature = 0.1
 
 Если LM Studio вернул не-JSON, приложение делает дополнительную попытку с более строгим требованием JSON.
 
+Каждые 50 задач `A6` пишет в события краткую статистику: быстрые успешные ответы, fallback к полному запросу и количество полных запросов.
+
 ## Удаление Исходников
 
 Исходный файл удаляется только после успешной упаковки и проверки ZIP в `A8`.
+
+В GUI есть флажок `Не удалять исходники`. По умолчанию он выключен: после успешного `A8` исходники удаляются по обычной логике. Если флажок включен, исходные книги и исходные архивы после успешной упаковки не удаляются.
 
 Для исходного архива действует похожая логика: если архив был распакован, все его книжные задачи успешно завершены и не было ошибок, исходный архив может быть удален после завершения всех дочерних задач.
 
@@ -447,6 +468,10 @@ Single raster images, including `.tif/.tiff`, are currently not treated as books
 
 Small unknown binary files are also rejected as non-books.
 
+`A3` also uses the `filetype` library to inspect file signatures. If the signature clearly identifies an image, audio, video, font, executable, or another standard non-book type, the file is moved to `NOBOOK_DIR` before `A4` and never reaches deduplication, tags, or LM Studio.
+
+Book files continue only when they match known book signatures or known book extensions. Text formats without book signals (`ISBN`, `глава`, `chapter`, `автор`) are no longer passed forward as books.
+
 ## GUI Counters
 
 Top-level counters count books, not pipeline operations.
@@ -481,11 +506,20 @@ Book errors
 
 Number of book tasks that ended with an error.
 
-Progress percentage and ETA are calculated only from book progress:
+`Books found` and `Books done` remain actual book counters.
+
+Progress percentage and ETA are now estimated from early stages `A1/A2/A3/A4`:
 
 ```text
-Books done / Books found
+done / estimated total books
 ```
+
+The estimate is built like this:
+
+1. `A2` provides the observed archive expansion ratio.
+2. `A3` provides the observed book hit ratio.
+3. `A4` is included in ETA as a separate deduplication frontier.
+4. While `A1` is still scanning the sources, ETA stays approximate and becomes more stable after scanning finishes.
 
 ## Agent Counters
 
@@ -516,7 +550,7 @@ The bottom-right checkbox controls automatic shutdown:
 ⏻ Shut down PC when done
 ```
 
-It is disabled by default. If enabled, the application forcibly shuts down the computer only after the pipeline finishes all operations successfully. Manual stop or pipeline errors do not trigger shutdown.
+It is disabled by default. If enabled, the application forcibly shuts down the computer only after the pipeline finishes all operations successfully, with a 300-second delay. Manual stop or pipeline errors do not trigger shutdown.
 
 ## Duplicates
 
@@ -542,7 +576,11 @@ Default URL:
 http://127.0.0.1:1234/v1/chat/completions
 ```
 
-The application does not send the whole book to the model. It sends:
+The application does not send the whole book to the model. Before the heavy request, `A6` first runs a fast V3 precheck using the filename, path, archive chain, and `A5` metadata.
+
+The fast response is accepted only when the model returns `title`, `author`, `genre`, and confidence at least `LM_FAST_CONFIDENCE_MIN`. If the fast response is weak or incomplete, `A6` falls back to the previous full request.
+
+The full LM Studio request sends:
 
 1. a short text snippet if it can be safely extracted;
 2. or fallback context: filename, extension, parent folder, archive chain, and filename-based guesses.
@@ -573,9 +611,13 @@ temperature = 0.1
 
 If LM Studio returns non-JSON, the application performs an additional stricter JSON-only retry.
 
+Every 50 `A6` tasks, the event stream receives a short statistic line: fast accepted responses, fallbacks to full mode, and full request count.
+
 ## Source Deletion
 
 A source file is deleted only after successful ZIP creation and archive test in `A8`.
+
+The GUI has a `Keep sources` checkbox. It is off by default: after successful `A8`, sources are deleted by the normal logic. When it is enabled, source books and source archives are not deleted after successful packing.
 
 For source archives, similar logic is used: if an archive was unpacked, all its book tasks finished successfully, and there were no failures, the source archive may be deleted after all child tasks are complete.
 

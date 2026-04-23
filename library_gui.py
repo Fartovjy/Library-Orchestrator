@@ -199,6 +199,24 @@ def lighten_hex(color: str, factor: float = 0.3) -> str:
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
+def darken_hex(color: str, factor: float = 0.18) -> str:
+    if not isinstance(color, str):
+        return color
+    raw = color.strip().lstrip("#")
+    if len(raw) != 6:
+        return color
+    try:
+        r = int(raw[0:2], 16)
+        g = int(raw[2:4], 16)
+        b = int(raw[4:6], 16)
+    except Exception:
+        return color
+    r = int(r * (1.0 - factor))
+    g = int(g * (1.0 - factor))
+    b = int(b * (1.0 - factor))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
 def fix_mojibake(text: str) -> str:
     """
     Восстанавливает типичный mojibake в строках.
@@ -240,6 +258,7 @@ class LibraryGUIApp:
         self.status_key = "status_ready"
         self.status_kwargs: dict[str, object] = {}
         self.shutdown_started = False
+        self.stop_requested_by_user = False
 
         font_family = "Segoe UI"
         if setting is not None:
@@ -335,19 +354,26 @@ class LibraryGUIApp:
         self.event_var = tk.StringVar(value=f"{self.tr('events_prefix')}: -")
         self.log_var = tk.StringVar(value=f"{self.tr('log_prefix')}: -")
         self.shutdown_after_done_var = tk.BooleanVar(value=False)
+        self.keep_sources_var = tk.BooleanVar(value=False)
 
         self.agent_processed: dict[str, tk.StringVar] = {}
         self.agent_errors: dict[str, tk.StringVar] = {}
         self.agent_queue: dict[str, tk.StringVar] = {}
         self.agent_cards: dict[str, tk.Frame] = {}
+        self.agent_indicator_bars: dict[str, tk.Frame] = {}
         self.agent_labels: dict[str, list[tk.Widget]] = {}
         self.stat_label_widgets: dict[str, tk.Label] = {}
         self.agent_title_labels: dict[str, tk.Label] = {}
         self.agent_last_processed: dict[str, int] = {k: 0 for k in lp.AGENT_KEYS}
         self.agent_active_until: dict[str, float] = {k: 0.0 for k in lp.AGENT_KEYS}
-        self.agent_active_bg: dict[str, str] = {
-            k: lighten_hex(self.agent_colors[k][0], 0.32) for k in lp.AGENT_KEYS
-        }
+        if self.theme_mode == "dark":
+            self.agent_active_bg = {
+                k: lighten_hex(self.agent_colors[k][0], 0.55) for k in lp.AGENT_KEYS
+            }
+        else:
+            self.agent_active_bg = {
+                k: darken_hex(self.agent_colors[k][0], 0.18) for k in lp.AGENT_KEYS
+            }
 
         self._build_window()
         self._build_ui()
@@ -393,7 +419,7 @@ class LibraryGUIApp:
     def _set_status(self, key: str, **kwargs: object) -> None:
         self.status_key = key
         self.status_kwargs = dict(kwargs)
-        self.status_var.set(self.tr(key, **kwargs))
+        self._refresh_status_line(self.last_snapshot)
 
     def _set_language(self, language: str) -> None:
         if language not in LANGUAGE_FILES:
@@ -404,13 +430,14 @@ class LibraryGUIApp:
     def _apply_language(self) -> None:
         self.root.title(self.tr("window_title"))
         self.mode_var.set(self._mode_label(self.current_mode))
-        self.status_var.set(self.tr(self.status_key, **self.status_kwargs))
+        self._refresh_status_line(self.last_snapshot)
         self.log_var.set(self._log_text(self.current_log_path))
 
         for key, label in self.stat_label_widgets.items():
             label.configure(text=self.tr(key))
         for key, label in self.agent_title_labels.items():
-            label.configure(text=self._agent_title(key))
+            active = time.time() < self.agent_active_until.get(key, 0.0)
+            label.configure(text=self._agent_title_text(key, active))
 
         if hasattr(self, "drop_title_label"):
             self.drop_title_label.configure(text=self.tr("drop_title"))
@@ -440,6 +467,8 @@ class LibraryGUIApp:
             self.lang_en_btn.configure(text=self.tr("language_en"))
         if hasattr(self, "shutdown_check"):
             self.shutdown_check.configure(text=self.tr("shutdown_after_done"))
+        if hasattr(self, "keep_sources_check"):
+            self.keep_sources_check.configure(text=self.tr("keep_sources"))
 
         self._render_events(self.last_snapshot)
 
@@ -738,10 +767,22 @@ class LibraryGUIApp:
             card.grid(row=row, column=col, sticky="nsew", padx=2, pady=2)
             self.agent_cards[key] = card
             self.agent_labels[key] = []
+            card.grid_columnconfigure(0, weight=1)
+            card.grid_columnconfigure(1, minsize=5)
+            card.grid_rowconfigure(0, weight=1)
+
+            content = tk.Frame(card, bg=bg)
+            content.grid(row=0, column=0, sticky="nsew")
+            self.agent_labels[key].append(content)
+
+            indicator = tk.Frame(card, bg=self._agent_indicator_color(key, False), width=5)
+            indicator.grid(row=0, column=1, sticky="ns", padx=(4, 0))
+            indicator.grid_propagate(False)
+            self.agent_indicator_bars[key] = indicator
 
             title_lbl = tk.Label(
-                card,
-                text=self._agent_title(key),
+                content,
+                text=self._agent_title_text(key, False),
                 font=self.font_agent_title,
                 bg=bg,
                 fg=fg,
@@ -758,7 +799,7 @@ class LibraryGUIApp:
             self.agent_errors[key] = e
             self.agent_queue[key] = q
 
-            metrics_line = tk.Frame(card, bg=bg)
+            metrics_line = tk.Frame(content, bg=bg)
             metrics_line.pack(fill=tk.X, anchor="w")
             self.agent_labels[key].append(metrics_line)
 
@@ -881,6 +922,19 @@ class LibraryGUIApp:
             selectcolor=self._c("ctrl_bg"),
         )
         self.shutdown_check.pack(side=tk.RIGHT, anchor="se")
+
+        self.keep_sources_check = tk.Checkbutton(
+            footer_controls,
+            text=self.tr("keep_sources"),
+            variable=self.keep_sources_var,
+            font=self.font_legend,
+            bg=self._c("ctrl_bg"),
+            fg=self._c("text_secondary"),
+            activebackground=self._c("ctrl_bg"),
+            activeforeground=self._c("text_primary"),
+            selectcolor=self._c("ctrl_bg"),
+        )
+        self.keep_sources_check.pack(side=tk.RIGHT, anchor="se", padx=(0, 12))
 
     def _apply_initial_dirs(self) -> None:
         # SOURCE_DIRS не подставляем автоматически при старте.
@@ -1088,7 +1142,7 @@ class LibraryGUIApp:
             max_parallel_archives=self._setting_int(
                 "MAX_PARALLEL_ARCHIVES", lp.DEFAULT_MAX_PARALLEL_ARCHIVES, min_value=1
             ),
-            delete_source_after_pack=True,
+            delete_source_after_pack=not self.keep_sources_var.get(),
             keep_temp_nobooks=False,
             lm_timeout_sec=self._setting_int(
                 "LM_TIMEOUT_SEC", lp.DEFAULT_LM_TIMEOUT_SEC, min_value=10
@@ -1143,6 +1197,7 @@ class LibraryGUIApp:
         self.sorter = sorter
         self.pipeline_running = True
         self.shutdown_started = False
+        self.stop_requested_by_user = False
         self.current_mode = "RUNNING"
         self.mode_var.set(self._mode_label("RUNNING"))
         self.time_var.set("00:00:00/~--:--:--")
@@ -1173,6 +1228,7 @@ class LibraryGUIApp:
         if not self.pipeline_running or not self.sorter:
             self._set_status("status_not_running")
             return
+        self.stop_requested_by_user = True
         self.sorter.request_stop_and_cleanup()
         self.current_mode = "STOP_CLEANUP"
         self.mode_var.set(self._mode_label("STOP_CLEANUP"))
@@ -1182,7 +1238,10 @@ class LibraryGUIApp:
         if self.pipeline_running and self.pipeline_thread and not self.pipeline_thread.is_alive():
             if self.sorter:
                 try:
-                    snap = self.sorter.metrics.snapshot(self.sorter.queue_sizes())
+                    snap = self.sorter.metrics.snapshot(
+                        self.sorter.queue_sizes(),
+                        self.sorter.stage_flags(),
+                    )
                     self._render_snapshot(snap)
                 except Exception:
                     pass
@@ -1190,20 +1249,33 @@ class LibraryGUIApp:
             self.start_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
             exit_code = self.pipeline_exit_code if self.pipeline_exit_code is not None else 2
-            if exit_code == 0:
+            stopped_by_user = self.stop_requested_by_user
+            if exit_code == 0 and stopped_by_user:
+                self._set_status("status_stopped_cleanup_done")
+            elif exit_code == 0:
                 self._set_status("status_finished_ok")
             else:
                 if self.pipeline_error:
                     self._set_status("status_execution_error", error=self.pipeline_error)
                 else:
                     self._set_status("status_finished_code", code=exit_code)
-            self.current_mode = "END" if exit_code == 0 else "END_ERROR"
+            if exit_code == 0 and stopped_by_user:
+                self.current_mode = "STOPPED"
+            else:
+                self.current_mode = "END" if exit_code == 0 else "END_ERROR"
             self.mode_var.set(self._mode_label(self.current_mode))
-            if exit_code == 0 and self.shutdown_after_done_var.get():
+            if (
+                exit_code == 0
+                and not stopped_by_user
+                and self.shutdown_after_done_var.get()
+            ):
                 self._shutdown_computer()
         elif self.sorter and self.pipeline_running:
             try:
-                snap = self.sorter.metrics.snapshot(self.sorter.queue_sizes())
+                snap = self.sorter.metrics.snapshot(
+                    self.sorter.queue_sizes(),
+                    self.sorter.stage_flags(),
+                )
                 self._render_snapshot(snap)
             except Exception:
                 pass
@@ -1218,6 +1290,7 @@ class LibraryGUIApp:
         self.current_mode = fix_mojibake(str(snap.get("mode", "RUNNING")))
         self.mode_var.set(self._mode_label(self.current_mode))
         self.time_var.set(self._time_label(snap))
+        self._refresh_status_line(snap)
 
         seen = int(snap.get("seen", 0))
         done = int(snap.get("done", 0))
@@ -1269,8 +1342,29 @@ class LibraryGUIApp:
     def _agent_title(self, key: str) -> str:
         return f"{key} {self.tr(f'agent_{key}')}"
 
+    def _agent_title_text(self, key: str, active: bool) -> str:
+        prefix = "\u25ae " if active else "\u25af "
+        return f"{prefix}{self._agent_title(key)}"
+
+    def _agent_indicator_color(self, key: str, active: bool) -> str:
+        if active:
+            return "#ffd166" if self.theme_mode == "dark" else "#b45309"
+        return "#1f2937" if self.theme_mode == "dark" else "#cbd5e1"
+
     def _log_text(self, path: object = "-") -> str:
         return f"{self.tr('log_prefix')}: {path}"
+
+    def _refresh_status_line(self, snap: Optional[dict]) -> None:
+        current = snap or self.last_snapshot or {}
+        active_stage_items = current.get("active_stage_items", {}) or {}
+        active_a6 = fix_mojibake(str(active_stage_items.get("A6", "")).strip())
+        if self.pipeline_running and self.current_mode == "RUNNING":
+            if active_a6:
+                self.status_var.set(self.tr("status_a6_current", file=active_a6))
+            else:
+                self.status_var.set(self.tr("status_a6_waiting"))
+            return
+        self.status_var.set(self.tr(self.status_key, **self.status_kwargs))
 
     def _render_events(self, snap: Optional[dict]) -> None:
         events = (snap or {}).get("events", []) or []
@@ -1287,7 +1381,7 @@ class LibraryGUIApp:
         self._set_status("status_shutdown_started")
         try:
             subprocess.Popen(
-                ["shutdown", "/s", "/f", "/t", "0"],
+                ["shutdown", "/s", "/f", "/t", "300"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -1312,6 +1406,7 @@ class LibraryGUIApp:
         is_active = now < self.agent_active_until.get(key, 0.0)
         bg = self.agent_active_bg[key] if is_active else self.agent_colors[key][0]
         self._set_agent_card_bg(key, bg)
+        self._set_agent_activity_indicator(key, is_active)
 
     def _set_agent_card_bg(self, key: str, bg: str) -> None:
         card = self.agent_cards.get(key)
@@ -1323,6 +1418,17 @@ class LibraryGUIApp:
             card.configure(bg=bg)
             for lbl in self.agent_labels.get(key, []):
                 lbl.configure(bg=bg)
+        except Exception:
+            return
+
+    def _set_agent_activity_indicator(self, key: str, active: bool) -> None:
+        try:
+            title = self.agent_title_labels.get(key)
+            if title:
+                title.configure(text=self._agent_title_text(key, active))
+            bar = self.agent_indicator_bars.get(key)
+            if bar:
+                bar.configure(bg=self._agent_indicator_color(key, active))
         except Exception:
             return
 

@@ -22,13 +22,13 @@ UNPACK_WORKERS = 6
 DETECT_WORKERS = 2
 DEDUPE_WORKERS = 3
 TAG_WORKERS = 3
-LM_WORKERS = 2
+LM_WORKERS = 3
 RENAME_WORKERS = 1
-PACK_WORKERS = 6
+PACK_WORKERS = 9
 
 # Дополнительно:
 MAX_PARALLEL_ARCHIVES = 3
-QUEUE_SIZE = 200
+QUEUE_SIZE = 100
 
 # LM Studio quality tuning:
 # Increase these if you want higher recall from LM on difficult files.
@@ -36,8 +36,17 @@ LM_TIMEOUT_SEC = 90
 LM_INPUT_CHARS = 4800
 LM_MAX_OUTPUT_TOKENS = 1024
 
-# True: always run full LM metadata extraction for each book task
-# (title+author+genre+confidence), without "smart skip" optimization.
+# V3: fast LM precheck before heavy full request.
+# Safe logic: fast answer is accepted only if it is full and confident,
+# otherwise the pipeline falls back to the current heavy LM request.
+LM_FAST_PRECHECK = True
+LM_FAST_INPUT_CHARS = 900
+LM_FAST_MAX_OUTPUT_TOKENS = 180
+LM_FAST_CONFIDENCE_MIN = 4.0
+
+# True: route every book through the full-metadata LM branch.
+# In V3, a fast LM precheck may satisfy this branch early;
+# otherwise the pipeline falls back to the heavy full request.
 LM_FORCE_FULL_METADATA = True
 
 # True: call LM even when snippet text is weak/empty (uses filename/path context).

@@ -44,6 +44,11 @@ except Exception:  # pragma: no cover
     requests = None
 
 try:
+    import filetype
+except Exception:  # pragma: no cover
+    filetype = None
+
+try:
     import xxhash
 except Exception as exc:  # pragma: no cover
     raise SystemExit(
@@ -96,6 +101,14 @@ DEFAULT_MAX_PARALLEL_ARCHIVES = int(getattr(setting, "MAX_PARALLEL_ARCHIVES", 1)
 DEFAULT_LM_TIMEOUT_SEC = int(getattr(setting, "LM_TIMEOUT_SEC", 40))
 DEFAULT_LM_INPUT_CHARS = int(getattr(setting, "LM_INPUT_CHARS", 700))
 DEFAULT_LM_MAX_OUTPUT_TOKENS = int(getattr(setting, "LM_MAX_OUTPUT_TOKENS", 120))
+DEFAULT_LM_FAST_PRECHECK = bool(getattr(setting, "LM_FAST_PRECHECK", True))
+DEFAULT_LM_FAST_INPUT_CHARS = int(getattr(setting, "LM_FAST_INPUT_CHARS", 900))
+DEFAULT_LM_FAST_MAX_OUTPUT_TOKENS = int(
+    getattr(setting, "LM_FAST_MAX_OUTPUT_TOKENS", 180)
+)
+DEFAULT_LM_FAST_CONFIDENCE_MIN = float(
+    getattr(setting, "LM_FAST_CONFIDENCE_MIN", 4.0)
+)
 DEFAULT_LM_FORCE_FULL_METADATA = bool(getattr(setting, "LM_FORCE_FULL_METADATA", True))
 DEFAULT_LM_ALWAYS_TRY_WITHOUT_SNIPPET = bool(
     getattr(setting, "LM_ALWAYS_TRY_WITHOUT_SNIPPET", True)
@@ -152,6 +165,81 @@ BOOK_EXTENSIONS = {
     ".csv",
     ".xps",
     ".oxps",
+}
+
+BOOK_FILETYPE_MIMES = {
+    "application/pdf",
+    "application/epub+zip",
+    "application/x-mobipocket-ebook",
+    "application/vnd.ms-htmlhelp",
+    "application/msword",
+    "application/rtf",
+    "text/rtf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.oasis.opendocument.text",
+    "application/vnd.ms-xpsdocument",
+    "application/oxps",
+    "application/postscript",
+}
+
+BOOK_FILETYPE_EXTENSIONS = {
+    "pdf",
+    "epub",
+    "mobi",
+    "azw",
+    "azw3",
+    "doc",
+    "docx",
+    "rtf",
+    "odt",
+    "chm",
+    "xps",
+    "oxps",
+}
+
+BOOK_ZIP_CONTAINER_EXTENSIONS = {
+    ".epub",
+    ".docx",
+    ".pptx",
+    ".xlsx",
+    ".odt",
+    ".xps",
+    ".oxps",
+    ".fb2.zip",
+}
+
+ARCHIVE_FILETYPE_MIMES = {
+    "application/zip",
+    "application/x-7z-compressed",
+    "application/x-rar-compressed",
+    "application/gzip",
+    "application/x-gzip",
+    "application/x-bzip2",
+    "application/x-xz",
+    "application/x-tar",
+}
+
+NONBOOK_FILETYPE_MIME_PREFIXES = (
+    "image/",
+    "audio/",
+    "video/",
+    "font/",
+)
+
+NONBOOK_FILETYPE_MIMES = {
+    "application/x-msdownload",
+    "application/x-dosexec",
+    "application/vnd.microsoft.portable-executable",
+    "application/x-executable",
+    "application/x-mach-binary",
+    "application/x-elf",
+    "application/x-shockwave-flash",
+    "application/vnd.android.package-archive",
+    "application/java-archive",
+    "application/x-iso9660-image",
+    "application/vnd.ms-cab-compressed",
 }
 
 STRONG_NONBOOK_EXTENSIONS = {
@@ -291,6 +379,10 @@ class Config:
     lm_timeout_sec: int = DEFAULT_LM_TIMEOUT_SEC
     lm_input_chars: int = DEFAULT_LM_INPUT_CHARS
     lm_max_output_tokens: int = DEFAULT_LM_MAX_OUTPUT_TOKENS
+    lm_fast_precheck: bool = DEFAULT_LM_FAST_PRECHECK
+    lm_fast_input_chars: int = DEFAULT_LM_FAST_INPUT_CHARS
+    lm_fast_max_output_tokens: int = DEFAULT_LM_FAST_MAX_OUTPUT_TOKENS
+    lm_fast_confidence_min: float = DEFAULT_LM_FAST_CONFIDENCE_MIN
     lm_force_full_metadata: bool = DEFAULT_LM_FORCE_FULL_METADATA
     lm_always_try_without_snippet: bool = DEFAULT_LM_ALWAYS_TRY_WITHOUT_SNIPPET
     lm_strict_json_mode: bool = DEFAULT_LM_STRICT_JSON_MODE
@@ -370,7 +462,9 @@ class Metrics:
         self.stage_errors: dict[str, int] = defaultdict(int)
         self.results: dict[str, int] = defaultdict(int)
         self.book_results: dict[str, int] = defaultdict(int)
+        self.lm_stats: dict[str, int] = defaultdict(int)
         self.events: deque[str] = deque(maxlen=10)
+        self.active_stage_items: dict[str, dict[str, str]] = defaultdict(dict)
 
     def set_mode(self, mode: str) -> None:
         with self.lock:
@@ -380,6 +474,28 @@ class Metrics:
         with self.lock:
             ts = datetime.now().strftime("%H:%M:%S")
             self.events.appendleft(f"[{ts}] {text}")
+
+    def set_active_item(self, stage: str, slot: str, text: str) -> None:
+        with self.lock:
+            self.active_stage_items[stage][slot] = text
+
+    def clear_active_item(self, stage: str, slot: str) -> None:
+        with self.lock:
+            stage_map = self.active_stage_items.get(stage)
+            if not stage_map:
+                return
+            stage_map.pop(slot, None)
+            if not stage_map:
+                self.active_stage_items.pop(stage, None)
+
+    def _snapshot_active_items(self) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for stage, stage_map in self.active_stage_items.items():
+            if not stage_map:
+                continue
+            slot = sorted(stage_map.keys())[0]
+            out[stage] = stage_map[slot]
+        return out
 
     def mark_task_seen(self) -> None:
         with self.lock:
@@ -405,19 +521,134 @@ class Metrics:
             if error:
                 self.stage_errors[stage] += 1
 
-    def snapshot(self, queue_sizes: dict[str, int]) -> dict[str, Any]:
+    def mark_lm_stat(self, key: str, delta: int = 1) -> dict[str, int]:
+        with self.lock:
+            self.lm_stats[key] += delta
+            return dict(self.lm_stats)
+
+    def _estimate_total_books_a1_a4(
+        self,
+        queue_sizes: dict[str, int],
+        stage_processed: dict[str, int],
+        seen: int,
+    ) -> tuple[int, int, int]:
+        a2 = int(stage_processed.get("A2", 0))
+        a3 = int(stage_processed.get("A3", 0))
+        q12 = max(0, int(queue_sizes.get("A2", queue_sizes.get("A1", 0))))
+        q23 = max(0, int(queue_sizes.get("A3", 0)))
+        q34 = max(0, int(queue_sizes.get("A4", 0)))
+
+        if a2 > 0:
+            files_per_a2 = max(0.0, min(64.0, a3 / max(1, a2)))
+        else:
+            files_per_a2 = 1.0
+        if a3 > 0:
+            book_ratio = max(0.0, min(1.0, seen / max(1, a3)))
+        else:
+            book_ratio = 0.0
+
+        future_a3_files = q23 + int(round(q12 * files_per_a2))
+        future_books = int(round(future_a3_files * book_ratio))
+        estimated_total_books = max(seen, seen + future_books)
+        remaining_a4_books = q34 + future_books
+        return estimated_total_books, future_a3_files, remaining_a4_books
+
+    def _stage_eta_floor(
+        self,
+        elapsed: int,
+        queue_sizes: dict[str, int],
+        stage_processed: dict[str, int],
+        future_a3_files: int,
+        remaining_a4_books: int,
+        stage_flags: Optional[dict[str, bool]] = None,
+    ) -> Optional[int]:
+        if elapsed <= 0:
+            return None
+
+        a1 = int(stage_processed.get("A1", 0))
+        a2 = int(stage_processed.get("A2", 0))
+        a3 = int(stage_processed.get("A3", 0))
+        a4 = int(stage_processed.get("A4", 0))
+        q12 = max(0, int(queue_sizes.get("A2", queue_sizes.get("A1", 0))))
+
+        eta_candidates: list[int] = []
+        if q12 > 0 and a2 > 0:
+            eta_candidates.append(int(q12 / max(a2 / max(1, elapsed), 1e-9)))
+        if future_a3_files > 0 and a3 > 0:
+            eta_candidates.append(
+                int(future_a3_files / max(a3 / max(1, elapsed), 1e-9))
+            )
+        if remaining_a4_books > 0 and a4 > 0:
+            eta_candidates.append(
+                int(remaining_a4_books / max(a4 / max(1, elapsed), 1e-9))
+            )
+
+        eta_floor = max(eta_candidates) if eta_candidates else None
+        if (
+            eta_floor is not None
+            and stage_flags
+            and not stage_flags.get("scan_done", False)
+            and a1 > 0
+        ):
+            eta_floor = max(eta_floor, int(eta_floor * 1.08))
+        return eta_floor
+
+    def snapshot(
+        self,
+        queue_sizes: dict[str, int],
+        stage_flags: Optional[dict[str, bool]] = None,
+    ) -> dict[str, Any]:
         with self.lock:
             seen = self.books_seen
             done = self.books_done
-            pct = 0.0 if seen == 0 else (done / max(1, seen)) * 100.0
+            stage_processed = dict(self.stage_processed)
+            stage_errors = dict(self.stage_errors)
+            results = dict(self.results)
+            book_results = dict(self.book_results)
+            lm_stats = dict(self.lm_stats)
             elapsed = int(time.time() - self.start_ts)
-            if seen > 0 and done >= seen:
-                eta_seconds: Optional[int] = 0
+            (
+                estimated_total_books,
+                future_a3_files,
+                remaining_a4_books,
+            ) = self._estimate_total_books_a1_a4(
+                queue_sizes=queue_sizes,
+                stage_processed=stage_processed,
+                seen=seen,
+            )
+            pct_base = max(seen, estimated_total_books)
+            pct = 0.0 if pct_base == 0 else (done / max(1, pct_base)) * 100.0
+
+            eta_books: Optional[int]
+            if pct_base > 0 and done >= pct_base:
+                eta_books = 0
             elif done > 0:
                 seconds_per_book = elapsed / max(1, done)
-                eta_seconds = int(seconds_per_book * max(0, seen - done))
+                eta_books = int(seconds_per_book * max(0, pct_base - done))
             else:
-                eta_seconds = None
+                eta_books = None
+            eta_floor = self._stage_eta_floor(
+                elapsed=elapsed,
+                queue_sizes=queue_sizes,
+                stage_processed=stage_processed,
+                future_a3_files=future_a3_files,
+                remaining_a4_books=remaining_a4_books,
+                stage_flags=stage_flags,
+            )
+            if eta_books is None:
+                eta_seconds = eta_floor
+            elif eta_floor is None:
+                eta_seconds = eta_books
+            else:
+                eta_seconds = max(eta_books, eta_floor)
+            if (
+                self.mode == "RUNNING"
+                and stage_flags
+                and not stage_flags.get("scan_done", False)
+            ):
+                pct = min(pct, 99.0)
+                if eta_seconds == 0 and pct_base > done:
+                    eta_seconds = 1
             return {
                 "mode": self.mode,
                 "seen": seen,
@@ -425,16 +656,21 @@ class Metrics:
                 "tasks_seen": self.total_tasks_seen,
                 "tasks_done": self.total_tasks_done,
                 "pct": pct,
+                "progress_total_books": pct_base,
                 "elapsed_sec": elapsed,
                 "eta_sec": eta_seconds,
                 "elapsed": format_duration_hms(elapsed),
                 "eta": format_duration_hms(eta_seconds),
-                "stage_processed": dict(self.stage_processed),
-                "stage_errors": dict(self.stage_errors),
-                "results": dict(self.results),
-                "book_results": dict(self.book_results),
+                "stage_processed": stage_processed,
+                "stage_errors": stage_errors,
+                "results": results,
+                "book_results": book_results,
+                "lm_stats": lm_stats,
                 "events": list(self.events),
+                "active_stage_items": self._snapshot_active_items(),
                 "queue_sizes": queue_sizes,
+                "stage_flags": dict(stage_flags or {}),
+                "eta_model": "A1/A2/A3/A4",
             }
 
 
@@ -724,6 +960,179 @@ class LMStudioClient:
                 return resp, mode
         return last_resp, last_mode
 
+    def _is_unknown_title(self, value: str) -> bool:
+        return clean_text(value).strip().lower() in {
+            "",
+            "unknown",
+            "unknown title",
+        }
+
+    def _is_unknown_author(self, value: str) -> bool:
+        return clean_text(value).strip().lower() in {
+            "",
+            "unknown",
+            "unknown author",
+        }
+
+    def _is_unknown_genre(self, value: str) -> bool:
+        return clean_text(value).strip().lower() in {
+            "",
+            "unknown",
+            "unknown genre",
+        }
+
+    def _lm_result_is_strong(self, parsed: Optional[dict[str, Any]]) -> bool:
+        if not parsed:
+            return False
+        title = clean_text(parsed.get("title", ""))
+        author = clean_text(parsed.get("author", ""))
+        genre = normalize_genre(clean_text(parsed.get("genre", "")) or "Unknown")
+        try:
+            conf = float(parsed.get("confidence", 0.0))
+        except Exception:
+            conf = 0.0
+        if self._is_unknown_title(title):
+            return False
+        if self._is_unknown_author(author):
+            return False
+        if self._is_unknown_genre(genre):
+            return False
+        return conf >= float(self.config.lm_fast_confidence_min)
+
+    def _fast_enrich_from_context(self, task: FileTask) -> Optional[dict[str, Any]]:
+        if not self.available or not self.config.lm_fast_precheck:
+            return None
+
+        context = build_lm_fallback_context(
+            task, max_chars=max(200, int(self.config.lm_fast_input_chars))
+        )
+        payload_seed = {
+            "schema": "lm_results_fast_v3",
+            "path": task.path.name,
+            "metadata": task.metadata.__dict__,
+            "context": context,
+        }
+        cache_key = xxhash.xxh64(
+            json.dumps(payload_seed, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        cached = self.db.get_lm_cache(cache_key)
+        if cached:
+            self.logger.info("LM fast cache_hit path=%s key=%s", task.path, cache_key[:10])
+            return cached
+
+        system_prompt = """РОЛЬ И ЗАДАЧА: Ты — машина для быстрой предварительной каталогизации книги. Используй только имя файла, путь, цепочку архивов и уже найденные метаданные. Не выдумывай. Если в каком-то поле нет уверенности, верни Unknown. Не добавляй никаких пояснений, только чистый JSON.
+
+ПРИМЕР ВЫВОДА:
+{
+  "results": [
+    {
+      "title": "Название А",
+      "author": "Автор X",
+      "genre_analysis": {
+        "primary_genre": "Научная фантастика",
+        "subgenres": [],
+        "confidence_score": 5.0
+      }
+    }
+  ]
+}"""
+        user_prompt = (
+            "БЫСТРЫЙ КОНТЕКСТ КНИГИ:\n"
+            f"Имя файла: {task.path.name}\n"
+            f"Текущие теги и эвристики: {json.dumps(task.metadata.__dict__, ensure_ascii=False)}\n"
+            f"{context}\n"
+            "Верни JSON строго по шаблону: один объект в массиве results для этой книги. "
+            "Если title, author или genre определить надежно нельзя, используй Unknown."
+        )
+        request_payload = {
+            "model": self.config.lm_model,
+            "temperature": 0.0,
+            "max_tokens": min(
+                int(self.config.lm_fast_max_output_tokens),
+                int(self.config.lm_max_output_tokens),
+            ),
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        try:
+            resp, req_mode = self._post_chat(
+                request_payload, timeout=(6, self.config.lm_timeout_sec)
+            )
+            if resp.status_code >= 400:
+                self.logger.warning(
+                    "LM fast HTTP %s mode=%s path=%s body=%s",
+                    resp.status_code,
+                    req_mode,
+                    task.path,
+                    self._response_error_brief(resp),
+                )
+                return None
+            data = resp.json()
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            parsed = parse_model_payload(content)
+            retry_content = ""
+            if not parsed:
+                retry_payload = {
+                    **request_payload,
+                    "messages": request_payload["messages"]
+                    + [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Верни только валидный JSON-объект без markdown и текста вокруг. "
+                                "Строго структура: {\"results\":[{\"title\":\"...\",\"author\":\"...\","
+                                "\"genre_analysis\":{\"primary_genre\":\"...\",\"subgenres\":[],"
+                                "\"confidence_score\":5.0}}]}"
+                            ),
+                        }
+                    ],
+                }
+                retry, retry_mode = self._post_chat(
+                    retry_payload, timeout=(6, self.config.lm_timeout_sec)
+                )
+                if retry.status_code < 400:
+                    retry_data = retry.json()
+                    retry_content = (
+                        retry_data.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content", "")
+                        .strip()
+                    )
+                    parsed = parse_model_payload(retry_content)
+                else:
+                    self.logger.warning(
+                        "LM fast retry HTTP %s mode=%s path=%s body=%s",
+                        retry.status_code,
+                        retry_mode,
+                        task.path,
+                        self._response_error_brief(retry),
+                    )
+            if not parsed:
+                self.logger.warning(
+                    "LM fast non-json path=%s raw=%s retry=%s",
+                    task.path,
+                    truncate(clean_text(content), 180),
+                    truncate(clean_text(retry_content), 180),
+                )
+                return None
+            self.db.set_lm_cache(cache_key, parsed)
+            self.logger.info(
+                "LM fast parsed path=%s payload=%s",
+                task.path,
+                json.dumps(parsed, ensure_ascii=False),
+            )
+            return parsed
+        except Exception as exc:
+            self.logger.warning("LM Studio fast precheck недоступен: %s", exc)
+            return None
+
     def enrich(self, task: FileTask, snippet: str) -> Optional[dict[str, Any]]:
         if not self.available:
             self.logger.warning("LM full unavailable: requests import failed")
@@ -1009,7 +1418,7 @@ class TerminalUI:
         sys.stdout.write("\x1b[?25l")
         while not self.stop_event.is_set():
             queue_sizes = self.pipeline.queue_sizes()
-            snap = self.metrics.snapshot(queue_sizes)
+            snap = self.metrics.snapshot(queue_sizes, self.pipeline.stage_flags())
             frame = self._render_frame(snap)
             sys.stdout.write("\x1b[H\x1b[2J")
             sys.stdout.write(frame)
@@ -1206,6 +1615,14 @@ class LibrarySorter:
             "A6": self.q56.qsize(),
             "A7": self.q67.qsize(),
             "A8": self.q78.qsize(),
+        }
+
+    def stage_flags(self) -> dict[str, bool]:
+        return {
+            "scan_done": self.scan_done.is_set(),
+            "unpack_done": self.unpack_done.is_set(),
+            "detect_done": self.detect_done.is_set(),
+            "dedupe_done": self.dedupe_done.is_set(),
         }
 
     def ensure_dirs(self) -> None:
@@ -1829,6 +2246,7 @@ class LibrarySorter:
 
     def _lm_loop(self, worker_idx: int) -> None:
         self.metrics.add_event(f"Agent6/W{worker_idx}: старт")
+        active_slot = f"W{worker_idx}"
         while True:
             if self.cleanup_event.is_set():
                 break
@@ -1841,6 +2259,7 @@ class LibrarySorter:
                     break
                 continue
             try:
+                self.metrics.set_active_item("A6", active_slot, task.path.name)
                 self.metrics.mark_stage("A6")
                 decision = self._lm_decision(task.metadata)
                 self.logger.info(
@@ -1850,42 +2269,73 @@ class LibrarySorter:
                     self._md_brief(task.metadata),
                 )
                 if decision == "full":
-                    snippet = extract_text_snippet(task.path, max_chars=self.config.lm_input_chars)
-                    if snippet and has_meaningful_lm_text(
-                        snippet, min_letters=self.config.lm_min_snippet_letters
-                    ):
-                        lm_input = snippet
-                        lm_input_mode = "snippet"
-                    elif self.config.lm_force_full_metadata or self.config.lm_always_try_without_snippet:
-                        lm_input = build_lm_fallback_context(
-                            task, max_chars=self.config.lm_input_chars
+                    if self.config.lm_fast_precheck:
+                        self.metrics.mark_lm_stat("fast_request")
+                    fast_data = self.lm_client._fast_enrich_from_context(task)
+                    if self.lm_client._lm_result_is_strong(fast_data):
+                        self.metrics.mark_lm_stat("fast_ok")
+                        self._merge_lm_metadata(task.metadata, fast_data)
+                        self.logger.info(
+                            "A6 fast_ok path=%s data=%s",
+                            task.path,
+                            json.dumps(fast_data, ensure_ascii=False),
                         )
-                        lm_input_mode = "fallback_context"
-                        self.metrics.add_event(f"LM fallback-context: {task.path.name}")
                     else:
-                        lm_input = ""
-                        lm_input_mode = "none"
-                        self.metrics.add_event(f"LM skip(no text): {task.path.name}")
-                    self.logger.info(
-                        "A6 full_input path=%s mode=%s chars=%d",
-                        task.path,
-                        lm_input_mode,
-                        len(lm_input),
-                    )
-                    if lm_input:
-                        lm_data = self.lm_client.enrich(task, lm_input)
-                        if lm_data:
-                            self._merge_lm_metadata(task.metadata, lm_data)
+                        if fast_data:
+                            self.metrics.mark_lm_stat("fast_fallback")
                             self.logger.info(
-                                "A6 full_ok path=%s data=%s",
+                                "A6 fast_fallback path=%s conf=%s data=%s",
                                 task.path,
-                                json.dumps(lm_data, ensure_ascii=False),
+                                fast_data.get("confidence"),
+                                json.dumps(fast_data, ensure_ascii=False),
                             )
+                        elif self.config.lm_fast_precheck:
+                            self.metrics.mark_lm_stat("fast_no_result")
+                        snippet = extract_text_snippet(
+                            task.path, max_chars=self.config.lm_input_chars
+                        )
+                        if snippet and has_meaningful_lm_text(
+                            snippet, min_letters=self.config.lm_min_snippet_letters
+                        ):
+                            lm_input = snippet
+                            lm_input_mode = "snippet"
+                        elif self.config.lm_force_full_metadata or self.config.lm_always_try_without_snippet:
+                            lm_input = build_lm_fallback_context(
+                                task, max_chars=self.config.lm_input_chars
+                            )
+                            lm_input_mode = "fallback_context"
+                            self.metrics.add_event(f"LM fallback-context: {task.path.name}")
                         else:
-                            self.logger.info("A6 full_no_result path=%s", task.path)
+                            lm_input = ""
+                            lm_input_mode = "none"
+                            self.metrics.add_event(f"LM skip(no text): {task.path.name}")
+                        self.logger.info(
+                            "A6 full_input path=%s mode=%s chars=%d",
+                            task.path,
+                            lm_input_mode,
+                            len(lm_input),
+                        )
+                        if lm_input:
+                            self.metrics.mark_lm_stat("full_request")
+                            lm_data = self.lm_client.enrich(task, lm_input)
+                            if lm_data:
+                                self.metrics.mark_lm_stat("full_ok")
+                                self._merge_lm_metadata(task.metadata, lm_data)
+                                self.logger.info(
+                                    "A6 full_ok path=%s data=%s",
+                                    task.path,
+                                    json.dumps(lm_data, ensure_ascii=False),
+                                )
+                            else:
+                                self.metrics.mark_lm_stat("full_no_result")
+                                self.logger.info("A6 full_no_result path=%s", task.path)
+                        else:
+                            self.metrics.mark_lm_stat("full_skipped_no_input")
                 elif decision == "genre_only":
+                    self.metrics.mark_lm_stat("genre_only_request")
                     lm_data = self.lm_client.enrich_genre_only(task)
                     if lm_data:
+                        self.metrics.mark_lm_stat("genre_only_ok")
                         self._merge_lm_metadata(task.metadata, lm_data)
                         self.logger.info(
                             "A6 genre_ok path=%s data=%s",
@@ -1893,9 +2343,22 @@ class LibrarySorter:
                             json.dumps(lm_data, ensure_ascii=False),
                         )
                     else:
+                        self.metrics.mark_lm_stat("genre_only_no_result")
                         self.logger.info("A6 genre_no_result path=%s", task.path)
                 else:
+                    self.metrics.mark_lm_stat("skipped")
                     self.logger.info("A6 skip path=%s reason=%s", task.path, decision)
+                lm_stats = self.metrics.mark_lm_stat("processed")
+                processed_lm = int(lm_stats.get("processed", 0))
+                if processed_lm and processed_lm % 50 == 0:
+                    self.metrics.add_event(
+                        "A6 stats: "
+                        f"req={lm_stats.get('fast_request', 0)} "
+                        f"fast={lm_stats.get('fast_ok', 0)} "
+                        f"fallback={lm_stats.get('fast_fallback', 0)} "
+                        f"full={lm_stats.get('full_request', 0)} "
+                        f"full_ok={lm_stats.get('full_ok', 0)}"
+                    )
                 self._put_with_stop(self.q67, task)
                 self.db.mark_file(task, "lm_done", json.dumps(task.metadata.__dict__, ensure_ascii=False))
             except Exception as exc:
@@ -1904,6 +2367,7 @@ class LibrarySorter:
                 self.db.mark_file(task, "lm_failed", str(exc))
                 self._put_with_stop(self.q67, task)
             finally:
+                self.metrics.clear_active_item("A6", active_slot)
                 self.q56.task_done()
         self.metrics.add_event(f"Agent6/W{worker_idx}: завершен")
 
@@ -2036,26 +2500,34 @@ class LibrarySorter:
     def _is_book_candidate(self, task: FileTask) -> tuple[bool, str]:
         path = task.path
         ext = suffix_lower(path)
+        size = safe_filesize(path)
+        if size == 0:
+            return False, "empty_file"
+
+        kind_ext, mime = guess_filetype_kind(path)
+        if filetype_is_book(kind_ext, mime, ext):
+            detail = mime or kind_ext or "unknown"
+            return True, f"book_filetype:{detail}"
+        if filetype_is_nonbook(kind_ext, mime, ext):
+            detail = mime or kind_ext or "unknown"
+            return False, f"nonbook_filetype:{detail}"
+
+        if ext in TEXT_EXTENSIONS:
+            snippet = extract_text_snippet(path, max_chars=400).lower()
+            if any(token in snippet for token in ("isbn", "глава", "chapter", "автор")):
+                return True, "text_book_signals"
+            return False, "text_no_book_signals"
+
         if ext in BOOK_EXTENSIONS:
             return True, f"book_ext:{ext}"
         if ext in STRONG_NONBOOK_EXTENSIONS:
             return False, f"nonbook_ext:{ext}"
 
-        size = safe_filesize(path)
-        if size == 0:
-            return False, "empty_file"
-        if ext in TEXT_EXTENSIONS:
-            snippet = extract_text_snippet(path, max_chars=400).lower()
-            if any(token in snippet for token in ("isbn", "глава", "chapter", "автор")):
-                return True, "text_book_signals"
-            return True, "text_unknown_keep"
-
-        # Неизвестные маленькие бинарники чаще оказываются прошивками/служебными файлами.
         if looks_binary(path):
             if size < TINY_UNKNOWN_BINARY_BYTES:
                 return False, f"tiny_unknown_binary:{ext or 'no_ext'}"
-            return True, "binary_unknown_keep"
-        return True, "fallback_keep"
+            return False, f"unknown_binary_not_book_type:{ext or 'no_ext'}"
+        return False, f"unknown_text_not_book_type:{ext or 'no_ext'}"
 
     def _handle_nobook(self, task: FileTask, reason: str) -> None:
         if task.origin == "source":
@@ -2624,9 +3096,58 @@ def suffix_lower(path: Path) -> str:
     return path.suffix.lower()
 
 
+def guess_filetype_kind(path: Path) -> tuple[str, str]:
+    if filetype is None:
+        return "", ""
+    try:
+        kind = filetype.guess(str(path))
+    except Exception:
+        return "", ""
+    if not kind:
+        return "", ""
+    kind_ext = clean_text(str(getattr(kind, "extension", "") or "")).lower().lstrip(".")
+    mime = clean_text(str(getattr(kind, "mime", "") or "")).lower()
+    return kind_ext, mime
+
+
+def filetype_is_book(kind_ext: str, mime: str, ext: str) -> bool:
+    if mime in BOOK_FILETYPE_MIMES:
+        return True
+    if kind_ext in BOOK_FILETYPE_EXTENSIONS:
+        return True
+    if mime in ARCHIVE_FILETYPE_MIMES and ext in BOOK_ZIP_CONTAINER_EXTENSIONS:
+        return True
+    return False
+
+
+def filetype_is_archive(kind_ext: str, mime: str) -> bool:
+    if mime in ARCHIVE_FILETYPE_MIMES:
+        return True
+    return kind_ext in {"zip", "7z", "rar", "gz", "bz2", "xz", "tar"}
+
+
+def filetype_is_nonbook(kind_ext: str, mime: str, ext: str) -> bool:
+    if not kind_ext and not mime:
+        return False
+    if filetype_is_book(kind_ext, mime, ext):
+        return False
+    if filetype_is_archive(kind_ext, mime):
+        return False
+    if mime in NONBOOK_FILETYPE_MIMES:
+        return True
+    if any(mime.startswith(prefix) for prefix in NONBOOK_FILETYPE_MIME_PREFIXES):
+        return True
+    return bool(kind_ext or mime)
+
+
 def is_archive(path: Path) -> bool:
     ext = suffix_lower(path)
+    if ext in BOOK_ZIP_CONTAINER_EXTENSIONS:
+        return False
     if ext in ARCHIVE_EXTENSIONS:
+        return True
+    kind_ext, mime = guess_filetype_kind(path)
+    if filetype_is_archive(kind_ext, mime):
         return True
     try:
         with open(path, "rb") as f:
@@ -2805,9 +3326,56 @@ def extract_text_snippet(path: Path, max_chars: int = 1800) -> str:
                     return clean_text(txt)[:max_chars]
             except Exception:
                 return ""
+        if ext in {".djvu", ".djv"}:
+            return extract_djvu_text_snippet(path, max_chars)
+        if ext == ".doc":
+            return extract_doc_text_snippet(path, max_chars)
     except Exception:
         return ""
     return ""
+
+
+def decode_text_bytes(raw: bytes) -> str:
+    for enc in ("utf-8", "utf-16", "cp1251", "latin1"):
+        try:
+            return raw.decode(enc, errors="ignore")
+        except Exception:
+            continue
+    return ""
+
+
+def run_text_tool(args: list[str], timeout_sec: int = 15) -> str:
+    try:
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+    except Exception:
+        return ""
+    if proc.returncode != 0 or not proc.stdout:
+        return ""
+    return clean_text(decode_text_bytes(proc.stdout))
+
+
+def extract_djvu_text_snippet(path: Path, max_chars: int) -> str:
+    tool = shutil.which("djvutxt")
+    if not tool:
+        return ""
+    for page_arg in ("--page=1", "-page=1"):
+        text = run_text_tool([tool, page_arg, str(path)], timeout_sec=20)
+        if text:
+            return text[:max_chars]
+    return ""
+
+
+def extract_doc_text_snippet(path: Path, max_chars: int) -> str:
+    tool = shutil.which("antiword")
+    if not tool:
+        return ""
+    text = run_text_tool([tool, str(path)], timeout_sec=15)
+    return text[:max_chars] if text else ""
 
 
 def read_text_head(path: Path, max_chars: int) -> str:
