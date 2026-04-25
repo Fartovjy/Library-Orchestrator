@@ -18,7 +18,7 @@ NOBOOK_DIR = r"E:\Sorted_Library\NoBook"
 
 # Количество агентов/воркеров по стадиям:
 # A2 Распаковка, A3 Книга?, A4 XXH64, A5 Теги, A6 LM Studio, A7 Переименование, A8 Упаковка
-UNPACK_WORKERS = 6
+UNPACK_WORKERS = 3
 DETECT_WORKERS = 2
 DEDUPE_WORKERS = 3
 TAG_WORKERS = 3
@@ -28,7 +28,7 @@ PACK_WORKERS = 9
 
 # Дополнительно:
 MAX_PARALLEL_ARCHIVES = 3
-QUEUE_SIZE = 100
+QUEUE_SIZE = 33
 
 # LM Studio quality tuning:
 # Increase these if you want higher recall from LM on difficult files.

@@ -2158,37 +2158,60 @@ class LibrarySorter:
             )
 
         extracted_count = 0
-        for file_path in iter_files(temp_root):
-            if self.should_stop():
-                break
-            extracted_count += 1
-            new_task = FileTask(
-                task_id=str(uuid.uuid4()),
-                path=file_path,
-                origin="temp",
-                source_root=task.source_root,
-                archive_chain=task.archive_chain + [task.path.name],
-                archive_source=source_archive,
-                cleanup_root=temp_root,
-            )
-            self.temp_tracker.register(temp_root)
-            self.metrics.mark_task_seen()
+        self.temp_tracker.register(temp_root)
+        try:
+            for file_path in iter_files(temp_root):
+                if self.should_stop():
+                    break
+                extracted_count += 1
+                new_task = FileTask(
+                    task_id=str(uuid.uuid4()),
+                    path=file_path,
+                    origin="temp",
+                    source_root=task.source_root,
+                    archive_chain=task.archive_chain + [task.path.name],
+                    archive_source=source_archive,
+                    cleanup_root=temp_root,
+                )
+                self.temp_tracker.register(temp_root)
+                self.metrics.mark_task_seen()
 
-            if is_archive(file_path):
-                if not self._put_with_stop(self.q12, new_task):
-                    self.temp_tracker.release(temp_root)
-                    break
-                self._register_archive_child(source_archive)
-            else:
-                if not self._put_with_stop(self.q23, new_task):
-                    self.temp_tracker.release(temp_root)
-                    break
-                self._register_archive_child(source_archive)
+                if is_archive(file_path):
+                    self._register_archive_child(source_archive)
+                    self._process_nested_archive_task(new_task)
+                else:
+                    if not self._put_with_stop(self.q23, new_task):
+                        self.temp_tracker.release(temp_root)
+                        break
+                    self._register_archive_child(source_archive)
+        finally:
+            self.temp_tracker.release(temp_root)
 
         if extracted_count == 0:
             shutil.rmtree(temp_root, ignore_errors=True)
             self.metrics.add_event(f"Пустой архив: {task.path.name}")
         return extracted_count
+
+    def _process_nested_archive_task(self, task: FileTask) -> None:
+        try:
+            if self.cleanup_event.is_set() or self.should_stop():
+                self._finalize_task(task, result="failed")
+                return
+            self.metrics.mark_stage("A2")
+            extracted_count = self._extract_archive_and_route(task)
+            if extracted_count == 0 and task.origin == "source":
+                reason = "empty_archive"
+                self._handle_nobook(task, reason)
+                self.db.mark_file(task, "nobook", reason)
+                self._finalize_task(task, result="nobook")
+            else:
+                self._finalize_task(task, result="archive_unpacked")
+                self.db.mark_file(task, "unpack_done", "")
+        except Exception as exc:
+            self.logger.exception("Agent2 nested: ошибка %s: %s", task.path, exc)
+            self.metrics.mark_stage("A2", error=True)
+            self.db.mark_file(task, "unpack_failed", str(exc))
+            self._finalize_task(task, result="failed")
 
     def _detect_loop(self, worker_idx: int) -> None:
         self.metrics.add_event(f"Agent3/W{worker_idx}: старт")
