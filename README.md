@@ -1,39 +1,54 @@
-﻿# LibSort
+# LibSort
 
-## Русский
+LibSort - локальное приложение для сортировки большой книжной коллекции. Оно ищет книги в выбранных папках, распаковывает обычные и вложенные архивы, отсекает мусор, удаляет дубликаты по содержимому, определяет метаданные и складывает результат в аккуратную структуру.
 
-LibSort - одноразовый конвейер для сортировки большой книжной папки, где книги могут лежать как отдельными файлами, так и внутри обычных или вложенных архивов.
-
-Главная цель приложения: найти именно книги, отсечь мусор и технические файлы, определить метаданные, удалить дубликаты по XXH64 и сложить результат в структуру:
+Итоговый формат:
 
 ```text
 TARGET_DIR\Жанр\Первая буква автора\Автор\Книга.zip
 ```
 
-Каждая книга упаковывается в отдельный ZIP с максимальным сжатием через 7-Zip.
+Каждая найденная книга упаковывается в отдельный ZIP через 7-Zip. Дубликаты и не-книжные файлы обрабатываются отдельно.
 
-## Быстрый Запуск
+## Состав Проекта
 
-1. Убедитесь, что установлены `7z.exe` и Python.
-2. Установите зависимости:
+```text
+run.py                Точка входа GUI
+ui.py                 Tkinter-интерфейс
+library_pipeline.py   Основной многопоточный конвейер
+setting.py            Пути, воркеры, Ollama и настройки GUI
+ui_ru.json            Русские строки интерфейса
+ui_en.json            Английские строки интерфейса
+requirements.txt      Python-зависимости
+logs/                 Логи запусков
+db/                   Служебные данные, если используются
+```
+
+`run.py` намеренно маленький: он создает окно и запускает интерфейс из `ui.py`. Вся логика сортировки находится в `library_pipeline.py`.
+
+## Быстрый Старт
+
+1. Установите Python.
+2. Установите 7-Zip так, чтобы был доступен `7z.exe`.
+3. Установите зависимости:
 
 ```powershell
 pip install -r requirements.txt
 ```
 
-3. Запустите GUI:
+4. Запустите GUI:
 
 ```powershell
 python .\run.py
 ```
 
-4. В GUI выберите один или несколько `SOURCE_DIRS`, проверьте `TARGET_DIR`, нажмите `Старт`.
+5. В интерфейсе выберите один или несколько `SOURCE_DIRS`, проверьте `TARGET_DIR` и нажмите `Старт`.
 
-## Настройки
+## Основные Настройки
 
-Основные настройки находятся в [setting.py](setting.py).
+Настройки лежат в [setting.py](setting.py).
 
-Ключевые параметры:
+Главные пути:
 
 ```python
 SOURCE_DIRS = [
@@ -44,35 +59,38 @@ DUPES_DIR = r"E:\Sorted_Library\Duplicates"
 NOBOOK_DIR = r"E:\Sorted_Library\NoBook"
 ```
 
-`TEMP_BASE` можно не задавать. Если он отсутствует, приложение использует:
+Если `TEMP_BASE` не задан, временные файлы создаются здесь:
 
 ```text
 <TARGET_DIR>\_TempPipeline
 ```
 
-Это сделано специально: временная упаковка на том же диске, что и `TARGET_DIR`, обычно быстрее и безопаснее для атомарной замены итоговых архивов.
+Это удобно, потому что временная распаковка и финальная упаковка идут на том же диске, что и целевая библиотека.
 
-Количество воркеров тоже задается в [setting.py](setting.py):
+Количество воркеров:
 
 ```python
-UNPACK_WORKERS = 6
+UNPACK_WORKERS = 3
 DETECT_WORKERS = 2
 DEDUPE_WORKERS = 3
 TAG_WORKERS = 3
-LM_WORKERS = 1
+LM_WORKERS = 3
 RENAME_WORKERS = 1
 PACK_WORKERS = 6
 ```
 
-## Логика Конвейера
+Дополнительные параметры:
 
-Перед основным запуском работает служебный агент:
-
-```text
-A0 DB Sync
+```python
+MAX_PARALLEL_ARCHIVES = 3
+QUEUE_SIZE = 33
 ```
 
-Он сверяет постоянную БД с уже существующими ZIP-файлами в `TARGET_DIR`. Для ZIP в целевой папке считается XXH64 не самого ZIP-архива, а полезной нагрузки внутри ZIP, то есть файла книги.
+`QUEUE_SIZE` ограничивает внутренние очереди после ранних стадий. Входная очередь распаковки `A2` сейчас не ограничена, чтобы `A1` мог просканировать весь `SOURCE_DIRS` и быстрее дать общий горизонт работы.
+
+## Логика Конвейера
+
+Перед основным конвейером может выполняться служебная синхронизация БД с уже существующими ZIP-файлами в `TARGET_DIR`. Для существующих ZIP хэш считается по книге внутри архива, а не по самому ZIP-файлу. Это важно: дубликаты сравниваются по содержимому книги, а не по контейнеру.
 
 Основные агенты:
 
@@ -87,87 +105,187 @@ A7 Переименование
 A8 Упаковка
 ```
 
-Порядок работы:
+### A1 Поиск
 
-1. `A1` ищет файлы в выбранных `SOURCE_DIRS`.
-2. `A2` распаковывает архивы, включая вложенные архивы.
-3. `A3` решает, книга это или нет.
-4. `A4` считает XXH64 и отсекает дубликаты до дорогих стадий.
-5. `A5` читает теги и метаданные из файла.
-6. `A6` обращается к Ollama только для книжных кандидатов.
-7. `A7` строит финальный путь.
-8. `A8` упаковывает книгу в ZIP, проверяет архив и только после успешной упаковки завершает задачу.
+`A1` обходит все выбранные `SOURCE_DIRS` и регистрирует найденные файлы. У `A1` нет отдельной очереди в GUI, поэтому в карточке A1 показываются только:
+
+```text
+P = обработано
+E = ошибок
+```
+
+Когда `A1` видит файл с известным книжным расширением, счетчик `Найдено` предварительно увеличивается. Если позже `A3` докажет, что файл не книга, счетчик корректируется вниз.
+
+Содержимое архивов тоже попадает в общий учет: когда `A2` распаковывает архив и находит новые файлы внутри, они регистрируются как обнаруженные задачи A1. Поэтому `Найдено`, процент и ETA уточняются по мере раскрытия архивов.
+
+### A2 Распаковка
+
+`A2` получает файлы от `A1`.
+
+Если файл является архивом, он распаковывается через 7-Zip во временную папку. Вложенные архивы обрабатываются рекурсивно. Если архив пустой или не содержит книг, он может попасть в `NOBOOK_DIR`.
+
+Если файл не архив, он передается дальше в `A3`.
+
+### A3 Книга?
+
+`A3` решает, является ли файл книгой.
+
+Проверяются:
+
+- расширение;
+- сигнатура файла через `filetype`;
+- MIME-тип;
+- текстовые признаки вроде `ISBN`, `глава`, `chapter`, `автор`;
+- размер и бинарность файла.
+
+Книжные форматы проходят дальше. Явный мусор, видео, картинки, исполняемые файлы, служебные бинарники и слабые текстовые файлы отправляются в `NOBOOK_DIR` или просто финализируются как не-книги, если они пришли из временной распаковки.
+
+### A4 XXH64
+
+`A4` считает `XXH64` по содержимому книги и проверяет дубликаты.
+
+Если книга уникальна, она идет в `A5`.
+
+Если найден дубликат:
+
+- исходный пользовательский файл переносится в `DUPES_DIR`;
+- временный файл из архива финализируется как временный дубликат;
+- дорогие стадии `A5-A8` для него не выполняются.
+
+### A5 Теги
+
+`A5` извлекает метаданные из файла и имени файла:
+
+- название;
+- автор;
+- жанр;
+- дополнительные признаки.
+
+Для разных форматов используются разные способы чтения метаданных, например PDF, EPUB, FB2, DOCX и ZIP-контейнеры.
+
+### A6 Ollama
+
+`A6` обращается к Ollama только для файлов, которые уже признаны книгами и прошли дедупликацию.
+
+По умолчанию используется OpenAI-compatible endpoint:
+
+```text
+http://127.0.0.1:11434/v1/chat/completions
+```
+
+Модель задается в `setting.py`:
+
+```python
+LM_MODEL = "gemma4:e4b"
+```
+
+Приложение не отправляет в модель всю книгу. Используется короткий фрагмент текста или fallback-контекст:
+
+- имя файла;
+- расширение;
+- путь;
+- цепочка архивов;
+- предварительные метаданные;
+- предположения из имени файла.
+
+Если метаданных достаточно, `A6` может пропустить обращение к модели.
+
+### A7 Переименование
+
+`A7` строит финальный путь:
+
+```text
+Жанр\Первая буква автора\Автор\Название.zip
+```
+
+Компоненты пути очищаются от запрещенных символов и ограничиваются по длине.
+
+### A8 Упаковка
+
+`A8` упаковывает книгу в отдельный ZIP, проверяет архив и только после успешной проверки финализирует задачу.
+
+Если включено удаление исходников, исходный файл или исходный архив удаляется только после успешного завершения связанных задач.
 
 ## Что Считается Книгой
 
-Книжные расширения включают, например:
+Книжные расширения включают:
 
 ```text
-.pdf, .djvu, .epub, .fb2, .mobi, .azw3, .doc, .docx, .rtf, .txt, .chm, .html, .ppt, .xls
+.epub, .fb2, .fb2.zip, .pdf, .djvu, .mobi, .azw, .azw3,
+.lit, .lrf, .prc, .rtf, .txt, .doc, .docx, .odt, .chm,
+.html, .htm, .md, .ppt, .pptx, .xls, .xlsx, .csv, .xps, .oxps
 ```
 
-Сильные не-книжные расширения отсекаются до Ollama:
+Сильные не-книжные расширения и типы отсекаются до дорогих стадий:
 
 ```text
-.jpg, .png, .tif, .tiff, .mp3, .mp4, .exe, .dll, .hex, .cod, .pjt, .maa, .mos, .swf, .js, .css
+.jpg, .png, .gif, .mp3, .mp4, .avi, .mkv, .exe, .dll,
+.js, .css, .svg, .iso и другие технические форматы
 ```
 
-Одиночные raster-изображения, включая `.tif/.tiff`, сейчас не считаются книгами. Это сделано, чтобы не отправлять в Ollama страницы, прошивки, схемы и технический мусор как книги.
-
-Маленькие неизвестные бинарные файлы также отсекаются как не книги.
-
-`A3` дополнительно использует библиотеку `filetype` и проверяет сигнатуру файла. Если сигнатура уверенно указывает на изображение, аудио, видео, шрифт, исполняемый файл или другой стандартный не-книжный тип, файл переносится в `NOBOOK_DIR` до `A4` и не попадает в дедупликацию, теги и Ollama.
-
-Книжные форматы пропускаются дальше только по известным книжным сигнатурам или по известным книжным расширениям. Текстовые форматы без книжных признаков (`ISBN`, `глава`, `chapter`, `автор`) теперь не отправляются дальше как книги.
+Одиночные изображения сейчас не считаются книгами. Это снижает ложные срабатывания на страницы, схемы, обложки, прошивки и технические материалы.
 
 ## Счетчики В GUI
 
-Верхние счетчики считают книги, а не операции.
+Верхние счетчики относятся к книжному прогрессу.
 
 ```text
-Книг найдено
+Найдено
 ```
 
-Сколько файлов `A3` признал книгами.
+Количество файлов, которые сейчас считаются книгами. Часть значения может быть предварительной: A1 добавляет книги по расширениям, A3 затем подтверждает или корректирует результат.
 
 ```text
-Книг завершено
+Завершено
 ```
 
-Сколько найденных книг уже дошли до финального результата: упакованы, признаны дубликатами или завершились ошибкой как книжные задачи.
+Количество книжных задач, которые дошли до финального результата: упакованы, признаны дубликатами или завершились ошибкой.
+
+```text
+Упаковано
+```
+
+Сколько уникальных книг успешно упаковано в итоговые ZIP.
 
 ```text
 Дубликаты
 ```
 
-Сколько книжных дубликатов найдено по XXH64.
+Сколько книжных дубликатов найдено по `XXH64`.
 
 ```text
 Не книги
 ```
 
-Сколько файлов `A3` признал не книгами. Этот счетчик не входит в книжный прогресс.
+Сколько файлов признано не книгами. Этот счетчик не входит в книжный процент.
 
 ```text
-Ошибки книг
+Ошибки
 ```
 
-Сколько книжных задач завершились ошибкой.
+Сколько книжных задач завершилось ошибкой.
 
-`Книг найдено` и `Книг завершено` остаются фактическими книжными счетчиками.
+## Процент И ETA
 
-Процент выполнения и примерное оставшееся время теперь считаются по ранним стадиям `A1/A2/A3/A4`:
+Процент готовности считается просто:
 
 ```text
-done / оценка общего количества книг
+Завершено / Найдено * 100
 ```
 
-Где оценка строится так:
+Например, если найдено `45478`, а завершено `669`, прогресс должен быть около `1.47%`.
 
-1. `A2` дает среднее расширение очереди после распаковки.
-2. `A3` дает долю файлов, которые оказываются книгами.
-3. `A4` учитывается в ETA как отдельный фронт дедупликации.
-4. Пока `A1` еще сканирует источники, ETA остается приблизительной и становится точнее после завершения сканирования.
+Расширенная оценка будущей работы используется только для ETA, но не для шкалы процента.
+
+ETA учитывает:
+
+- среднее время на завершенную книгу;
+- текущий видимый хвост конвейера `A2-A8`;
+- активные задачи, которые уже вынуты из очередей;
+- будущие книги, которые могут появиться после распаковки архивов;
+- скорость отдельных стадий, включая узкие места вроде `A6`.
+
+В GUI отображаемое оставшееся время обновляется не чаще одного раза в 10 секунд. Это сделано, чтобы показатель не дергался на каждом коротком опросе интерфейса.
 
 ## Счетчики Агентов
 
@@ -179,543 +297,128 @@ E = ошибок
 Q = очередь
 ```
 
-Это счетчики стадий, а не счетчики книг. Например, `A2` может обработать много архивов-контейнеров, а `A3` увидит только обычные файлы, извлеченные из этих архивов.
+`Q` показывается для `A2-A8`. У `A1` очереди нет, поэтому `Q` не отображается.
 
-## Язык Интерфейса И Выключение ПК
+Эти счетчики показывают операции стадии, а не только книги. Например, `A2` может обработать архив, внутри которого сотни файлов, а `A3` затем решит, какие из них являются книгами.
 
-GUI поддерживает два языка интерфейса:
+## Очереди И Параллельность
 
-```text
-ui_ru.json
-ui_en.json
-```
-
-Переключение выполняется кнопками `RU` и `EN` внизу окна, без перезапуска программы.
-
-Справа внизу находится чекбокс:
+Конвейер построен на очередях:
 
 ```text
-⏻ Выключить ПК после завершения
+A1 -> q12 -> A2 -> q23 -> A3 -> q34 -> A4 -> q45 -> A5 -> q56 -> A6 -> q67 -> A7 -> q78 -> A8
 ```
 
-По умолчанию он выключен. Если включить его, приложение выполнит принудительное выключение компьютера только после успешного завершения всех операций конвейера, с задержкой 300 секунд. При остановке вручную или ошибке выключение не запускается.
+`q12` сейчас без лимита, чтобы поиск мог быстро просканировать Source. Остальные очереди ограничиваются `QUEUE_SIZE`.
+
+Это дает две полезные вещи:
+
+1. A1 быстро показывает общий объем обнаруженной работы.
+2. Поздние стадии не получают бесконтрольный наплыв задач.
 
 ## Дубликаты
 
-Дубликаты проверяются по `XXH64`.
+Дубликаты определяются по `XXH64`.
 
-Важное правило: для уже упакованных книг в `TARGET_DIR` хэш считается по файлу книги внутри ZIP, а не по ZIP-архиву. Поэтому сравниваются одинаковые сущности: книга с книгой.
+Для книг, уже лежащих в `TARGET_DIR` как ZIP, хэш считается по файлу книги внутри ZIP. Поэтому сравнение идет по полезной нагрузке, а не по упаковке.
 
-Если дубликат найден среди исходных файлов, он переносится в `DUPES_DIR`. Если дубликат найден среди временных файлов, извлеченных из архива, он не учитывается как пользовательский `Дубликат` в GUI, чтобы не создавать ложное ощущение, что в `Duplicates` должны появиться файлы.
+Если дубликат найден среди исходных файлов, он переносится в `DUPES_DIR`. Если дубликат найден среди файлов, извлеченных из архива, он финализируется как временный дубликат без лишнего копирования в пользовательскую папку дубликатов.
 
-## Ollama
+## Не-Книги
 
-Ollama используется только после того, как файл прошел `A3` как книга и `A4` как уникальная книга.
+Файлы, которые не являются книгами, обрабатываются отдельно.
 
-Модель:
+Для исходных файлов может выполняться перенос в `NOBOOK_DIR`.
 
-```text
-gemma4:e4b
-```
+Для временных файлов из архивов обычно достаточно финализации без сохранения, если не включен режим сохранения временного мусора.
 
-URL по умолчанию:
+## Временные Файлы И Очистка
 
-```text
-http://127.0.0.1:11434/v1/chat/completions
-```
-
-Сервер Ollama должен запускаться с переменной окружения:
-
-```text
-OLLAMA_CONTEXT_LENGTH=16000
-```
-
-На этой машине это задается в Windows autostart-скрипте `C:\Users\Home\.codex\scripts\start-ollama-server.ps1`, который запускает `ollama serve`.
-
-Приложение не отправляет в модель всю книгу. Перед тяжелым запросом `A6` сначала выполняет быстрый V3 precheck по имени файла, пути, цепочке архивов и метаданным `A5`.
-
-Быстрый ответ принимается только если модель вернула `title`, `author`, `genre` и уверенность не ниже `LM_FAST_CONFIDENCE_MIN`. Если быстрый ответ слабый или неполный, `A6` переходит к прежнему полному запросу.
-
-В полный запрос Ollama отправляется:
-
-1. короткий текстовый фрагмент, если его удалось безопасно извлечь;
-2. или fallback-контекст: имя файла, расширение, папка, цепочка архивов и предположения из имени файла.
-
-Основной запрос требует строгий JSON вида:
-
-```json
-{
-  "results": [
-    {
-      "title": "Название А",
-      "author": "Автор X",
-      "genre_analysis": {
-        "primary_genre": "Научная фантастика",
-        "subgenres": ["Транспортный триллер", "Дистопия"],
-        "confidence_score": 5.0
-      }
-    }
-  ]
-}
-```
-
-Основная температура запроса:
-
-```text
-temperature = 0.1
-```
-
-Если Ollama вернул не-JSON, приложение делает дополнительную попытку с более строгим требованием JSON.
-
-Каждые 50 задач `A6` пишет в события краткую статистику: быстрые успешные ответы, fallback к полному запросу и количество полных запросов.
-
-## Удаление Исходников
-
-Исходный файл удаляется только после успешной упаковки и проверки ZIP в `A8`.
-
-В GUI есть флажок `Не удалять исходники`. По умолчанию он выключен: после успешного `A8` исходники удаляются по обычной логике. Если флажок включен, исходные книги и исходные архивы после успешной упаковки не удаляются.
-
-Для исходного архива действует похожая логика: если архив был распакован, все его книжные задачи успешно завершены и не было ошибок, исходный архив может быть удален после завершения всех дочерних задач.
-
-Если файл из `SOURCE_DIRS` признан не книгой, он переносится в `NOBOOK_DIR`.
-
-Если исходный архив распакован и после проверки внутри не найдено ни одной книги, исходный архив переносится целиком в `NOBOOK_DIR`. Его временно извлеченные файлы удаляются вместе с temp-папкой и не отправляются в `A7/A8`.
-
-Файлы, извлеченные во временную папку из архивов, являются рабочими копиями. После завершения конвейера временная папка очищается.
-
-## Остановка
-
-В GUI есть кнопка:
-
-```text
-Стоп
-```
-
-Она останавливает конвейер, сбрасывает очереди и очищает временные папки.
-
-В терминальном режиме также поддерживается:
-
-```text
-Esc
-Ctrl+S
-```
-
-Обе комбинации означают остановку с очисткой временной папки.
-
-## База Данных
-
-БД постоянная и хранится в `TARGET_DIR`.
-
-Имя БД строится по выбранным `SOURCE_DIRS`, чтобы при переключении на другую папку не уничтожать историю предыдущей папки.
-
-БД хранит:
-
-1. хэши книг;
-2. финальные пути ZIP;
-3. метаданные;
-4. кэш ответов Ollama;
-5. статусы задач.
-
-## Логи
-
-Логи пишутся в папку:
-
-```text
-logs
-```
-
-В логах можно увидеть:
-
-1. какие файлы нашел `A1`;
-2. что распаковал `A2`;
-3. почему `A3` признал файл книгой или не книгой;
-4. какой XXH64 посчитал `A4`;
-5. что вернул Ollama;
-6. куда `A7` направил книгу;
-7. какой ZIP создал `A8`.
-
-## Результирующие Папки
-
-```text
-TARGET_DIR
-```
-
-Основная отсортированная библиотека.
-
-```text
-DUPES_DIR
-```
-
-Пользовательские дубликаты книг.
-
-```text
-NOBOOK_DIR
-```
-
-Файлы из источников, которые не являются книгами.
-
-```text
-TARGET_DIR\_TempPipeline
-```
-
-Временная рабочая зона. После завершения или остановки очищается.
-
-## English
-
-LibSort is a one-off pipeline for sorting a large book collection where books may exist as standalone files, inside archives, or inside nested archives.
-
-The main goal is to find actual books, reject technical/non-book files, detect metadata, deduplicate by XXH64, and place each result into this structure:
-
-```text
-TARGET_DIR\Genre\Author first letter\Author\Book.zip
-```
-
-Each book is packed into its own ZIP archive with maximum compression via 7-Zip.
-
-## Quick Start
-
-1. Make sure `7z.exe` and Python are installed.
-2. Install dependencies:
-
-```powershell
-pip install -r requirements.txt
-```
-
-3. Start the GUI:
-
-```powershell
-python .\run.py
-```
-
-4. In the GUI, select one or more `SOURCE_DIRS`, check `TARGET_DIR`, and press `Старт`.
-
-## Settings
-
-Main settings are stored in [setting.py](setting.py).
-
-Key paths:
-
-```python
-SOURCE_DIRS = [
-    r"E:\Энциклопедии. Словари. Справочники",
-]
-TARGET_DIR = r"E:\Sorted_Library"
-DUPES_DIR = r"E:\Sorted_Library\Duplicates"
-NOBOOK_DIR = r"E:\Sorted_Library\NoBook"
-```
-
-`TEMP_BASE` is optional. If it is not set, the application uses:
+Распаковка архивов идет во временные папки внутри:
 
 ```text
 <TARGET_DIR>\_TempPipeline
 ```
 
-This is intentional: keeping temporary packing work on the same disk as `TARGET_DIR` is usually faster and safer for atomic replacement of final archives.
+Временные папки регистрируются в трекере и освобождаются после завершения связанных задач.
 
-Worker counts are also configured in [setting.py](setting.py):
+Кнопка `Стоп` запускает остановку конвейера и очистку временных папок.
 
-```python
-UNPACK_WORKERS = 6
-DETECT_WORKERS = 2
-DEDUPE_WORKERS = 3
-TAG_WORKERS = 3
-LM_WORKERS = 1
-RENAME_WORKERS = 1
-PACK_WORKERS = 6
-```
+## Логи
 
-## Pipeline Logic
-
-Before the main run, a service agent starts:
+Логи создаются в папке:
 
 ```text
-A0 DB Sync
+logs/
 ```
 
-It compares the persistent database with existing ZIP files in `TARGET_DIR`. For ZIP files already in the target directory, XXH64 is calculated from the book payload inside the ZIP, not from the ZIP archive itself.
-
-Main agents:
+Имя лога содержит дату, время и идентификатор сессии:
 
 ```text
-A1 Search
-A2 Unpack
-A3 Book?
-A4 XXH64
-A5 Tags
-A6 Ollama
-A7 Rename/Route
-A8 Pack
+library_sorter_YYYYMMDD_HHMMSS_xxxxxxxx.log
 ```
 
-Processing order:
+В логах можно увидеть:
 
-1. `A1` searches files in selected `SOURCE_DIRS`.
-2. `A2` unpacks archives, including nested archives.
-3. `A3` decides whether a file is a book.
-4. `A4` calculates XXH64 and removes duplicates before expensive stages.
-5. `A5` reads tags and metadata.
-6. `A6` asks Ollama only for book candidates.
-7. `A7` builds the final destination path.
-8. `A8` packs the book into ZIP, tests the archive, and only then finishes the task.
+- старт и завершение агентов;
+- решения `A3`;
+- хэши и решения `A4`;
+- ответы и ошибки Ollama;
+- маршруты `A7`;
+- упаковку `A8`;
+- ошибки распаковки архивов.
 
-## What Counts As A Book
+## Язык Интерфейса
 
-Book extensions include, for example:
-
-```text
-.pdf, .djvu, .epub, .fb2, .mobi, .azw3, .doc, .docx, .rtf, .txt, .chm, .html, .ppt, .xls
-```
-
-Strong non-book extensions are rejected before Ollama:
-
-```text
-.jpg, .png, .tif, .tiff, .mp3, .mp4, .exe, .dll, .hex, .cod, .pjt, .maa, .mos, .swf, .js, .css
-```
-
-Single raster images, including `.tif/.tiff`, are currently not treated as books. This prevents pages, firmware, diagrams, and technical artifacts from being sent to Ollama as books.
-
-Small unknown binary files are also rejected as non-books.
-
-`A3` also uses the `filetype` library to inspect file signatures. If the signature clearly identifies an image, audio, video, font, executable, or another standard non-book type, the file is moved to `NOBOOK_DIR` before `A4` and never reaches deduplication, tags, or Ollama.
-
-Book files continue only when they match known book signatures or known book extensions. Text formats without book signals (`ISBN`, `глава`, `chapter`, `автор`) are no longer passed forward as books.
-
-## GUI Counters
-
-Top-level counters count books, not pipeline operations.
-
-```text
-Books found
-```
-
-Number of files that `A3` accepted as books.
-
-```text
-Books done
-```
-
-Number of accepted books that reached a final result: packed, duplicate, or failed as a book task.
-
-```text
-Duplicates
-```
-
-Number of book duplicates found by XXH64.
-
-```text
-Not books
-```
-
-Number of files that `A3` rejected as non-books. This counter is not part of book progress.
-
-```text
-Book errors
-```
-
-Number of book tasks that ended with an error.
-
-`Books found` and `Books done` remain actual book counters.
-
-Progress percentage and ETA are now estimated from early stages `A1/A2/A3/A4`:
-
-```text
-done / estimated total books
-```
-
-The estimate is built like this:
-
-1. `A2` provides the observed archive expansion ratio.
-2. `A3` provides the observed book hit ratio.
-3. `A4` is included in ETA as a separate deduplication frontier.
-4. While `A1` is still scanning the sources, ETA stays approximate and becomes more stable after scanning finishes.
-
-## Agent Counters
-
-Agent cards show:
-
-```text
-P = processed
-E = errors
-Q = queue
-```
-
-These are stage counters, not book counters. For example, `A2` can process many archive containers, while `A3` only sees regular files extracted from those archives.
-
-## Interface Language And PC Shutdown
-
-The GUI supports two interface languages:
+Строки интерфейса лежат в JSON-файлах:
 
 ```text
 ui_ru.json
 ui_en.json
 ```
 
-The language can be switched live with the `RU` and `EN` buttons at the bottom of the window. No restart is required.
+Переключение языка выполняется кнопками `RU` и `EN` в GUI без перезапуска программы.
 
-The bottom-right checkbox controls automatic shutdown:
+## Выключение ПК После Завершения
 
-```text
-⏻ Shut down PC when done
-```
-
-It is disabled by default. If enabled, the application forcibly shuts down the computer only after the pipeline finishes all operations successfully, with a 300-second delay. Manual stop or pipeline errors do not trigger shutdown.
-
-## Duplicates
-
-Duplicates are checked by `XXH64`.
-
-Important rule: for books already packed in `TARGET_DIR`, the hash is calculated from the book file inside the ZIP, not from the ZIP archive. Therefore the comparison is book-to-book.
-
-If a duplicate is found among source files, it is moved to `DUPES_DIR`. If a duplicate is found among temporary files extracted from an archive, it is not counted as a user-visible `Дубликат` in the GUI, so the `Duplicates` folder is not expected to receive those temporary files.
-
-## Ollama
-
-Ollama is used only after a file has passed `A3` as a book and `A4` as a unique book.
-
-Model:
+В GUI есть опция:
 
 ```text
-gemma4:e4b
+Выключить ПК после завершения
 ```
 
-Default URL:
+Если она включена, после успешного завершения конвейера запускается выключение Windows с задержкой 300 секунд.
 
-```text
-http://127.0.0.1:11434/v1/chat/completions
+При ручной остановке или ошибке выключение не запускается.
+
+## Рекомендации По Запуску
+
+- Для больших коллекций запускайте сортировку на диске с достаточным свободным местом.
+- Не удаляйте `_TempPipeline` вручную во время работы.
+- Если много архивов, увеличивайте `MAX_PARALLEL_ARCHIVES` осторожно: распаковка активно грузит диск.
+- Если Ollama является узким местом, увеличивать `LM_WORKERS` стоит только если модель и железо реально выдерживают параллельные запросы.
+- Если в логах много не-книжных видео/картинок, это нормально для смешанных архивов: они отсекаются на `A3`.
+
+## Публикация
+
+Для публикации на GitHub проект должен быть git-репозиторием с настроенным remote или должен быть создан новый репозиторий.
+
+Минимальный ручной сценарий:
+
+```powershell
+git init
+git add .
+git commit -m "Update LibSort project"
+git branch -M main
+git remote add origin https://github.com/<user>/<repo>.git
+git push -u origin main
 ```
 
-The Ollama server should start with this environment variable:
+Если используется GitHub CLI:
 
-```text
-OLLAMA_CONTEXT_LENGTH=16000
+```powershell
+gh auth login
+gh repo create <user>/<repo> --source . --private --push
 ```
 
-On this machine it is set in the Windows autostart script `C:\Users\Home\.codex\scripts\start-ollama-server.ps1`, which starts `ollama serve`.
-
-The application does not send the whole book to the model. Before the heavy request, `A6` first runs a fast V3 precheck using the filename, path, archive chain, and `A5` metadata.
-
-The fast response is accepted only when the model returns `title`, `author`, `genre`, and confidence at least `LM_FAST_CONFIDENCE_MIN`. If the fast response is weak or incomplete, `A6` falls back to the previous full request.
-
-The full Ollama request sends:
-
-1. a short text snippet if it can be safely extracted;
-2. or fallback context: filename, extension, parent folder, archive chain, and filename-based guesses.
-
-The main prompt asks for strict JSON:
-
-```json
-{
-  "results": [
-    {
-      "title": "Название А",
-      "author": "Автор X",
-      "genre_analysis": {
-        "primary_genre": "Научная фантастика",
-        "subgenres": ["Транспортный триллер", "Дистопия"],
-        "confidence_score": 5.0
-      }
-    }
-  ]
-}
-```
-
-Main request temperature:
-
-```text
-temperature = 0.1
-```
-
-If Ollama returns non-JSON, the application performs an additional stricter JSON-only retry.
-
-Every 50 `A6` tasks, the event stream receives a short statistic line: fast accepted responses, fallbacks to full mode, and full request count.
-
-## Source Deletion
-
-A source file is deleted only after successful ZIP creation and archive test in `A8`.
-
-The GUI has a `Keep sources` checkbox. It is off by default: after successful `A8`, sources are deleted by the normal logic. When it is enabled, source books and source archives are not deleted after successful packing.
-
-For source archives, similar logic is used: if an archive was unpacked, all its book tasks finished successfully, and there were no failures, the source archive may be deleted after all child tasks are complete.
-
-If a file from `SOURCE_DIRS` is classified as non-book, it is moved to `NOBOOK_DIR`.
-
-If a source archive is unpacked and no books are found inside it, the original source archive is moved as a whole to `NOBOOK_DIR`. Its temporary extracted files are deleted with the temp folder and are not sent to `A7/A8`.
-
-Files extracted into the temporary folder from archives are working copies. The temporary folder is cleaned after completion or stop.
-
-## Stop Behavior
-
-The GUI has a button:
-
-```text
-Стоп
-```
-
-It stops the pipeline, clears queues, and cleans temporary folders.
-
-Terminal mode also supports:
-
-```text
-Esc
-Ctrl+S
-```
-
-Both mean stop with temporary-folder cleanup.
-
-## Database
-
-The database is persistent and stored in `TARGET_DIR`.
-
-The database name is derived from selected `SOURCE_DIRS`, so switching to another source folder does not destroy history for the previous one.
-
-The database stores:
-
-1. book hashes;
-2. final ZIP paths;
-3. metadata;
-4. Ollama response cache;
-5. task statuses.
-
-## Logs
-
-Logs are written to:
-
-```text
-logs
-```
-
-Logs show:
-
-1. what `A1` found;
-2. what `A2` unpacked;
-3. why `A3` accepted or rejected a file;
-4. which XXH64 value `A4` calculated;
-5. what Ollama returned;
-6. where `A7` routed the book;
-7. which ZIP `A8` created.
-
-## Output Folders
-
-```text
-TARGET_DIR
-```
-
-Main sorted library.
-
-```text
-DUPES_DIR
-```
-
-User-visible duplicate books.
-
-```text
-NOBOOK_DIR
-```
-
-Source files that are not books.
-
-```text
-TARGET_DIR\_TempPipeline
-```
-
-Temporary workspace. It is cleaned after completion or stop.
+На текущей машине `gh` должен быть установлен отдельно.

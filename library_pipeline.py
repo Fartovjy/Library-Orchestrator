@@ -467,6 +467,7 @@ class Metrics:
         self.lm_stats: dict[str, int] = defaultdict(int)
         self.events: deque[str] = deque(maxlen=10)
         self.active_stage_items: dict[str, dict[str, str]] = defaultdict(dict)
+        self.active_stage_started: dict[str, dict[str, float]] = defaultdict(dict)
 
     def set_mode(self, mode: str) -> None:
         with self.lock:
@@ -479,6 +480,9 @@ class Metrics:
 
     def set_active_item(self, stage: str, slot: str, text: str) -> None:
         with self.lock:
+            previous = self.active_stage_items[stage].get(slot)
+            if previous != text:
+                self.active_stage_started[stage][slot] = time.time()
             self.active_stage_items[stage][slot] = text
 
     def clear_active_item(self, stage: str, slot: str) -> None:
@@ -487,6 +491,11 @@ class Metrics:
             if not stage_map:
                 return
             stage_map.pop(slot, None)
+            started_map = self.active_stage_started.get(stage)
+            if started_map:
+                started_map.pop(slot, None)
+                if not started_map:
+                    self.active_stage_started.pop(stage, None)
             if not stage_map:
                 self.active_stage_items.pop(stage, None)
 
@@ -513,6 +522,15 @@ class Metrics:
             if stage_map
         }
 
+    def _snapshot_active_elapsed(self, now: Optional[float] = None) -> dict[str, int]:
+        ts = time.time() if now is None else now
+        out: dict[str, int] = {}
+        for stage, started_map in self.active_stage_started.items():
+            if not started_map:
+                continue
+            out[stage] = max(0, int(max(ts - started for started in started_map.values())))
+        return out
+
     def mark_task_seen(self) -> None:
         with self.lock:
             self.total_tasks_seen += 1
@@ -525,6 +543,10 @@ class Metrics:
     def mark_book_seen(self) -> None:
         with self.lock:
             self.books_seen += 1
+
+    def unmark_book_seen(self) -> None:
+        with self.lock:
+            self.books_seen = max(0, self.books_seen - 1)
 
     def mark_book_done(self, result: str) -> None:
         with self.lock:
@@ -546,6 +568,7 @@ class Metrics:
         self,
         queue_sizes: dict[str, int],
         stage_processed: dict[str, int],
+        active_stage_counts: dict[str, int],
         seen: int,
     ) -> tuple[int, int, int]:
         a2 = int(stage_processed.get("A2", 0))
@@ -553,6 +576,7 @@ class Metrics:
         q12 = max(0, int(queue_sizes.get("A2", queue_sizes.get("A1", 0))))
         q23 = max(0, int(queue_sizes.get("A3", 0)))
         q34 = max(0, int(queue_sizes.get("A4", 0)))
+        active_a2 = max(0, int(active_stage_counts.get("A2", 0)))
 
         if a2 > 0:
             files_per_a2 = max(0.0, min(64.0, a3 / max(1, a2)))
@@ -563,17 +587,30 @@ class Metrics:
         else:
             book_ratio = 0.0
 
-        future_a3_files = q23 + int(round(q12 * files_per_a2))
+        future_a3_files = q23 + int(round((q12 + active_a2) * files_per_a2))
         future_books = int(round(future_a3_files * book_ratio))
         estimated_total_books = max(seen, seen + future_books)
         remaining_a4_books = q34 + future_books
         return estimated_total_books, future_a3_files, remaining_a4_books
+
+    def _known_pipeline_backlog(
+        self,
+        queue_sizes: dict[str, int],
+        active_stage_counts: dict[str, int],
+    ) -> int:
+        total = 0
+        for stage in ("A2", "A3", "A4", "A5", "A6", "A7", "A8"):
+            total += max(0, int(queue_sizes.get(stage, 0)))
+            total += max(0, int(active_stage_counts.get(stage, 0)))
+        return total
 
     def _stage_eta_floor(
         self,
         elapsed: int,
         queue_sizes: dict[str, int],
         stage_processed: dict[str, int],
+        active_stage_counts: dict[str, int],
+        active_stage_elapsed: dict[str, int],
         future_a3_files: int,
         remaining_a4_books: int,
         stage_flags: Optional[dict[str, bool]] = None,
@@ -581,15 +618,31 @@ class Metrics:
         if elapsed <= 0:
             return None
 
-        a1 = int(stage_processed.get("A1", 0))
         a2 = int(stage_processed.get("A2", 0))
         a3 = int(stage_processed.get("A3", 0))
         a4 = int(stage_processed.get("A4", 0))
         q12 = max(0, int(queue_sizes.get("A2", queue_sizes.get("A1", 0))))
+        active_a2 = max(0, int(active_stage_counts.get("A2", 0)))
+        a2_active_elapsed = max(0, int(active_stage_elapsed.get("A2", 0)))
 
         eta_candidates: list[int] = []
-        if q12 > 0 and a2 > 0:
-            eta_candidates.append(int(q12 / max(a2 / max(1, elapsed), 1e-9)))
+        if q12 + active_a2 > 0 and a2 > 0:
+            eta_candidates.append(int((q12 + active_a2) / max(a2 / max(1, elapsed), 1e-9)))
+        if (
+            active_a2 > 0
+            and a2_active_elapsed > 0
+            and stage_flags
+            and not stage_flags.get("unpack_done", False)
+        ):
+            eta_candidates.append(a2_active_elapsed)
+        for stage in ("A3", "A4", "A5", "A6", "A7", "A8"):
+            backlog = max(0, int(queue_sizes.get(stage, 0)))
+            backlog += max(0, int(active_stage_counts.get(stage, 0)))
+            processed = int(stage_processed.get(stage, 0))
+            if backlog > 0 and processed > 0:
+                eta_candidates.append(
+                    int(backlog / max(processed / max(1, elapsed), 1e-9))
+                )
         if future_a3_files > 0 and a3 > 0:
             eta_candidates.append(
                 int(future_a3_files / max(a3 / max(1, elapsed), 1e-9))
@@ -599,15 +652,7 @@ class Metrics:
                 int(remaining_a4_books / max(a4 / max(1, elapsed), 1e-9))
             )
 
-        eta_floor = max(eta_candidates) if eta_candidates else None
-        if (
-            eta_floor is not None
-            and stage_flags
-            and not stage_flags.get("scan_done", False)
-            and a1 > 0
-        ):
-            eta_floor = max(eta_floor, int(eta_floor * 1.08))
-        return eta_floor
+        return max(eta_candidates) if eta_candidates else None
 
     def snapshot(
         self,
@@ -622,7 +667,15 @@ class Metrics:
             results = dict(self.results)
             book_results = dict(self.book_results)
             lm_stats = dict(self.lm_stats)
-            elapsed = int(time.time() - self.start_ts)
+            now = time.time()
+            elapsed = int(now - self.start_ts)
+            active_stage_counts = self._snapshot_active_counts()
+            active_stage_slots = self._snapshot_active_slots()
+            active_stage_elapsed = self._snapshot_active_elapsed(now)
+            known_pipeline_backlog = self._known_pipeline_backlog(
+                queue_sizes=queue_sizes,
+                active_stage_counts=active_stage_counts,
+            )
             (
                 estimated_total_books,
                 future_a3_files,
@@ -630,23 +683,37 @@ class Metrics:
             ) = self._estimate_total_books_a1_a4(
                 queue_sizes=queue_sizes,
                 stage_processed=stage_processed,
+                active_stage_counts=active_stage_counts,
                 seen=seen,
             )
-            pct_base = max(seen, estimated_total_books)
-            pct = 0.0 if pct_base == 0 else (done / max(1, pct_base)) * 100.0
+            progress_total_books = max(0, seen)
+            pct = (
+                0.0
+                if progress_total_books == 0
+                else (done / max(1, progress_total_books)) * 100.0
+            )
+            pct = max(0.0, min(100.0, pct))
 
             eta_books: Optional[int]
-            if pct_base > 0 and done >= pct_base:
-                eta_books = 0
-            elif done > 0:
+            if done > 0:
                 seconds_per_book = elapsed / max(1, done)
-                eta_books = int(seconds_per_book * max(0, pct_base - done))
+                future_books = max(0, estimated_total_books - seen)
+                remaining_books = max(
+                    0,
+                    progress_total_books - done,
+                    known_pipeline_backlog + future_books,
+                )
+                eta_books = int(seconds_per_book * remaining_books)
+                if remaining_books <= 0 and progress_total_books > 0:
+                    eta_books = 0
             else:
                 eta_books = None
             eta_floor = self._stage_eta_floor(
                 elapsed=elapsed,
                 queue_sizes=queue_sizes,
                 stage_processed=stage_processed,
+                active_stage_counts=active_stage_counts,
+                active_stage_elapsed=active_stage_elapsed,
                 future_a3_files=future_a3_files,
                 remaining_a4_books=remaining_a4_books,
                 stage_flags=stage_flags,
@@ -657,14 +724,6 @@ class Metrics:
                 eta_seconds = eta_books
             else:
                 eta_seconds = max(eta_books, eta_floor)
-            if (
-                self.mode == "RUNNING"
-                and stage_flags
-                and not stage_flags.get("scan_done", False)
-            ):
-                pct = min(pct, 99.0)
-                if eta_seconds == 0 and pct_base > done:
-                    eta_seconds = 1
             return {
                 "mode": self.mode,
                 "seen": seen,
@@ -672,7 +731,9 @@ class Metrics:
                 "tasks_seen": self.total_tasks_seen,
                 "tasks_done": self.total_tasks_done,
                 "pct": pct,
-                "progress_total_books": pct_base,
+                "progress_total_books": progress_total_books,
+                "estimated_total_books": estimated_total_books,
+                "known_pipeline_backlog": known_pipeline_backlog,
                 "elapsed_sec": elapsed,
                 "eta_sec": eta_seconds,
                 "elapsed": format_duration_hms(elapsed),
@@ -684,11 +745,12 @@ class Metrics:
                 "lm_stats": lm_stats,
                 "events": list(self.events),
                 "active_stage_items": self._snapshot_active_items(),
-                "active_stage_counts": self._snapshot_active_counts(),
-                "active_stage_slots": self._snapshot_active_slots(),
+                "active_stage_counts": active_stage_counts,
+                "active_stage_slots": active_stage_slots,
+                "active_stage_elapsed": active_stage_elapsed,
                 "queue_sizes": queue_sizes,
                 "stage_flags": dict(stage_flags or {}),
-                "eta_model": "A1/A2/A3/A4",
+                "eta_model": "pipeline_backlog+A1/A2(active)/A3-A8",
             }
 
 
@@ -1563,7 +1625,7 @@ class LibrarySorter:
         self._archive_failed: set[Path] = set()
         self._archive_has_book: set[Path] = set()
 
-        self.q12 = queue.Queue(maxsize=config.queue_size)
+        self.q12 = queue.Queue()
         self.q23 = queue.Queue(maxsize=config.queue_size)
         self.q34 = queue.Queue(maxsize=config.queue_size)
         self.q45 = queue.Queue(maxsize=config.queue_size)
@@ -1625,7 +1687,7 @@ class LibrarySorter:
 
     def queue_sizes(self) -> dict[str, int]:
         return {
-            "A1": self.q12.qsize(),
+            "A1": 0,
             "A2": self.q12.qsize(),
             "A3": self.q23.qsize(),
             "A4": self.q34.qsize(),
@@ -2018,6 +2080,13 @@ class LibrarySorter:
                 continue
         return False
 
+    def _mark_discovered_task(self, task: FileTask) -> None:
+        self.metrics.mark_task_seen()
+        self.metrics.mark_stage("A1")
+        if suffix_lower(task.path) in BOOK_EXTENSIONS and not task.book_seen_counted:
+            task.book_seen_counted = True
+            self.metrics.mark_book_seen()
+
     def _md_brief(self, md: Metadata) -> str:
         title = truncate(clean_text(md.title), 48)
         author = truncate(clean_text(md.author), 36)
@@ -2069,8 +2138,7 @@ class LibrarySorter:
                                         origin="source",
                                         source_root=source_root,
                                     )
-                                    self.metrics.mark_task_seen()
-                                    self.metrics.mark_stage("A1")
+                                    self._mark_discovered_task(task)
                                     if not self._put_with_stop(self.q12, task):
                                         break
                                 except Exception as exc:
@@ -2176,7 +2244,7 @@ class LibrarySorter:
                     cleanup_root=temp_root,
                 )
                 self.temp_tracker.register(temp_root)
-                self.metrics.mark_task_seen()
+                self._mark_discovered_task(new_task)
 
                 if is_archive(file_path):
                     self._register_archive_child(source_archive)
@@ -2248,6 +2316,9 @@ class LibrarySorter:
                         reason,
                     )
                 else:
+                    if task.book_seen_counted:
+                        task.book_seen_counted = False
+                        self.metrics.unmark_book_seen()
                     self._handle_nobook(task, reason)
                     self.db.mark_file(task, "nobook", reason)
                     self.logger.info(
@@ -4078,7 +4149,7 @@ def parse_args() -> Config:
         temp_base=Path(args.temp),
         lm_url=args.lm_url,
         lm_model=args.lm_model,
-        queue_size=max(100, args.queue_size),
+        queue_size=max(1, args.queue_size),
         unpack_workers=max(1, args.unpack_workers),
         detect_workers=max(1, args.detect_workers),
         tag_workers=max(1, args.tag_workers),
