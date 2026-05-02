@@ -11,35 +11,45 @@ TARGET_DIR = 'E:\\Sorted_Library'
 DUPES_DIR = r"E:\Sorted_Library\Duplicates"
 NOBOOK_DIR = r"E:\Sorted_Library\NoBook"
 
+# Ollama OpenAI-compatible API.
+# Server must expose /v1/chat/completions.
+LM_URL = "http://127.0.0.1:11434/v1/chat/completions"
+LM_MODEL = "gemma4:e4b"
+
 # Необязательно.
 # Если не задавать TEMP_BASE, конвейер автоматически использует:
 #   <TARGET_DIR>\_TempPipeline
 # TEMP_BASE = r"E:\Sorted_Library\_TempPipeline"
 
 # Количество агентов/воркеров по стадиям:
-# A2 Распаковка, A3 Книга?, A4 XXH64, A5 Теги, A6 LM Studio, A7 Переименование, A8 Упаковка
+# A2 Распаковка, A3 Книга?, A4 XXH64, A5 Теги, A6 Ollama, A7 Переименование, A8 Упаковка
 UNPACK_WORKERS = 3
 DETECT_WORKERS = 2
 DEDUPE_WORKERS = 3
 TAG_WORKERS = 3
 LM_WORKERS = 3
 RENAME_WORKERS = 1
-PACK_WORKERS = 9
+PACK_WORKERS = 6
 
 # Дополнительно:
 MAX_PARALLEL_ARCHIVES = 3
 QUEUE_SIZE = 33
 
-# LM Studio quality tuning:
+# Ollama quality tuning:
 # Increase these if you want higher recall from LM on difficult files.
-LM_TIMEOUT_SEC = 90
-LM_INPUT_CHARS = 4800
-LM_MAX_OUTPUT_TOKENS = 1024
+LM_TIMEOUT_SEC = 45
+LM_INPUT_CHARS = 1200
+LM_MAX_OUTPUT_TOKENS = 300
+
+# GUI "Глубокий анализ" uses the larger Ollama context window.
+LM_DEEP_INPUT_CHARS = 16000
+LM_DEEP_TIMEOUT_SEC = 120
+LM_DEEP_MAX_OUTPUT_TOKENS = 1024
 
 # V3: fast LM precheck before heavy full request.
 # Safe logic: fast answer is accepted only if it is full and confident,
 # otherwise the pipeline falls back to the current heavy LM request.
-LM_FAST_PRECHECK = True
+LM_FAST_PRECHECK = False
 LM_FAST_INPUT_CHARS = 900
 LM_FAST_MAX_OUTPUT_TOKENS = 180
 LM_FAST_CONFIDENCE_MIN = 4.0
@@ -47,11 +57,16 @@ LM_FAST_CONFIDENCE_MIN = 4.0
 # True: route every book through the full-metadata LM branch.
 # In V3, a fast LM precheck may satisfy this branch early;
 # otherwise the pipeline falls back to the heavy full request.
-LM_FORCE_FULL_METADATA = True
+LM_FORCE_FULL_METADATA = False
+
+# True: use full LM requests just to replace "Unknown Author".
+# False is much faster for chapter/page-like files where the model usually
+# cannot recover a useful author anyway.
+LM_FILL_UNKNOWN_AUTHOR = False
 
 # True: call LM even when snippet text is weak/empty (uses filename/path context).
 LM_ALWAYS_TRY_WITHOUT_SNIPPET = True
-# True: ask LM Studio for strict JSON output (auto-fallback if unsupported).
+# True: ask Ollama for strict JSON output (auto-fallback if unsupported).
 LM_STRICT_JSON_MODE = True
 # Minimum letters in snippet to consider it meaningful text.
 LM_MIN_SNIPPET_LETTERS = 24

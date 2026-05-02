@@ -82,7 +82,7 @@ A2 Распаковка
 A3 Книга?
 A4 XXH64
 A5 Теги
-A6 LM Studio
+A6 Ollama
 A7 Переименование
 A8 Упаковка
 ```
@@ -94,7 +94,7 @@ A8 Упаковка
 3. `A3` решает, книга это или нет.
 4. `A4` считает XXH64 и отсекает дубликаты до дорогих стадий.
 5. `A5` читает теги и метаданные из файла.
-6. `A6` обращается к LM Studio только для книжных кандидатов.
+6. `A6` обращается к Ollama только для книжных кандидатов.
 7. `A7` строит финальный путь.
 8. `A8` упаковывает книгу в ZIP, проверяет архив и только после успешной упаковки завершает задачу.
 
@@ -106,17 +106,17 @@ A8 Упаковка
 .pdf, .djvu, .epub, .fb2, .mobi, .azw3, .doc, .docx, .rtf, .txt, .chm, .html, .ppt, .xls
 ```
 
-Сильные не-книжные расширения отсекаются до LM Studio:
+Сильные не-книжные расширения отсекаются до Ollama:
 
 ```text
 .jpg, .png, .tif, .tiff, .mp3, .mp4, .exe, .dll, .hex, .cod, .pjt, .maa, .mos, .swf, .js, .css
 ```
 
-Одиночные raster-изображения, включая `.tif/.tiff`, сейчас не считаются книгами. Это сделано, чтобы не отправлять в LM Studio страницы, прошивки, схемы и технический мусор как книги.
+Одиночные raster-изображения, включая `.tif/.tiff`, сейчас не считаются книгами. Это сделано, чтобы не отправлять в Ollama страницы, прошивки, схемы и технический мусор как книги.
 
 Маленькие неизвестные бинарные файлы также отсекаются как не книги.
 
-`A3` дополнительно использует библиотеку `filetype` и проверяет сигнатуру файла. Если сигнатура уверенно указывает на изображение, аудио, видео, шрифт, исполняемый файл или другой стандартный не-книжный тип, файл переносится в `NOBOOK_DIR` до `A4` и не попадает в дедупликацию, теги и LM Studio.
+`A3` дополнительно использует библиотеку `filetype` и проверяет сигнатуру файла. Если сигнатура уверенно указывает на изображение, аудио, видео, шрифт, исполняемый файл или другой стандартный не-книжный тип, файл переносится в `NOBOOK_DIR` до `A4` и не попадает в дедупликацию, теги и Ollama.
 
 Книжные форматы пропускаются дальше только по известным книжным сигнатурам или по известным книжным расширениям. Текстовые форматы без книжных признаков (`ISBN`, `глава`, `chapter`, `автор`) теперь не отправляются дальше как книги.
 
@@ -208,27 +208,35 @@ ui_en.json
 
 Если дубликат найден среди исходных файлов, он переносится в `DUPES_DIR`. Если дубликат найден среди временных файлов, извлеченных из архива, он не учитывается как пользовательский `Дубликат` в GUI, чтобы не создавать ложное ощущение, что в `Duplicates` должны появиться файлы.
 
-## LM Studio
+## Ollama
 
-LM Studio используется только после того, как файл прошел `A3` как книга и `A4` как уникальная книга.
+Ollama используется только после того, как файл прошел `A3` как книга и `A4` как уникальная книга.
 
 Модель:
 
 ```text
-google/gemma-4-e4b
+gemma4:e4b
 ```
 
 URL по умолчанию:
 
 ```text
-http://127.0.0.1:1234/v1/chat/completions
+http://127.0.0.1:11434/v1/chat/completions
 ```
+
+Сервер Ollama должен запускаться с переменной окружения:
+
+```text
+OLLAMA_CONTEXT_LENGTH=16000
+```
+
+На этой машине это задается в Windows autostart-скрипте `C:\Users\Home\.codex\scripts\start-ollama-server.ps1`, который запускает `ollama serve`.
 
 Приложение не отправляет в модель всю книгу. Перед тяжелым запросом `A6` сначала выполняет быстрый V3 precheck по имени файла, пути, цепочке архивов и метаданным `A5`.
 
 Быстрый ответ принимается только если модель вернула `title`, `author`, `genre` и уверенность не ниже `LM_FAST_CONFIDENCE_MIN`. Если быстрый ответ слабый или неполный, `A6` переходит к прежнему полному запросу.
 
-В полный запрос LM Studio отправляется:
+В полный запрос Ollama отправляется:
 
 1. короткий текстовый фрагмент, если его удалось безопасно извлечь;
 2. или fallback-контекст: имя файла, расширение, папка, цепочка архивов и предположения из имени файла.
@@ -257,7 +265,7 @@ http://127.0.0.1:1234/v1/chat/completions
 temperature = 0.1
 ```
 
-Если LM Studio вернул не-JSON, приложение делает дополнительную попытку с более строгим требованием JSON.
+Если Ollama вернул не-JSON, приложение делает дополнительную попытку с более строгим требованием JSON.
 
 Каждые 50 задач `A6` пишет в события краткую статистику: быстрые успешные ответы, fallback к полному запросу и количество полных запросов.
 
@@ -305,7 +313,7 @@ Ctrl+S
 1. хэши книг;
 2. финальные пути ZIP;
 3. метаданные;
-4. кэш ответов LM Studio;
+4. кэш ответов Ollama;
 5. статусы задач.
 
 ## Логи
@@ -322,7 +330,7 @@ logs
 2. что распаковал `A2`;
 3. почему `A3` признал файл книгой или не книгой;
 4. какой XXH64 посчитал `A4`;
-5. что вернул LM Studio;
+5. что вернул Ollama;
 6. куда `A7` направил книгу;
 7. какой ZIP создал `A8`.
 
@@ -434,7 +442,7 @@ A2 Unpack
 A3 Book?
 A4 XXH64
 A5 Tags
-A6 LM Studio
+A6 Ollama
 A7 Rename/Route
 A8 Pack
 ```
@@ -446,7 +454,7 @@ Processing order:
 3. `A3` decides whether a file is a book.
 4. `A4` calculates XXH64 and removes duplicates before expensive stages.
 5. `A5` reads tags and metadata.
-6. `A6` asks LM Studio only for book candidates.
+6. `A6` asks Ollama only for book candidates.
 7. `A7` builds the final destination path.
 8. `A8` packs the book into ZIP, tests the archive, and only then finishes the task.
 
@@ -458,17 +466,17 @@ Book extensions include, for example:
 .pdf, .djvu, .epub, .fb2, .mobi, .azw3, .doc, .docx, .rtf, .txt, .chm, .html, .ppt, .xls
 ```
 
-Strong non-book extensions are rejected before LM Studio:
+Strong non-book extensions are rejected before Ollama:
 
 ```text
 .jpg, .png, .tif, .tiff, .mp3, .mp4, .exe, .dll, .hex, .cod, .pjt, .maa, .mos, .swf, .js, .css
 ```
 
-Single raster images, including `.tif/.tiff`, are currently not treated as books. This prevents pages, firmware, diagrams, and technical artifacts from being sent to LM Studio as books.
+Single raster images, including `.tif/.tiff`, are currently not treated as books. This prevents pages, firmware, diagrams, and technical artifacts from being sent to Ollama as books.
 
 Small unknown binary files are also rejected as non-books.
 
-`A3` also uses the `filetype` library to inspect file signatures. If the signature clearly identifies an image, audio, video, font, executable, or another standard non-book type, the file is moved to `NOBOOK_DIR` before `A4` and never reaches deduplication, tags, or LM Studio.
+`A3` also uses the `filetype` library to inspect file signatures. If the signature clearly identifies an image, audio, video, font, executable, or another standard non-book type, the file is moved to `NOBOOK_DIR` before `A4` and never reaches deduplication, tags, or Ollama.
 
 Book files continue only when they match known book signatures or known book extensions. Text formats without book signals (`ISBN`, `глава`, `chapter`, `автор`) are no longer passed forward as books.
 
@@ -560,27 +568,35 @@ Important rule: for books already packed in `TARGET_DIR`, the hash is calculated
 
 If a duplicate is found among source files, it is moved to `DUPES_DIR`. If a duplicate is found among temporary files extracted from an archive, it is not counted as a user-visible `Дубликат` in the GUI, so the `Duplicates` folder is not expected to receive those temporary files.
 
-## LM Studio
+## Ollama
 
-LM Studio is used only after a file has passed `A3` as a book and `A4` as a unique book.
+Ollama is used only after a file has passed `A3` as a book and `A4` as a unique book.
 
 Model:
 
 ```text
-google/gemma-4-e4b
+gemma4:e4b
 ```
 
 Default URL:
 
 ```text
-http://127.0.0.1:1234/v1/chat/completions
+http://127.0.0.1:11434/v1/chat/completions
 ```
+
+The Ollama server should start with this environment variable:
+
+```text
+OLLAMA_CONTEXT_LENGTH=16000
+```
+
+On this machine it is set in the Windows autostart script `C:\Users\Home\.codex\scripts\start-ollama-server.ps1`, which starts `ollama serve`.
 
 The application does not send the whole book to the model. Before the heavy request, `A6` first runs a fast V3 precheck using the filename, path, archive chain, and `A5` metadata.
 
 The fast response is accepted only when the model returns `title`, `author`, `genre`, and confidence at least `LM_FAST_CONFIDENCE_MIN`. If the fast response is weak or incomplete, `A6` falls back to the previous full request.
 
-The full LM Studio request sends:
+The full Ollama request sends:
 
 1. a short text snippet if it can be safely extracted;
 2. or fallback context: filename, extension, parent folder, archive chain, and filename-based guesses.
@@ -609,7 +625,7 @@ Main request temperature:
 temperature = 0.1
 ```
 
-If LM Studio returns non-JSON, the application performs an additional stricter JSON-only retry.
+If Ollama returns non-JSON, the application performs an additional stricter JSON-only retry.
 
 Every 50 `A6` tasks, the event stream receives a short statistic line: fast accepted responses, fallbacks to full mode, and full request count.
 
@@ -657,7 +673,7 @@ The database stores:
 1. book hashes;
 2. final ZIP paths;
 3. metadata;
-4. LM Studio response cache;
+4. Ollama response cache;
 5. task statuses.
 
 ## Logs
@@ -674,7 +690,7 @@ Logs show:
 2. what `A2` unpacked;
 3. why `A3` accepted or rejected a file;
 4. which XXH64 value `A4` calculated;
-5. what LM Studio returned;
+5. what Ollama returned;
 6. where `A7` routed the book;
 7. which ZIP `A8` created.
 

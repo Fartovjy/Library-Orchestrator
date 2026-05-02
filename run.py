@@ -318,6 +318,7 @@ class LibraryGUIApp:
         self.log_var = tk.StringVar(value=f"{self.tr('log_prefix')}: -")
         self.shutdown_after_done_var = tk.BooleanVar(value=False)
         self.keep_sources_var = tk.BooleanVar(value=False)
+        self.deep_analysis_var = tk.BooleanVar(value=False)
 
         self.agent_processed: dict[str, tk.StringVar] = {}
         self.agent_errors: dict[str, tk.StringVar] = {}
@@ -423,6 +424,8 @@ class LibraryGUIApp:
             self.shutdown_check.configure(text=self.tr("shutdown_after_done"))
         if hasattr(self, "keep_sources_check"):
             self.keep_sources_check.configure(text=self.tr("keep_sources"))
+        if hasattr(self, "deep_analysis_check"):
+            self.deep_analysis_check.configure(text=self.tr("deep_analysis"))
 
         self._render_events(self.last_snapshot)
 
@@ -891,6 +894,19 @@ class LibraryGUIApp:
         )
         self.keep_sources_check.pack(side=tk.RIGHT, anchor="se", padx=(0, 12))
 
+        self.deep_analysis_check = tk.Checkbutton(
+            footer_controls,
+            text=self.tr("deep_analysis"),
+            variable=self.deep_analysis_var,
+            font=self.font_legend,
+            bg=self._c("ctrl_bg"),
+            fg=self._c("text_secondary"),
+            activebackground=self._c("ctrl_bg"),
+            activeforeground=self._c("text_primary"),
+            selectcolor=self._c("ctrl_bg"),
+        )
+        self.deep_analysis_check.pack(side=tk.RIGHT, anchor="se", padx=(0, 12))
+
     def _apply_initial_dirs(self) -> None:
         # SOURCE_DIRS не подставляем автоматически при старте.
         self.source_var.set("")
@@ -1064,11 +1080,35 @@ class LibraryGUIApp:
         nobook = target / "NoBook"
         temp_base = self._resolve_temp_base(target)
 
-        lm_url = "http://127.0.0.1:1234/v1/chat/completions"
-        lm_model = "google/gemma-4-e4b"
+        lm_url = "http://127.0.0.1:11434/v1/chat/completions"
+        lm_model = "gemma4:e4b"
         if setting is not None:
             lm_url = getattr(setting, "LM_URL", lm_url)
             lm_model = getattr(setting, "LM_MODEL", lm_model)
+
+        deep_analysis = bool(self.deep_analysis_var.get())
+        lm_timeout_sec = self._setting_int(
+            "LM_TIMEOUT_SEC", lp.DEFAULT_LM_TIMEOUT_SEC, min_value=10
+        )
+        lm_input_chars = self._setting_int(
+            "LM_INPUT_CHARS", lp.DEFAULT_LM_INPUT_CHARS, min_value=200
+        )
+        lm_max_output_tokens = self._setting_int(
+            "LM_MAX_OUTPUT_TOKENS", lp.DEFAULT_LM_MAX_OUTPUT_TOKENS, min_value=40
+        )
+        if deep_analysis:
+            lm_timeout_sec = max(
+                lm_timeout_sec,
+                self._setting_int("LM_DEEP_TIMEOUT_SEC", 120, min_value=10),
+            )
+            lm_input_chars = max(
+                lm_input_chars,
+                self._setting_int("LM_DEEP_INPUT_CHARS", 16000, min_value=200),
+            )
+            lm_max_output_tokens = max(
+                lm_max_output_tokens,
+                self._setting_int("LM_DEEP_MAX_OUTPUT_TOKENS", 1024, min_value=40),
+            )
 
         return lp.Config(
             source_dirs=source_dirs,
@@ -1099,17 +1139,14 @@ class LibraryGUIApp:
             ),
             delete_source_after_pack=not self.keep_sources_var.get(),
             keep_temp_nobooks=False,
-            lm_timeout_sec=self._setting_int(
-                "LM_TIMEOUT_SEC", lp.DEFAULT_LM_TIMEOUT_SEC, min_value=10
-            ),
-            lm_input_chars=self._setting_int(
-                "LM_INPUT_CHARS", lp.DEFAULT_LM_INPUT_CHARS, min_value=200
-            ),
-            lm_max_output_tokens=self._setting_int(
-                "LM_MAX_OUTPUT_TOKENS", lp.DEFAULT_LM_MAX_OUTPUT_TOKENS, min_value=40
-            ),
-            lm_force_full_metadata=self._setting_bool(
-                "LM_FORCE_FULL_METADATA", getattr(lp, "DEFAULT_LM_FORCE_FULL_METADATA", True)
+            lm_timeout_sec=lm_timeout_sec,
+            lm_input_chars=lm_input_chars,
+            lm_max_output_tokens=lm_max_output_tokens,
+            lm_fast_precheck=False if deep_analysis else lp.DEFAULT_LM_FAST_PRECHECK,
+            lm_force_full_metadata=deep_analysis,
+            lm_fill_unknown_author=deep_analysis
+            or self._setting_bool(
+                "LM_FILL_UNKNOWN_AUTHOR", getattr(lp, "DEFAULT_LM_FILL_UNKNOWN_AUTHOR", False)
             ),
             lm_always_try_without_snippet=self._setting_bool(
                 "LM_ALWAYS_TRY_WITHOUT_SNIPPET", lp.DEFAULT_LM_ALWAYS_TRY_WITHOUT_SNIPPET

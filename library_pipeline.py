@@ -6,7 +6,7 @@
 3) Определение "книга / не книга"
 4) Ранний отсев дубликатов по XXH64
 5) Чтение тегов и метаданных
-6) Доопределение метаданных через LM Studio (JSON)
+6) Доопределение метаданных через Ollama (JSON)
 7) Нормализация имени и пути назначения
 8) Упаковка книг в ZIP с максимальным сжатием (7-Zip)
 
@@ -110,6 +110,7 @@ DEFAULT_LM_FAST_CONFIDENCE_MIN = float(
     getattr(setting, "LM_FAST_CONFIDENCE_MIN", 4.0)
 )
 DEFAULT_LM_FORCE_FULL_METADATA = bool(getattr(setting, "LM_FORCE_FULL_METADATA", True))
+DEFAULT_LM_FILL_UNKNOWN_AUTHOR = bool(getattr(setting, "LM_FILL_UNKNOWN_AUTHOR", False))
 DEFAULT_LM_ALWAYS_TRY_WITHOUT_SNIPPET = bool(
     getattr(setting, "LM_ALWAYS_TRY_WITHOUT_SNIPPET", True)
 )
@@ -343,7 +344,7 @@ AGENT_LABELS = {
     "A3": "Книга?",
     "A4": "XXH64",
     "A5": "Теги",
-    "A6": "LM Studio",
+    "A6": "Ollama",
     "A7": "Переименование",
     "A8": "Упаковка",
 }
@@ -363,8 +364,8 @@ class Config:
     dupes_dir: Path = Path(DEFAULT_DUPES_DIR)
     nobook_dir: Path = Path(DEFAULT_NOBOOK_DIR)
     temp_base: Path = Path(DEFAULT_TEMP_BASE)
-    lm_url: str = "http://127.0.0.1:1234/v1/chat/completions"
-    lm_model: str = "google/gemma-4-e4b"
+    lm_url: str = "http://127.0.0.1:11434/v1/chat/completions"
+    lm_model: str = "gemma4:e4b"
     queue_size: int = DEFAULT_QUEUE_SIZE
     unpack_workers: int = DEFAULT_UNPACK_WORKERS
     detect_workers: int = DEFAULT_DETECT_WORKERS
@@ -384,6 +385,7 @@ class Config:
     lm_fast_max_output_tokens: int = DEFAULT_LM_FAST_MAX_OUTPUT_TOKENS
     lm_fast_confidence_min: float = DEFAULT_LM_FAST_CONFIDENCE_MIN
     lm_force_full_metadata: bool = DEFAULT_LM_FORCE_FULL_METADATA
+    lm_fill_unknown_author: bool = DEFAULT_LM_FILL_UNKNOWN_AUTHOR
     lm_always_try_without_snippet: bool = DEFAULT_LM_ALWAYS_TRY_WITHOUT_SNIPPET
     lm_strict_json_mode: bool = DEFAULT_LM_STRICT_JSON_MODE
     lm_min_snippet_letters: int = DEFAULT_LM_MIN_SNIPPET_LETTERS
@@ -937,7 +939,7 @@ class LMStudioClient:
             strict_payload = {**payload, "response_format": {"type": "json_object"}}
             attempts.append(("strict_json", strict_payload))
         attempts.append(("default", payload))
-        # Compatibility fallback for LM Studio builds that reject some OpenAI fields.
+        # Compatibility fallback for OpenAI-compatible servers that reject some optional fields.
         attempts.append(
             (
                 "minimal",
@@ -1146,7 +1148,7 @@ class LMStudioClient:
             )
             return parsed
         except Exception as exc:
-            self.logger.warning("LM Studio fast precheck недоступен: %s", exc)
+            self.logger.warning("Ollama fast precheck недоступен: %s", exc)
             return None
 
     def enrich(self, task: FileTask, snippet: str) -> Optional[dict[str, Any]]:
@@ -1219,7 +1221,7 @@ class LMStudioClient:
                     self._response_error_brief(resp),
                 )
                 self.metrics.add_event(
-                    f"LM Studio HTTP {resp.status_code}: fallback для {task.path.name}"
+                    f"Ollama HTTP {resp.status_code}: fallback для {task.path.name}"
                 )
                 return None
             data = resp.json()
@@ -1276,7 +1278,7 @@ class LMStudioClient:
                     truncate(clean_text(retry_content), 200),
                 )
                 self.metrics.add_event(
-                    f"LM Studio вернул не-JSON для {task.path.name}: fallback"
+                    f"Ollama вернул не-JSON для {task.path.name}: fallback"
                 )
                 return None
             self.db.set_lm_cache(cache_key, parsed)
@@ -1287,8 +1289,8 @@ class LMStudioClient:
             )
             return parsed
         except Exception as exc:
-            self.logger.warning("LM Studio недоступен: %s", exc)
-            self.metrics.add_event(f"LM Studio недоступен: {exc}")
+            self.logger.warning("Ollama недоступен: %s", exc)
+            self.metrics.add_event(f"Ollama недоступен: {exc}")
             return None
 
     def enrich_genre_only(self, task: FileTask) -> Optional[dict[str, Any]]:
@@ -1408,7 +1410,7 @@ class LMStudioClient:
             )
             return parsed
         except Exception as exc:
-            self.logger.warning("LM Studio genre-only недоступен: %s", exc)
+            self.logger.warning("Ollama genre-only недоступен: %s", exc)
             return None
 
 
@@ -2710,8 +2712,11 @@ class LibrarySorter:
             "unknown title",
         }
         missing_author = not md.author or md.author.strip().lower() in {
+            "unknown",
             "unknown author",
         }
+        if missing_author and not self.config.lm_fill_unknown_author:
+            missing_author = False
         # Не тратим LM только ради жанра, если автор и название уже определены.
         if not missing_title and not missing_author:
             return False
@@ -2723,6 +2728,7 @@ class LibrarySorter:
             "unknown title",
         }
         missing_author = not md.author or md.author.strip().lower() in {
+            "unknown",
             "unknown author",
         }
         missing_genre = not md.genre or md.genre.strip().lower() in {"unknown"}
@@ -4019,7 +4025,7 @@ def parse_sources_input(values: list[str]) -> list[Path]:
 
 def parse_args() -> Config:
     p = argparse.ArgumentParser(
-        description="Многопоточный конвейер сортировки библиотеки с LM Studio и XXH64."
+        description="Многопоточный конвейер сортировки библиотеки с Ollama и XXH64."
     )
     p.add_argument("--sources", nargs="+", default=DEFAULT_SOURCE_DIRS)
     p.add_argument("--source", action="append", dest="legacy_source", help=argparse.SUPPRESS)
@@ -4027,8 +4033,8 @@ def parse_args() -> Config:
     p.add_argument("--dupes", default=DEFAULT_DUPES_DIR)
     p.add_argument("--nobook", default=DEFAULT_NOBOOK_DIR)
     p.add_argument("--temp", default=DEFAULT_TEMP_BASE)
-    p.add_argument("--lm-url", default="http://127.0.0.1:1234/v1/chat/completions")
-    p.add_argument("--lm-model", default="google/gemma-4-e4b")
+    p.add_argument("--lm-url", default="http://127.0.0.1:11434/v1/chat/completions")
+    p.add_argument("--lm-model", default="gemma4:e4b")
     p.add_argument("--queue-size", type=int, default=DEFAULT_QUEUE_SIZE)
     p.add_argument("--unpack-workers", type=int, default=DEFAULT_UNPACK_WORKERS)
     p.add_argument("--detect-workers", type=int, default=DEFAULT_DETECT_WORKERS)
