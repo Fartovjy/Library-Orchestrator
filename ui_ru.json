@@ -31,7 +31,7 @@
   "language_ru": "RU",
   "language_en": "EN",
   "shutdown_after_done": "⏻ Выключить ПК после завершения",
-  "keep_sources": "Не удалять исходники",
+  "keep_sources": "Сохранять исходники",
   "deep_analysis": "Глубокий анализ",
   "rename_output": "Переименование",
   "mode_IDLE": "Ожидание",

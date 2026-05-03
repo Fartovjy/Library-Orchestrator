@@ -384,7 +384,7 @@ class Config:
     dedupe_workers: int = DEFAULT_DEDUPE_WORKERS
     pack_workers: int = DEFAULT_PACK_WORKERS
     max_parallel_archives: int = DEFAULT_MAX_PARALLEL_ARCHIVES
-    delete_source_after_pack: bool = True
+    delete_source_after_pack: bool = False
     keep_temp_nobooks: bool = False
     lm_timeout_sec: int = DEFAULT_LM_TIMEOUT_SEC
     lm_input_chars: int = DEFAULT_LM_INPUT_CHARS
@@ -2365,7 +2365,15 @@ class LibrarySorter:
                 and task.origin == "source"
                 and task.path.exists()
             ):
-                task.path.unlink(missing_ok=True)
+                if self._source_delete_after_pack_is_safe(task):
+                    task.path.unlink(missing_ok=True)
+                    self.logger.info("Source removed after verified pack: %s", task.path)
+                else:
+                    self.logger.warning(
+                        "Source delete skipped: verification failed source=%s dest=%s",
+                        task.path,
+                        task.dest_zip or "",
+                    )
         except Exception as exc:
             self.logger.warning("Не удалось удалить исходник %s: %s", task.path, exc)
 
@@ -2375,6 +2383,38 @@ class LibrarySorter:
         if task.is_book_candidate and not task.book_done_counted:
             task.book_done_counted = True
             self.metrics.mark_book_done(result)
+
+    def _source_delete_after_pack_is_safe(self, task: FileTask) -> bool:
+        if not task.dest_zip or not task.dest_zip.exists():
+            return False
+        try:
+            if task.path.resolve(strict=False) == task.dest_zip.resolve(strict=False):
+                return False
+        except Exception:
+            return False
+        if not task.xxh64:
+            return False
+        try:
+            packed_hash, note = xxh64_zip_payload(task.dest_zip)
+        except Exception as exc:
+            self.logger.warning(
+                "Source delete skipped: cannot hash packed payload source=%s dest=%s error=%s",
+                task.path,
+                task.dest_zip,
+                exc,
+            )
+            return False
+        if packed_hash != task.xxh64:
+            self.logger.warning(
+                "Source delete skipped: packed hash mismatch source=%s dest=%s expected=%s got=%s note=%s",
+                task.path,
+                task.dest_zip,
+                task.xxh64,
+                packed_hash or "",
+                note,
+            )
+            return False
+        return True
 
     def _clear_all_queues(self) -> None:
         for q in (self.q12, self.q23, self.q34, self.q45, self.q56, self.q67, self.q78):
@@ -3788,7 +3828,12 @@ def parse_args() -> Config:
     p.add_argument(
         "--keep-source",
         action="store_true",
-        help="Не удалять исходные файлы после успешной упаковки",
+        help="Сохранять исходные файлы после успешной упаковки (поведение по умолчанию).",
+    )
+    p.add_argument(
+        "--delete-source",
+        action="store_true",
+        help="Опасный режим: удалять исходники только после проверки упакованной копии.",
     )
     p.add_argument(
         "--keep-temp-nobooks",
@@ -3852,7 +3897,7 @@ def parse_args() -> Config:
         dedupe_workers=max(1, args.dedupe_workers),
         pack_workers=max(1, args.pack_workers),
         max_parallel_archives=max(1, args.max_parallel_archives),
-        delete_source_after_pack=not args.keep_source,
+        delete_source_after_pack=bool(args.delete_source and not args.keep_source),
         keep_temp_nobooks=bool(args.keep_temp_nobooks),
         lm_timeout_sec=max(10, args.lm_timeout_sec),
         lm_input_chars=max(200, args.lm_input_chars),

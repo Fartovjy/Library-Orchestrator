@@ -320,7 +320,7 @@ class LibraryGUIApp:
         self.event_var = tk.StringVar(value=f"{self.tr('events_prefix')}: -")
         self.log_var = tk.StringVar(value=f"{self.tr('log_prefix')}: -")
         self.shutdown_after_done_var = tk.BooleanVar(value=False)
-        self.keep_sources_var = tk.BooleanVar(value=False)
+        self.keep_sources_var = tk.BooleanVar(value=True)
         self.deep_analysis_var = tk.BooleanVar(value=False)
         self.lm_url_var = tk.StringVar(value=self._setting_str("LM_URL", lp.DEFAULT_LM_URL))
         self.lm_model_var = tk.StringVar(value=self._setting_str("LM_MODEL", lp.DEFAULT_LM_MODEL))
