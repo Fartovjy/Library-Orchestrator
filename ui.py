@@ -322,6 +322,69 @@ class LibraryGUIApp:
         self.shutdown_after_done_var = tk.BooleanVar(value=False)
         self.keep_sources_var = tk.BooleanVar(value=False)
         self.deep_analysis_var = tk.BooleanVar(value=False)
+        self.dupes_var_path = tk.StringVar(value=fix_mojibake(str(lp.DEFAULT_DUPES_DIR)))
+        self.nobook_var_path = tk.StringVar(value=fix_mojibake(str(lp.DEFAULT_NOBOOK_DIR)))
+        self.temp_base_var = tk.StringVar(value=fix_mojibake(str(lp.DEFAULT_TEMP_BASE)))
+        self.lm_url_var = tk.StringVar(value=self._setting_str("LM_URL", lp.DEFAULT_LM_URL))
+        self.lm_model_var = tk.StringVar(value=self._setting_str("LM_MODEL", lp.DEFAULT_LM_MODEL))
+        self.output_language_var = tk.StringVar(
+            value=self._setting_choice("OUTPUT_LANGUAGE", lp.DEFAULT_OUTPUT_LANGUAGE, {"auto", "ru", "en"})
+        )
+        self.gui_font_family_var = tk.StringVar(value=font_family)
+        self.worker_vars: dict[str, tk.StringVar] = {}
+        for name, default in [
+            ("UNPACK_WORKERS", lp.DEFAULT_UNPACK_WORKERS),
+            ("DETECT_WORKERS", lp.DEFAULT_DETECT_WORKERS),
+            ("DEDUPE_WORKERS", lp.DEFAULT_DEDUPE_WORKERS),
+            ("TAG_WORKERS", lp.DEFAULT_TAG_WORKERS),
+            ("LM_WORKERS", lp.DEFAULT_LM_WORKERS),
+            ("RENAME_WORKERS", lp.DEFAULT_RENAME_WORKERS),
+            ("PACK_WORKERS", lp.DEFAULT_PACK_WORKERS),
+            ("MAX_PARALLEL_ARCHIVES", lp.DEFAULT_MAX_PARALLEL_ARCHIVES),
+            ("QUEUE_SIZE", lp.DEFAULT_QUEUE_SIZE),
+            ("TARGET_HASH_SCAN_WORKERS", lp.DEFAULT_TARGET_HASH_SCAN_WORKERS),
+        ]:
+            self.worker_vars[name] = tk.StringVar(value=str(self._setting_int(name, default, min_value=1)))
+        self.lm_number_vars: dict[str, tk.StringVar] = {}
+        for name, default in [
+            ("LM_TIMEOUT_SEC", lp.DEFAULT_LM_TIMEOUT_SEC),
+            ("LM_INPUT_CHARS", lp.DEFAULT_LM_INPUT_CHARS),
+            ("LM_MAX_OUTPUT_TOKENS", lp.DEFAULT_LM_MAX_OUTPUT_TOKENS),
+            ("LM_DEEP_TIMEOUT_SEC", 120),
+            ("LM_DEEP_INPUT_CHARS", 16000),
+            ("LM_DEEP_MAX_OUTPUT_TOKENS", 1024),
+            ("LM_FAST_INPUT_CHARS", lp.DEFAULT_LM_FAST_INPUT_CHARS),
+            ("LM_FAST_MAX_OUTPUT_TOKENS", lp.DEFAULT_LM_FAST_MAX_OUTPUT_TOKENS),
+            ("LM_MIN_SNIPPET_LETTERS", lp.DEFAULT_LM_MIN_SNIPPET_LETTERS),
+            ("GUI_WINDOW_WIDTH", self.window_width),
+            ("GUI_WINDOW_HEIGHT", self.window_height),
+        ]:
+            self.lm_number_vars[name] = tk.StringVar(value=str(self._setting_int(name, default, min_value=1)))
+        self.lm_confidence_var = tk.StringVar(
+            value=str(self._setting_float("LM_FAST_CONFIDENCE_MIN", lp.DEFAULT_LM_FAST_CONFIDENCE_MIN, min_value=0.0))
+        )
+        self.gui_font_vars: dict[str, tk.StringVar] = {}
+        for name, default in [
+            ("GUI_FONT_MAIN_SIZE", 12),
+            ("GUI_FONT_TITLE_SIZE", 15),
+            ("GUI_FONT_SMALL_SIZE", 12),
+            ("GUI_FONT_STATS_SIZE", 11),
+            ("GUI_FONT_COUNTER_LABEL_SIZE", 9),
+            ("GUI_FONT_LEGEND_SIZE", 9),
+            ("GUI_FONT_AGENT_TITLE_SIZE", 11),
+            ("GUI_FONT_AGENT_VALUE_SIZE", 10),
+            ("GUI_FONT_AGENT_METRIC_LABEL_SIZE", 9),
+        ]:
+            self.gui_font_vars[name] = tk.StringVar(value=str(self._setting_int(name, default, min_value=6)))
+        self.boolean_setting_vars: dict[str, tk.BooleanVar] = {
+            "LM_FAST_PRECHECK": tk.BooleanVar(value=self._setting_bool("LM_FAST_PRECHECK", lp.DEFAULT_LM_FAST_PRECHECK)),
+            "LM_FORCE_FULL_METADATA": tk.BooleanVar(value=self._setting_bool("LM_FORCE_FULL_METADATA", lp.DEFAULT_LM_FORCE_FULL_METADATA)),
+            "LM_FILL_UNKNOWN_AUTHOR": tk.BooleanVar(value=self._setting_bool("LM_FILL_UNKNOWN_AUTHOR", lp.DEFAULT_LM_FILL_UNKNOWN_AUTHOR)),
+            "LM_ALWAYS_TRY_WITHOUT_SNIPPET": tk.BooleanVar(value=self._setting_bool("LM_ALWAYS_TRY_WITHOUT_SNIPPET", lp.DEFAULT_LM_ALWAYS_TRY_WITHOUT_SNIPPET)),
+            "LM_STRICT_JSON_MODE": tk.BooleanVar(value=self._setting_bool("LM_STRICT_JSON_MODE", lp.DEFAULT_LM_STRICT_JSON_MODE)),
+            "ISBN_LOOKUP": tk.BooleanVar(value=self._setting_bool("ISBN_LOOKUP", lp.DEFAULT_ISBN_LOOKUP)),
+            "SEED_HASHES_FROM_TARGET": tk.BooleanVar(value=self._setting_bool("SEED_HASHES_FROM_TARGET", lp.DEFAULT_SEED_HASHES_FROM_TARGET)),
+        }
         self.rename_output_var = tk.BooleanVar(
             value=self._setting_bool(
                 "TRANSLATE_OUTPUT_NAMES", lp.DEFAULT_TRANSLATE_OUTPUT_NAMES
@@ -428,6 +491,9 @@ class LibraryGUIApp:
             self.lang_ru_btn.configure(text=self.tr("language_ru"))
         if hasattr(self, "lang_en_btn"):
             self.lang_en_btn.configure(text=self.tr("language_en"))
+        if hasattr(self, "notebook"):
+            self.notebook.tab(self.main_tab, text=self.tr("tab_main"))
+            self.notebook.tab(self.settings_tab, text=self.tr("tab_settings"))
         if hasattr(self, "shutdown_check"):
             self.shutdown_check.configure(text=self.tr("shutdown_after_done"))
         if hasattr(self, "keep_sources_check"):
@@ -436,6 +502,9 @@ class LibraryGUIApp:
             self.deep_analysis_check.configure(text=self.tr("deep_analysis"))
         if hasattr(self, "rename_output_check"):
             self.rename_output_check.configure(text=self.tr("rename_output"))
+        if hasattr(self, "settings_text_widgets"):
+            for widget, key in self.settings_text_widgets:
+                widget.configure(text=self.tr(key))
 
         self._render_events(self.last_snapshot)
 
@@ -448,7 +517,28 @@ class LibraryGUIApp:
         self.root.configure(bg=self._c("root_bg"))
 
     def _build_ui(self) -> None:
-        outer = tk.Frame(self.root, bg=self._c("root_bg"), padx=self.outer_pad, pady=8)
+        style = ttk.Style()
+        style.theme_use("default")
+        style.configure(
+            "App.TNotebook",
+            background=self._c("root_bg"),
+            borderwidth=0,
+        )
+        style.configure(
+            "App.TNotebook.Tab",
+            padding=(14, 5),
+            font=self.font_legend,
+        )
+
+        self.notebook = ttk.Notebook(self.root, style="App.TNotebook")
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        self.main_tab = tk.Frame(self.notebook, bg=self._c("root_bg"))
+        self.settings_tab = tk.Frame(self.notebook, bg=self._c("root_bg"))
+        self.notebook.add(self.main_tab, text=self.tr("tab_main"))
+        self.notebook.add(self.settings_tab, text=self.tr("tab_settings"))
+
+        outer = tk.Frame(self.main_tab, bg=self._c("root_bg"), padx=self.outer_pad, pady=6)
         outer.pack(fill=tk.BOTH, expand=True)
 
         top = tk.Frame(
@@ -635,8 +725,6 @@ class LibraryGUIApp:
         )
         self.time_badge.grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(4, 0))
 
-        style = ttk.Style()
-        style.theme_use("default")
         style.configure(
             "Agent.Horizontal.TProgressbar",
             thickness=20,
@@ -933,6 +1021,253 @@ class LibraryGUIApp:
             selectcolor=self._c("ctrl_bg"),
         )
         self.rename_output_check.pack(side=tk.RIGHT, anchor="se", padx=(0, 12))
+        self._build_settings_tab()
+
+    def _build_settings_tab(self) -> None:
+        self.settings_text_widgets: list[tuple[tk.Widget, str]] = []
+        canvas = tk.Canvas(
+            self.settings_tab,
+            bg=self._c("root_bg"),
+            highlightthickness=0,
+        )
+        scrollbar = ttk.Scrollbar(self.settings_tab, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        content = tk.Frame(canvas, bg=self._c("root_bg"), padx=10, pady=8)
+        window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+        content.bind(
+            "<Configure>",
+            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda event: canvas.itemconfigure(window_id, width=event.width),
+        )
+
+        row = 0
+
+        def section(title_key: str) -> None:
+            nonlocal row
+            label = tk.Label(
+                content,
+                text=self.tr(title_key),
+                font=self.font_agent_title,
+                bg=self._c("root_bg"),
+                fg=self._c("text_primary"),
+                anchor="w",
+            )
+            label.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(8 if row else 0, 4))
+            self.settings_text_widgets.append((label, title_key))
+            row += 1
+
+        def add_entry(label_key: str, var: tk.StringVar, width: int = 18) -> None:
+            nonlocal row
+            label = tk.Label(
+                content,
+                text=self.tr(label_key),
+                font=self.font_legend,
+                bg=self._c("root_bg"),
+                fg=self._c("text_secondary"),
+                anchor="w",
+            )
+            label.grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+            self.settings_text_widgets.append((label, label_key))
+            entry = tk.Entry(content, textvariable=var, font=self.font_legend, width=width)
+            entry.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=2)
+            row += 1
+
+        def add_path(label_key: str, var: tk.StringVar) -> None:
+            nonlocal row
+            label = tk.Label(
+                content,
+                text=self.tr(label_key),
+                font=self.font_legend,
+                bg=self._c("root_bg"),
+                fg=self._c("text_secondary"),
+                anchor="w",
+            )
+            label.grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+            self.settings_text_widgets.append((label, label_key))
+            entry = tk.Entry(content, textvariable=var, font=self.font_legend)
+            entry.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(0, 8), pady=2)
+            btn = tk.Button(
+                content,
+                text=self.tr("browse"),
+                font=self.font_legend,
+                command=lambda v=var: self._browse_setting_dir(v),
+                bg=self._c("btn_secondary_bg"),
+                fg=self._c("btn_secondary_fg"),
+                activebackground=self._c("btn_secondary_active_bg"),
+                activeforeground=self._c("btn_secondary_active_fg"),
+            )
+            btn.grid(row=row, column=3, sticky="ew", pady=2)
+            self.settings_text_widgets.append((btn, "browse"))
+            row += 1
+
+        def add_bool(label_key: str, var: tk.BooleanVar) -> None:
+            nonlocal row
+            check = tk.Checkbutton(
+                content,
+                text=self.tr(label_key),
+                variable=var,
+                font=self.font_legend,
+                bg=self._c("root_bg"),
+                fg=self._c("text_secondary"),
+                activebackground=self._c("root_bg"),
+                activeforeground=self._c("text_primary"),
+                selectcolor=self._c("root_bg"),
+                anchor="w",
+            )
+            check.grid(row=row, column=0, columnspan=2, sticky="w", pady=1)
+            self.settings_text_widgets.append((check, label_key))
+            row += 1
+
+        section("settings_paths")
+        add_path("settings_dupes_dir", self.dupes_var_path)
+        add_path("settings_nobook_dir", self.nobook_var_path)
+        add_path("settings_temp_base", self.temp_base_var)
+
+        section("settings_workers")
+        worker_items = [
+            ("settings_unpack_workers", "UNPACK_WORKERS"),
+            ("settings_detect_workers", "DETECT_WORKERS"),
+            ("settings_dedupe_workers", "DEDUPE_WORKERS"),
+            ("settings_tag_workers", "TAG_WORKERS"),
+            ("settings_lm_workers", "LM_WORKERS"),
+            ("settings_rename_workers", "RENAME_WORKERS"),
+            ("settings_pack_workers", "PACK_WORKERS"),
+            ("settings_max_parallel_archives", "MAX_PARALLEL_ARCHIVES"),
+            ("settings_queue_size", "QUEUE_SIZE"),
+            ("settings_target_hash_workers", "TARGET_HASH_SCAN_WORKERS"),
+        ]
+        for idx in range(0, len(worker_items), 2):
+            label_a, name_a = worker_items[idx]
+            add_entry(label_a, self.worker_vars[name_a], width=10)
+            if idx + 1 < len(worker_items):
+                prev_row = row - 1
+                label_b, name_b = worker_items[idx + 1]
+                label = tk.Label(
+                    content,
+                    text=self.tr(label_b),
+                    font=self.font_legend,
+                    bg=self._c("root_bg"),
+                    fg=self._c("text_secondary"),
+                    anchor="w",
+                )
+                label.grid(row=prev_row, column=2, sticky="w", padx=(4, 8), pady=2)
+                self.settings_text_widgets.append((label, label_b))
+                entry = tk.Entry(
+                    content,
+                    textvariable=self.worker_vars[name_b],
+                    font=self.font_legend,
+                    width=10,
+                )
+                entry.grid(row=prev_row, column=3, sticky="ew", pady=2)
+
+        section("settings_ollama")
+        add_entry("settings_lm_url", self.lm_url_var, width=34)
+        add_entry("settings_lm_model", self.lm_model_var, width=20)
+        for key, name in [
+            ("settings_lm_timeout", "LM_TIMEOUT_SEC"),
+            ("settings_lm_input_chars", "LM_INPUT_CHARS"),
+            ("settings_lm_tokens", "LM_MAX_OUTPUT_TOKENS"),
+            ("settings_lm_min_letters", "LM_MIN_SNIPPET_LETTERS"),
+            ("settings_lm_deep_timeout", "LM_DEEP_TIMEOUT_SEC"),
+            ("settings_lm_deep_input", "LM_DEEP_INPUT_CHARS"),
+            ("settings_lm_deep_tokens", "LM_DEEP_MAX_OUTPUT_TOKENS"),
+            ("settings_lm_fast_input", "LM_FAST_INPUT_CHARS"),
+            ("settings_lm_fast_tokens", "LM_FAST_MAX_OUTPUT_TOKENS"),
+        ]:
+            add_entry(key, self.lm_number_vars[name], width=10)
+        add_entry("settings_lm_fast_confidence", self.lm_confidence_var, width=10)
+
+        section("settings_flags")
+        add_bool("deep_analysis", self.deep_analysis_var)
+        add_bool("rename_output", self.rename_output_var)
+        add_bool("keep_sources", self.keep_sources_var)
+        add_bool("settings_lm_fast_precheck", self.boolean_setting_vars["LM_FAST_PRECHECK"])
+        add_bool("settings_lm_force_full", self.boolean_setting_vars["LM_FORCE_FULL_METADATA"])
+        add_bool("settings_lm_fill_author", self.boolean_setting_vars["LM_FILL_UNKNOWN_AUTHOR"])
+        add_bool("settings_lm_without_snippet", self.boolean_setting_vars["LM_ALWAYS_TRY_WITHOUT_SNIPPET"])
+        add_bool("settings_lm_strict_json", self.boolean_setting_vars["LM_STRICT_JSON_MODE"])
+        add_bool("settings_isbn_lookup", self.boolean_setting_vars["ISBN_LOOKUP"])
+        add_bool("settings_seed_hashes", self.boolean_setting_vars["SEED_HASHES_FROM_TARGET"])
+
+        section("settings_output")
+        label = tk.Label(
+            content,
+            text=self.tr("settings_output_language"),
+            font=self.font_legend,
+            bg=self._c("root_bg"),
+            fg=self._c("text_secondary"),
+            anchor="w",
+        )
+        label.grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+        self.settings_text_widgets.append((label, "settings_output_language"))
+        combo = ttk.Combobox(
+            content,
+            textvariable=self.output_language_var,
+            values=("auto", "ru", "en"),
+            width=10,
+            state="readonly",
+            font=self.font_legend,
+        )
+        combo.grid(row=row, column=1, sticky="w", pady=2)
+        row += 1
+
+        section("settings_gui")
+        add_entry("settings_gui_font_family", self.gui_font_family_var, width=18)
+        for key, name in [
+            ("settings_gui_width", "GUI_WINDOW_WIDTH"),
+            ("settings_gui_height", "GUI_WINDOW_HEIGHT"),
+            ("settings_gui_font_main", "GUI_FONT_MAIN_SIZE"),
+            ("settings_gui_font_title", "GUI_FONT_TITLE_SIZE"),
+            ("settings_gui_font_small", "GUI_FONT_SMALL_SIZE"),
+            ("settings_gui_font_stats", "GUI_FONT_STATS_SIZE"),
+            ("settings_gui_font_counter", "GUI_FONT_COUNTER_LABEL_SIZE"),
+            ("settings_gui_font_legend", "GUI_FONT_LEGEND_SIZE"),
+            ("settings_gui_font_agent_title", "GUI_FONT_AGENT_TITLE_SIZE"),
+            ("settings_gui_font_agent_value", "GUI_FONT_AGENT_VALUE_SIZE"),
+            ("settings_gui_font_agent_metric", "GUI_FONT_AGENT_METRIC_LABEL_SIZE"),
+        ]:
+            var = self.lm_number_vars.get(name) or self.gui_font_vars[name]
+            add_entry(key, var, width=10)
+
+        save_btn = tk.Button(
+            content,
+            text=self.tr("settings_save"),
+            font=self.font_main,
+            command=self._save_settings_to_file,
+            bg=self._c("btn_start_bg"),
+            fg=self._c("btn_start_fg"),
+            activebackground=self._c("btn_start_active_bg"),
+            activeforeground=self._c("btn_start_active_fg"),
+        )
+        save_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(10, 2))
+        self.settings_text_widgets.append((save_btn, "settings_save"))
+
+        hint = tk.Label(
+            content,
+            text=self.tr("settings_restart_hint"),
+            font=self.font_legend,
+            bg=self._c("root_bg"),
+            fg=self._c("text_muted"),
+            anchor="w",
+            justify=tk.LEFT,
+        )
+        hint.grid(row=row, column=2, columnspan=2, sticky="ew", padx=(12, 0), pady=(10, 2))
+        self.settings_text_widgets.append((hint, "settings_restart_hint"))
+
+        for col in range(4):
+            content.grid_columnconfigure(col, weight=1 if col in {1, 3} else 0)
+
+    def _browse_setting_dir(self, var: tk.StringVar) -> None:
+        initial = self._best_existing_dir(var.get())
+        picked = filedialog.askdirectory(title=self.tr("dialog_target_title"), initialdir=initial)
+        if picked:
+            var.set(str(Path(picked)))
 
     def _apply_initial_dirs(self) -> None:
         # SOURCE_DIRS не подставляем автоматически при старте.
@@ -1026,13 +1361,15 @@ class LibraryGUIApp:
             messagebox.showerror(self.tr("dialog_paths_title"), self.tr("dialog_target_missing"))
             return False
         target = Path(target_raw)
+        dupes = Path(self.dupes_var_path.get().strip() or str(target / "Duplicates"))
+        nobook = Path(self.nobook_var_path.get().strip() or str(target / "NoBook"))
 
         try:
             for source in source_dirs:
                 source.mkdir(parents=True, exist_ok=True)
             target.mkdir(parents=True, exist_ok=True)
-            (target / "Duplicates").mkdir(parents=True, exist_ok=True)
-            (target / "NoBook").mkdir(parents=True, exist_ok=True)
+            dupes.mkdir(parents=True, exist_ok=True)
+            nobook.mkdir(parents=True, exist_ok=True)
             temp_base = self._resolve_temp_base(target)
             temp_base.mkdir(parents=True, exist_ok=True)
             (temp_base / "extract").mkdir(parents=True, exist_ok=True)
@@ -1071,6 +1408,10 @@ class LibraryGUIApp:
                 return
 
     def _resolve_temp_base(self, target_dir: Path) -> Path:
+        if hasattr(self, "temp_base_var"):
+            value = self.temp_base_var.get().strip()
+            if value:
+                return Path(value)
         if setting is not None:
             try:
                 temp_base = getattr(setting, "TEMP_BASE", None)
@@ -1097,44 +1438,170 @@ class LibraryGUIApp:
         except Exception:
             return default
 
+    def _setting_str(self, name: str, default: str) -> str:
+        if setting is None:
+            return str(default)
+        try:
+            return fix_mojibake(str(getattr(setting, name, default)))
+        except Exception:
+            return str(default)
+
+    def _setting_choice(self, name: str, default: str, choices: set[str]) -> str:
+        value = self._setting_str(name, default).strip().lower()
+        return value if value in choices else default
+
+    def _setting_float(self, name: str, default: float, min_value: float = 0.0) -> float:
+        if setting is None:
+            return max(min_value, float(default))
+        try:
+            value = float(getattr(setting, name, default))
+            return max(min_value, value)
+        except Exception:
+            return max(min_value, float(default))
+
+    def _entry_int(self, name: str, default: int, min_value: int = 1) -> int:
+        var = (
+            self.worker_vars.get(name)
+            or self.lm_number_vars.get(name)
+            or self.gui_font_vars.get(name)
+        )
+        raw = var.get().strip() if var else ""
+        try:
+            value = int(raw)
+        except Exception:
+            value = int(default)
+            if var:
+                var.set(str(value))
+        value = max(min_value, value)
+        if var:
+            var.set(str(value))
+        return value
+
+    def _entry_float(self, var: tk.StringVar, default: float, min_value: float = 0.0) -> float:
+        try:
+            value = float(var.get().strip().replace(",", "."))
+        except Exception:
+            value = float(default)
+        value = max(min_value, value)
+        var.set(str(value))
+        return value
+
+    def _selected_output_language(self) -> str:
+        value = self.output_language_var.get().strip().lower()
+        if value == "auto":
+            return self.language
+        if value in {"ru", "en"}:
+            return value
+        self.output_language_var.set("auto")
+        return self.language
+
+    def _setting_value_repr(self, value: object) -> str:
+        if isinstance(value, bool):
+            return "True" if value else "False"
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, list):
+            items = ",\n".join(f"    {str(item)!r}" for item in value)
+            return "[\n" + items + (",\n" if items else "") + "]"
+        return repr(str(value))
+
+    def _save_settings_to_file(self) -> None:
+        setting_path = Path(__file__).resolve().parent / "setting.py"
+        if not setting_path.exists():
+            messagebox.showerror(self.tr("tab_settings"), self.tr("settings_save_error", error="setting.py not found"))
+            return
+        try:
+            source_dirs = [str(p) for p in lp.parse_sources_input([self.source_var.get().strip()])]
+            values: dict[str, object] = {
+                "TARGET_DIR": self.target_var.get().strip(),
+                "DUPES_DIR": self.dupes_var_path.get().strip(),
+                "NOBOOK_DIR": self.nobook_var_path.get().strip(),
+                "TEMP_BASE": self.temp_base_var.get().strip(),
+                "LM_URL": self.lm_url_var.get().strip() or lp.DEFAULT_LM_URL,
+                "LM_MODEL": self.lm_model_var.get().strip() or lp.DEFAULT_LM_MODEL,
+                "MAX_PARALLEL_ARCHIVES": self._entry_int("MAX_PARALLEL_ARCHIVES", lp.DEFAULT_MAX_PARALLEL_ARCHIVES, min_value=1),
+                "QUEUE_SIZE": self._entry_int("QUEUE_SIZE", lp.DEFAULT_QUEUE_SIZE, min_value=1),
+                "LM_TIMEOUT_SEC": self._entry_int("LM_TIMEOUT_SEC", lp.DEFAULT_LM_TIMEOUT_SEC, min_value=10),
+                "LM_INPUT_CHARS": self._entry_int("LM_INPUT_CHARS", lp.DEFAULT_LM_INPUT_CHARS, min_value=200),
+                "LM_MAX_OUTPUT_TOKENS": self._entry_int("LM_MAX_OUTPUT_TOKENS", lp.DEFAULT_LM_MAX_OUTPUT_TOKENS, min_value=40),
+                "LM_DEEP_TIMEOUT_SEC": self._entry_int("LM_DEEP_TIMEOUT_SEC", 120, min_value=10),
+                "LM_DEEP_INPUT_CHARS": self._entry_int("LM_DEEP_INPUT_CHARS", 16000, min_value=200),
+                "LM_DEEP_MAX_OUTPUT_TOKENS": self._entry_int("LM_DEEP_MAX_OUTPUT_TOKENS", 1024, min_value=40),
+                "LM_FAST_INPUT_CHARS": self._entry_int("LM_FAST_INPUT_CHARS", lp.DEFAULT_LM_FAST_INPUT_CHARS, min_value=200),
+                "LM_FAST_MAX_OUTPUT_TOKENS": self._entry_int("LM_FAST_MAX_OUTPUT_TOKENS", lp.DEFAULT_LM_FAST_MAX_OUTPUT_TOKENS, min_value=40),
+                "LM_FAST_CONFIDENCE_MIN": self._entry_float(self.lm_confidence_var, lp.DEFAULT_LM_FAST_CONFIDENCE_MIN, min_value=0.0),
+                "LM_MIN_SNIPPET_LETTERS": self._entry_int("LM_MIN_SNIPPET_LETTERS", lp.DEFAULT_LM_MIN_SNIPPET_LETTERS, min_value=1),
+                "TRANSLATE_OUTPUT_NAMES": bool(self.rename_output_var.get()),
+                "OUTPUT_LANGUAGE": self.output_language_var.get().strip().lower() or "auto",
+                "GUI_DEFAULT_LANGUAGE": self.language,
+                "GUI_WINDOW_WIDTH": self._entry_int("GUI_WINDOW_WIDTH", self.window_width, min_value=WINDOW_MIN_WIDTH),
+                "GUI_WINDOW_HEIGHT": self._entry_int("GUI_WINDOW_HEIGHT", self.window_height, min_value=WINDOW_MIN_HEIGHT),
+                "GUI_FONT_FAMILY": self.gui_font_family_var.get().strip() or "Segoe UI",
+                "UNPACK_WORKERS": self._entry_int("UNPACK_WORKERS", lp.DEFAULT_UNPACK_WORKERS, min_value=1),
+                "DETECT_WORKERS": self._entry_int("DETECT_WORKERS", lp.DEFAULT_DETECT_WORKERS, min_value=1),
+                "DEDUPE_WORKERS": self._entry_int("DEDUPE_WORKERS", lp.DEFAULT_DEDUPE_WORKERS, min_value=1),
+                "TAG_WORKERS": self._entry_int("TAG_WORKERS", lp.DEFAULT_TAG_WORKERS, min_value=1),
+                "LM_WORKERS": self._entry_int("LM_WORKERS", lp.DEFAULT_LM_WORKERS, min_value=1),
+                "RENAME_WORKERS": self._entry_int("RENAME_WORKERS", lp.DEFAULT_RENAME_WORKERS, min_value=1),
+                "PACK_WORKERS": self._entry_int("PACK_WORKERS", lp.DEFAULT_PACK_WORKERS, min_value=1),
+                "TARGET_HASH_SCAN_WORKERS": self._entry_int("TARGET_HASH_SCAN_WORKERS", lp.DEFAULT_TARGET_HASH_SCAN_WORKERS, min_value=1),
+            }
+            if source_dirs:
+                values["SOURCE_DIRS"] = source_dirs
+            for name, var in self.boolean_setting_vars.items():
+                values[name] = bool(var.get())
+            for name in self.gui_font_vars:
+                values[name] = self._entry_int(name, 10, min_value=6)
+
+            text = setting_path.read_text(encoding="utf-8")
+            updated = text
+            for name, value in values.items():
+                line = f"{name} = {self._setting_value_repr(value)}"
+                pattern = re.compile(
+                    rf"^{re.escape(name)}\s*=\s*(?:\[[\s\S]*?\]|.*)$",
+                    flags=re.MULTILINE,
+                )
+                if pattern.search(updated):
+                    updated = pattern.sub(lambda _m, line=line: line, updated, count=1)
+                else:
+                    updated = updated.rstrip() + "\n" + line + "\n"
+            setting_path.write_text(updated, encoding="utf-8")
+            self._set_status("settings_saved")
+        except Exception as exc:
+            messagebox.showerror(
+                self.tr("tab_settings"),
+                self.tr("settings_save_error", error=exc),
+            )
+
     def _c(self, key: str, fallback: str = "#000000") -> str:
         return str(self.palette.get(key, fallback))
 
     def _build_config(self) -> lp.Config:
         source_dirs = lp.parse_sources_input([self.source_var.get().strip()])
         target = Path(self.target_var.get().strip())
-        dupes = target / "Duplicates"
-        nobook = target / "NoBook"
+        dupes = Path(self.dupes_var_path.get().strip() or str(target / "Duplicates"))
+        nobook = Path(self.nobook_var_path.get().strip() or str(target / "NoBook"))
         temp_base = self._resolve_temp_base(target)
 
-        lm_url = "http://127.0.0.1:11434/v1/chat/completions"
-        lm_model = "gemma4:e4b"
-        if setting is not None:
-            lm_url = getattr(setting, "LM_URL", lm_url)
-            lm_model = getattr(setting, "LM_MODEL", lm_model)
+        lm_url = self.lm_url_var.get().strip() or lp.DEFAULT_LM_URL
+        lm_model = self.lm_model_var.get().strip() or lp.DEFAULT_LM_MODEL
 
         deep_analysis = bool(self.deep_analysis_var.get())
-        lm_timeout_sec = self._setting_int(
-            "LM_TIMEOUT_SEC", lp.DEFAULT_LM_TIMEOUT_SEC, min_value=10
-        )
-        lm_input_chars = self._setting_int(
-            "LM_INPUT_CHARS", lp.DEFAULT_LM_INPUT_CHARS, min_value=200
-        )
-        lm_max_output_tokens = self._setting_int(
-            "LM_MAX_OUTPUT_TOKENS", lp.DEFAULT_LM_MAX_OUTPUT_TOKENS, min_value=40
-        )
+        lm_timeout_sec = self._entry_int("LM_TIMEOUT_SEC", lp.DEFAULT_LM_TIMEOUT_SEC, min_value=10)
+        lm_input_chars = self._entry_int("LM_INPUT_CHARS", lp.DEFAULT_LM_INPUT_CHARS, min_value=200)
+        lm_max_output_tokens = self._entry_int("LM_MAX_OUTPUT_TOKENS", lp.DEFAULT_LM_MAX_OUTPUT_TOKENS, min_value=40)
         if deep_analysis:
             lm_timeout_sec = max(
                 lm_timeout_sec,
-                self._setting_int("LM_DEEP_TIMEOUT_SEC", 120, min_value=10),
+                self._entry_int("LM_DEEP_TIMEOUT_SEC", 120, min_value=10),
             )
             lm_input_chars = max(
                 lm_input_chars,
-                self._setting_int("LM_DEEP_INPUT_CHARS", 16000, min_value=200),
+                self._entry_int("LM_DEEP_INPUT_CHARS", 16000, min_value=200),
             )
             lm_max_output_tokens = max(
                 lm_max_output_tokens,
-                self._setting_int("LM_DEEP_MAX_OUTPUT_TOKENS", 1024, min_value=40),
+                self._entry_int("LM_DEEP_MAX_OUTPUT_TOKENS", 1024, min_value=40),
             )
 
         return lp.Config(
@@ -1145,54 +1612,37 @@ class LibraryGUIApp:
             temp_base=temp_base,
             lm_url=lm_url,
             lm_model=lm_model,
-            queue_size=self._setting_int("QUEUE_SIZE", lp.DEFAULT_QUEUE_SIZE, min_value=1),
-            unpack_workers=self._setting_int(
-                "UNPACK_WORKERS", lp.DEFAULT_UNPACK_WORKERS, min_value=1
-            ),
-            detect_workers=self._setting_int(
-                "DETECT_WORKERS", lp.DEFAULT_DETECT_WORKERS, min_value=1
-            ),
-            dedupe_workers=self._setting_int(
-                "DEDUPE_WORKERS", lp.DEFAULT_DEDUPE_WORKERS, min_value=1
-            ),
-            tag_workers=self._setting_int("TAG_WORKERS", lp.DEFAULT_TAG_WORKERS, min_value=1),
-            lm_workers=self._setting_int("LM_WORKERS", lp.DEFAULT_LM_WORKERS, min_value=1),
-            rename_workers=self._setting_int(
-                "RENAME_WORKERS", lp.DEFAULT_RENAME_WORKERS, min_value=1
-            ),
-            pack_workers=self._setting_int("PACK_WORKERS", lp.DEFAULT_PACK_WORKERS, min_value=1),
-            max_parallel_archives=self._setting_int(
-                "MAX_PARALLEL_ARCHIVES", lp.DEFAULT_MAX_PARALLEL_ARCHIVES, min_value=1
-            ),
+            queue_size=self._entry_int("QUEUE_SIZE", lp.DEFAULT_QUEUE_SIZE, min_value=1),
+            unpack_workers=self._entry_int("UNPACK_WORKERS", lp.DEFAULT_UNPACK_WORKERS, min_value=1),
+            detect_workers=self._entry_int("DETECT_WORKERS", lp.DEFAULT_DETECT_WORKERS, min_value=1),
+            dedupe_workers=self._entry_int("DEDUPE_WORKERS", lp.DEFAULT_DEDUPE_WORKERS, min_value=1),
+            tag_workers=self._entry_int("TAG_WORKERS", lp.DEFAULT_TAG_WORKERS, min_value=1),
+            lm_workers=self._entry_int("LM_WORKERS", lp.DEFAULT_LM_WORKERS, min_value=1),
+            rename_workers=self._entry_int("RENAME_WORKERS", lp.DEFAULT_RENAME_WORKERS, min_value=1),
+            pack_workers=self._entry_int("PACK_WORKERS", lp.DEFAULT_PACK_WORKERS, min_value=1),
+            max_parallel_archives=self._entry_int("MAX_PARALLEL_ARCHIVES", lp.DEFAULT_MAX_PARALLEL_ARCHIVES, min_value=1),
             delete_source_after_pack=not self.keep_sources_var.get(),
             keep_temp_nobooks=False,
             lm_timeout_sec=lm_timeout_sec,
             lm_input_chars=lm_input_chars,
             lm_max_output_tokens=lm_max_output_tokens,
-            lm_fast_precheck=False if deep_analysis else lp.DEFAULT_LM_FAST_PRECHECK,
-            lm_force_full_metadata=deep_analysis,
+            lm_fast_precheck=False if deep_analysis else bool(self.boolean_setting_vars["LM_FAST_PRECHECK"].get()),
+            lm_fast_input_chars=self._entry_int("LM_FAST_INPUT_CHARS", lp.DEFAULT_LM_FAST_INPUT_CHARS, min_value=200),
+            lm_fast_max_output_tokens=self._entry_int("LM_FAST_MAX_OUTPUT_TOKENS", lp.DEFAULT_LM_FAST_MAX_OUTPUT_TOKENS, min_value=40),
+            lm_fast_confidence_min=self._entry_float(
+                self.lm_confidence_var, lp.DEFAULT_LM_FAST_CONFIDENCE_MIN, min_value=0.0
+            ),
+            lm_force_full_metadata=deep_analysis or bool(self.boolean_setting_vars["LM_FORCE_FULL_METADATA"].get()),
             lm_fill_unknown_author=deep_analysis
-            or self._setting_bool(
-                "LM_FILL_UNKNOWN_AUTHOR", getattr(lp, "DEFAULT_LM_FILL_UNKNOWN_AUTHOR", False)
-            ),
-            lm_always_try_without_snippet=self._setting_bool(
-                "LM_ALWAYS_TRY_WITHOUT_SNIPPET", lp.DEFAULT_LM_ALWAYS_TRY_WITHOUT_SNIPPET
-            ),
-            lm_strict_json_mode=self._setting_bool(
-                "LM_STRICT_JSON_MODE", lp.DEFAULT_LM_STRICT_JSON_MODE
-            ),
-            lm_min_snippet_letters=self._setting_int(
-                "LM_MIN_SNIPPET_LETTERS", lp.DEFAULT_LM_MIN_SNIPPET_LETTERS, min_value=1
-            ),
-            seed_hashes_from_target=self._setting_bool(
-                "SEED_HASHES_FROM_TARGET", lp.DEFAULT_SEED_HASHES_FROM_TARGET
-            ),
-            target_hash_scan_workers=self._setting_int(
-                "TARGET_HASH_SCAN_WORKERS", lp.DEFAULT_TARGET_HASH_SCAN_WORKERS, min_value=1
-            ),
-            isbn_lookup=self._setting_bool("ISBN_LOOKUP", lp.DEFAULT_ISBN_LOOKUP),
+            or bool(self.boolean_setting_vars["LM_FILL_UNKNOWN_AUTHOR"].get()),
+            lm_always_try_without_snippet=bool(self.boolean_setting_vars["LM_ALWAYS_TRY_WITHOUT_SNIPPET"].get()),
+            lm_strict_json_mode=bool(self.boolean_setting_vars["LM_STRICT_JSON_MODE"].get()),
+            lm_min_snippet_letters=self._entry_int("LM_MIN_SNIPPET_LETTERS", lp.DEFAULT_LM_MIN_SNIPPET_LETTERS, min_value=1),
+            seed_hashes_from_target=bool(self.boolean_setting_vars["SEED_HASHES_FROM_TARGET"].get()),
+            target_hash_scan_workers=self._entry_int("TARGET_HASH_SCAN_WORKERS", lp.DEFAULT_TARGET_HASH_SCAN_WORKERS, min_value=1),
+            isbn_lookup=bool(self.boolean_setting_vars["ISBN_LOOKUP"].get()),
             translate_output_names=bool(self.rename_output_var.get()),
-            output_language=self.language,
+            output_language=self._selected_output_language(),
             ephemeral_mode=True,
         )
 

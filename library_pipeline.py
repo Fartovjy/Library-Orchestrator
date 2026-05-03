@@ -83,6 +83,8 @@ DEFAULT_SOURCE_DIRS = _default_source_dirs()
 DEFAULT_TARGET_DIR = getattr(setting, "TARGET_DIR", r"E:\Sorted_Library")
 DEFAULT_DUPES_DIR = getattr(setting, "DUPES_DIR", r"E:\Sorted_Library\Duplicates")
 DEFAULT_NOBOOK_DIR = getattr(setting, "NOBOOK_DIR", r"E:\Sorted_Library\NoBook")
+DEFAULT_LM_URL = getattr(setting, "LM_URL", "http://127.0.0.1:11434/v1/chat/completions")
+DEFAULT_LM_MODEL = getattr(setting, "LM_MODEL", "gemma4:e4b")
 _temp_from_setting = getattr(setting, "TEMP_BASE", None)
 if _temp_from_setting:
     DEFAULT_TEMP_BASE = _temp_from_setting
@@ -370,8 +372,8 @@ class Config:
     dupes_dir: Path = Path(DEFAULT_DUPES_DIR)
     nobook_dir: Path = Path(DEFAULT_NOBOOK_DIR)
     temp_base: Path = Path(DEFAULT_TEMP_BASE)
-    lm_url: str = "http://127.0.0.1:11434/v1/chat/completions"
-    lm_model: str = "gemma4:e4b"
+    lm_url: str = DEFAULT_LM_URL
+    lm_model: str = DEFAULT_LM_MODEL
     queue_size: int = DEFAULT_QUEUE_SIZE
     unpack_workers: int = DEFAULT_UNPACK_WORKERS
     detect_workers: int = DEFAULT_DETECT_WORKERS
