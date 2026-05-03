@@ -27,6 +27,7 @@ def _detect_loop(self, worker_idx: int) -> None:
             if is_book_file:
                 task.is_book_candidate = True
                 self._mark_archive_has_book(task.archive_source)
+                self._register_archive_book(task.archive_source)
                 if not task.book_seen_counted:
                     task.book_seen_counted = True
                     self.metrics.mark_book_seen()

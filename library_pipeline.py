@@ -1775,6 +1775,8 @@ class LibrarySorter:
         self._archive_pending: dict[Path, int] = defaultdict(int)
         self._archive_failed: set[Path] = set()
         self._archive_has_book: set[Path] = set()
+        self._archive_book_total: dict[Path, int] = defaultdict(int)
+        self._archive_book_packed: dict[Path, int] = defaultdict(int)
 
         self.q12 = queue.Queue()
         self.q23 = queue.Queue(maxsize=config.queue_size)
@@ -2375,42 +2377,87 @@ class LibrarySorter:
         except Exception as exc:
             self.logger.warning("Не удалось удалить исходник %s: %s", task.path, exc)
 
-        self._mark_archive_progress(task, result)
         self.temp_tracker.release(task.cleanup_root)
+        self._mark_archive_progress(task, result)
         self.metrics.mark_task_done(result)
         if task.is_book_candidate and not task.book_done_counted:
             task.book_done_counted = True
             self.metrics.mark_book_done(result)
 
     def _source_delete_after_pack_is_safe(self, task: FileTask) -> bool:
-        if not task.dest_zip or not task.dest_zip.exists() or not task.dest_zip.is_file():
-            return False
         try:
             source_path = task.path.resolve(strict=False)
-            dest_path = task.dest_zip.resolve(strict=False)
-            target_dir = self.config.target_dir.resolve(strict=False)
-            if source_path == dest_path:
-                self.logger.warning(
-                    "Source delete skipped: source and destination are the same path=%s",
-                    task.path,
-                )
-                return False
-            dest_path.relative_to(target_dir)
         except Exception:
             self.logger.warning(
-                "Source delete skipped: packed destination is outside target source=%s dest=%s target=%s",
+                "Source delete skipped: cannot resolve source=%s",
+                task.path,
+            )
+            return False
+        if task.dest_zip:
+            try:
+                if source_path == task.dest_zip.resolve(strict=False):
+                    self.logger.warning(
+                        "Source delete skipped: source and destination are the same path=%s",
+                        task.path,
+                    )
+                    return False
+            except Exception:
+                return False
+        if not self._source_file_is_delete_candidate(task.path):
+            return False
+        return self._packed_output_is_verified(task)
+
+    def _source_file_is_delete_candidate(self, path: Path) -> bool:
+        if not path.exists() or not path.is_file():
+            return False
+        if path.is_symlink():
+            self.logger.warning("Source delete skipped: symlink source=%s", path)
+            return False
+        try:
+            source_path = path.resolve(strict=False)
+        except Exception:
+            return False
+        for source_dir in self.config.source_dirs:
+            try:
+                source_path.relative_to(source_dir.resolve(strict=False))
+                return True
+            except Exception:
+                continue
+        self.logger.warning("Source delete skipped: outside SOURCE_DIRS path=%s", path)
+        return False
+
+    def _packed_output_is_verified(self, task: FileTask) -> bool:
+        if not task.dest_zip or not task.dest_zip.exists() or not task.dest_zip.is_file():
+            self.logger.warning(
+                "Pack verification failed: destination missing source=%s dest=%s",
+                task.path,
+                task.dest_zip or "",
+            )
+            return False
+        try:
+            task.dest_zip.resolve(strict=False).relative_to(
+                self.config.target_dir.resolve(strict=False)
+            )
+        except Exception:
+            self.logger.warning(
+                "Pack verification failed: destination outside target source=%s dest=%s target=%s",
                 task.path,
                 task.dest_zip,
                 self.config.target_dir,
             )
             return False
         if not task.xxh64:
+            self.logger.warning(
+                "Pack verification failed: missing source hash source=%s dest=%s",
+                task.path,
+                task.dest_zip,
+            )
             return False
         try:
             packed_hash, note = xxh64_zip_payload(task.dest_zip)
         except Exception as exc:
             self.logger.warning(
-                "Source delete skipped: cannot hash packed payload source=%s dest=%s error=%s",
+                "Pack verification failed: cannot hash packed payload source=%s dest=%s error=%s",
                 task.path,
                 task.dest_zip,
                 exc,
@@ -2418,7 +2465,7 @@ class LibrarySorter:
             return False
         if packed_hash != task.xxh64:
             self.logger.warning(
-                "Source delete skipped: packed hash mismatch source=%s dest=%s expected=%s got=%s note=%s",
+                "Pack verification failed: packed hash mismatch source=%s dest=%s expected=%s got=%s note=%s",
                 task.path,
                 task.dest_zip,
                 task.xxh64,
@@ -2562,6 +2609,12 @@ class LibrarySorter:
         with self._archive_state_lock:
             self._archive_has_book.add(archive_path)
 
+    def _register_archive_book(self, archive_path: Optional[Path]) -> None:
+        if not archive_path:
+            return
+        with self._archive_state_lock:
+            self._archive_book_total[archive_path] += 1
+
     def _preserve_archive_source(self, archive_path: Optional[Path]) -> None:
         if not archive_path:
             return
@@ -2580,9 +2633,19 @@ class LibrarySorter:
             return
 
         action = ""
+        book_verified = True
+        if task.is_book_candidate:
+            book_verified = result == "packed" and self._packed_output_is_verified(task)
+
         with self._archive_state_lock:
             if archive_path not in self._archive_pending:
                 return
+
+            if task.is_book_candidate:
+                if book_verified:
+                    self._archive_book_packed[archive_path] += 1
+                else:
+                    self._archive_failed.add(archive_path)
 
             if result == "failed":
                 self._archive_failed.add(archive_path)
@@ -2594,12 +2657,37 @@ class LibrarySorter:
             if pending <= 0:
                 del self._archive_pending[archive_path]
                 has_book = archive_path in self._archive_has_book
+                book_total = self._archive_book_total.pop(archive_path, 0)
+                book_packed = self._archive_book_packed.pop(archive_path, 0)
                 self._archive_has_book.discard(archive_path)
                 self._archive_failed.discard(archive_path)
                 if not failed and self.config.delete_source_after_pack:
-                    action = "preserve_archive" if has_book else "move_nobook"
+                    if has_book and book_total > 0 and book_packed == book_total:
+                        action = "delete_archive"
+                    elif has_book:
+                        action = "preserve_archive"
+                    else:
+                        action = "move_nobook"
 
-        if action == "preserve_archive" and archive_path.exists():
+        if action == "delete_archive" and archive_path.exists():
+            if self._source_file_is_delete_candidate(archive_path):
+                try:
+                    archive_path.unlink(missing_ok=True)
+                    self.metrics.add_event(
+                        f"Source archive removed after verified books: {archive_path.name}"
+                    )
+                    self.logger.info(
+                        "Source archive removed after verified books: %s", archive_path
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        "Не удалось удалить исходный архив %s: %s", archive_path, exc
+                    )
+            else:
+                self.logger.warning(
+                    "Source archive delete skipped: unsafe source archive=%s", archive_path
+                )
+        elif action == "preserve_archive" and archive_path.exists():
             self.logger.info("Source archive preserved after pipeline: %s", archive_path)
             self.metrics.add_event(f"Source archive preserved: {archive_path.name}")
         elif action == "move_nobook" and archive_path.exists():
