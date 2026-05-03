@@ -121,6 +121,11 @@ DEFAULT_TARGET_HASH_SCAN_WORKERS = int(
     getattr(setting, "TARGET_HASH_SCAN_WORKERS", max(2, min(8, os.cpu_count() or 4)))
 )
 DEFAULT_ISBN_LOOKUP = bool(getattr(setting, "ISBN_LOOKUP", True))
+DEFAULT_TRANSLATE_OUTPUT_NAMES = bool(
+    getattr(setting, "TRANSLATE_OUTPUT_NAMES", False)
+)
+DEFAULT_OUTPUT_LANGUAGE = str(getattr(setting, "OUTPUT_LANGUAGE", "auto")).strip().lower()
+DEFAULT_GUI_LANGUAGE = str(getattr(setting, "GUI_DEFAULT_LANGUAGE", "ru")).strip().lower()
 
 ARCHIVE_EXTENSIONS = {
     ".zip",
@@ -393,6 +398,8 @@ class Config:
     seed_hashes_from_target: bool = DEFAULT_SEED_HASHES_FROM_TARGET
     target_hash_scan_workers: int = DEFAULT_TARGET_HASH_SCAN_WORKERS
     isbn_lookup: bool = DEFAULT_ISBN_LOOKUP
+    translate_output_names: bool = DEFAULT_TRANSLATE_OUTPUT_NAMES
+    output_language: str = DEFAULT_OUTPUT_LANGUAGE
     ephemeral_mode: bool = True
 
 
@@ -1504,6 +1511,119 @@ class LMStudioClient:
         except Exception as exc:
             self.logger.warning("Ollama genre-only недоступен: %s", exc)
             return None
+
+    def translate_output_metadata(
+        self,
+        task: FileTask,
+        md: Metadata,
+        target_language: str,
+    ) -> dict[str, str]:
+        lang = normalize_output_language(target_language)
+        original_title = clean_text(md.title or task.path.stem)
+        original_author = clean_text(md.author or "Unknown Author")
+        canonical_genre = normalize_genre(md.genre or "Unknown")
+        translated: dict[str, str] = {
+            "genre": translate_genre_for_output(canonical_genre, lang),
+        }
+
+        if not self.available:
+            self.logger.warning("LM rename unavailable: requests import failed")
+            return translated
+
+        payload_seed = {
+            "schema": "output_name_translation_v1",
+            "target_language": lang,
+            "title": original_title,
+            "author": original_author,
+            "genre": canonical_genre,
+        }
+        cache_key = "rename:" + xxhash.xxh64(
+            json.dumps(payload_seed, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        cached = self.db.get_lm_cache(cache_key)
+        if cached:
+            self.logger.info("LM rename cache_hit path=%s key=%s", task.path, cache_key[:16])
+            return {str(k): str(v) for k, v in cached.items() if v}
+
+        target_name = "Russian" if lang == "ru" else "English"
+        system_prompt = (
+            "You are a careful library catalog translator. "
+            f"Translate output display names to {target_name}. "
+            "Return only a valid JSON object with keys title and author. "
+            "Do not add explanations. Preserve volume numbers, part numbers, editions, "
+            "technical abbreviations, ISBNs and series markers. "
+            "For authors, use the established name in the target language when it is well known; "
+            "otherwise transliterate. Do not invent missing metadata."
+        )
+        user_prompt = (
+            f"Target language: {target_name}\n"
+            f"Title: {original_title}\n"
+            f"Author: {original_author}\n"
+            f"Genre: {canonical_genre}\n"
+            f"Filename: {task.path.name}\n"
+            "Return JSON exactly like: {\"title\":\"...\",\"author\":\"...\"}"
+        )
+        request_payload = {
+            "model": self.config.lm_model,
+            "temperature": 0.0,
+            "max_tokens": min(160, self.config.lm_max_output_tokens),
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        try:
+            self.metrics.mark_lm_stat("rename_request")
+            resp, req_mode = self._post_chat(
+                request_payload, timeout=(6, self.config.lm_timeout_sec)
+            )
+            if resp.status_code >= 400:
+                self.logger.warning(
+                    "LM rename HTTP %s mode=%s path=%s body=%s",
+                    resp.status_code,
+                    req_mode,
+                    task.path,
+                    self._response_error_brief(resp),
+                )
+                self.metrics.mark_lm_stat("rename_no_result")
+                return translated
+
+            data = resp.json()
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            parsed = parse_model_payload(content)
+            if not parsed:
+                self.logger.warning(
+                    "LM rename non-json path=%s raw=%s",
+                    task.path,
+                    truncate(clean_text(content), 180),
+                )
+                self.metrics.mark_lm_stat("rename_no_result")
+                return translated
+
+            title = clean_text(parsed.get("title", ""))
+            author = clean_text(parsed.get("author", ""))
+            if title and not self._is_unknown_title(title):
+                translated["title"] = title
+            if author and not self._is_unknown_author(author):
+                translated["author"] = author
+            self.db.set_lm_cache(cache_key, translated)
+            self.metrics.mark_lm_stat("rename_ok")
+            self.logger.info(
+                "LM rename parsed path=%s lang=%s payload=%s",
+                task.path,
+                lang,
+                json.dumps(translated, ensure_ascii=False),
+            )
+            return translated
+        except Exception as exc:
+            self.metrics.mark_lm_stat("rename_no_result")
+            self.logger.warning("Ollama rename недоступен: %s", exc)
+            return translated
 
 
 class TerminalUI:
@@ -2970,10 +3090,24 @@ class LibrarySorter:
     def _build_destination(self, task: FileTask) -> Path:
         md = task.metadata
         md.genre = normalize_genre(md.genre or "Unknown")
-        genre = sanitize_component(md.genre or "Unknown", max_len=48)
-        author = sanitize_component(md.author or "Unknown Author", max_len=64)
+        output_language = normalize_output_language(self.config.output_language)
+        title_value = md.title or task.path.stem
+        author_value = md.author or "Unknown Author"
+        genre_value = md.genre or "Unknown"
+        if self.config.translate_output_names:
+            translated = self.lm_client.translate_output_metadata(
+                task, md, output_language
+            )
+            title_value = translated.get("title") or title_value
+            author_value = translated.get("author") or author_value
+            genre_value = translated.get("genre") or translate_genre_for_output(
+                genre_value, output_language
+            )
+
+        genre = sanitize_component(genre_value, max_len=48)
+        author = sanitize_component(author_value, max_len=64)
         first = first_letter(author)
-        title = sanitize_component(md.title or task.path.stem, max_len=110)
+        title = sanitize_component(title_value, max_len=110)
 
         for _ in range(6):
             out_dir = self.config.target_dir / genre / first / author
@@ -3884,6 +4018,55 @@ CANONICAL_GENRES = (
 )
 
 
+GENRE_OUTPUT_TRANSLATIONS_EN = {
+    "Фантастика": "Science Fiction",
+    "Фэнтези": "Fantasy",
+    "Детективы и триллеры": "Mystery and Thrillers",
+    "Романы": "Romance",
+    "Детская литература": "Children's Literature",
+    "Поэзия": "Poetry",
+    "Художественная литература": "Fiction",
+    "История": "History",
+    "Военное дело": "Military",
+    "Политика и право": "Politics and Law",
+    "Экономика и бизнес": "Business and Economics",
+    "Наука": "Science",
+    "Техника": "Engineering and Technology",
+    "Программирование и IT": "Programming and IT",
+    "Медицина и здоровье": "Medicine and Health",
+    "Биология и природа": "Biology and Nature",
+    "Сельское хозяйство и садоводство": "Agriculture and Gardening",
+    "Дом, хобби и ремесла": "Home, Hobbies and Crafts",
+    "Кулинария": "Cooking",
+    "Искусство и дизайн": "Art and Design",
+    "Религия и философия": "Religion and Philosophy",
+    "Психология и саморазвитие": "Psychology and Self-Development",
+    "Языкознание": "Language and Linguistics",
+    "Образование": "Education",
+    "Справочники и энциклопедии": "References and Encyclopedias",
+    "Путешествия и география": "Travel and Geography",
+    "Спорт": "Sports",
+    "Документальная литература": "Nonfiction",
+    "Unknown": "Unknown",
+}
+
+
+def normalize_output_language(language: str) -> str:
+    lang = clean_text(language).lower()
+    if lang == "auto":
+        lang = DEFAULT_GUI_LANGUAGE
+    if lang.startswith("en"):
+        return "en"
+    return "ru"
+
+
+def translate_genre_for_output(genre: str, target_language: str) -> str:
+    canonical = normalize_genre(genre or "Unknown")
+    if normalize_output_language(target_language) == "en":
+        return GENRE_OUTPUT_TRANSLATIONS_EN.get(canonical, canonical)
+    return canonical
+
+
 GENRE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Справочники и энциклопедии", ("энциклоп", "encyclop", "справоч", "reference", "dictionary", "словар")),
     ("Программирование и IT", ("programming", "software", "computer science", "network", "firewall", "embedded", "algorithm", "information theory", "алгоритм", "программ", "компьютер", "it_")),
@@ -4396,6 +4579,25 @@ def parse_args() -> Config:
         help="Не искать метаданные по ISBN через Open Library.",
     )
     p.add_argument(
+        "--rename-output",
+        dest="rename_output",
+        action="store_true",
+        default=DEFAULT_TRANSLATE_OUTPUT_NAMES,
+        help="Переводить финальные имена папок и ZIP под выбранный язык.",
+    )
+    p.add_argument(
+        "--no-rename-output",
+        dest="rename_output",
+        action="store_false",
+        help="Не переводить финальные имена папок и ZIP.",
+    )
+    p.add_argument(
+        "--output-language",
+        choices=("auto", "ru", "en"),
+        default=DEFAULT_OUTPUT_LANGUAGE if DEFAULT_OUTPUT_LANGUAGE in {"auto", "ru", "en"} else "auto",
+        help="Язык финальных имен при --rename-output.",
+    )
+    p.add_argument(
         "--persist-state",
         action="store_true",
         help="Сохранять служебную БД/логи после завершения (по умолчанию удаляются).",
@@ -4431,6 +4633,8 @@ def parse_args() -> Config:
         lm_input_chars=max(200, args.lm_input_chars),
         lm_max_output_tokens=max(40, args.lm_max_output_tokens),
         isbn_lookup=DEFAULT_ISBN_LOOKUP and not args.no_isbn_lookup,
+        translate_output_names=bool(args.rename_output),
+        output_language=args.output_language,
         ephemeral_mode=not args.persist_state,
     )
 

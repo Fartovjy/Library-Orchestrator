@@ -322,6 +322,11 @@ class LibraryGUIApp:
         self.shutdown_after_done_var = tk.BooleanVar(value=False)
         self.keep_sources_var = tk.BooleanVar(value=False)
         self.deep_analysis_var = tk.BooleanVar(value=False)
+        self.rename_output_var = tk.BooleanVar(
+            value=self._setting_bool(
+                "TRANSLATE_OUTPUT_NAMES", lp.DEFAULT_TRANSLATE_OUTPUT_NAMES
+            )
+        )
 
         self.agent_processed: dict[str, tk.StringVar] = {}
         self.agent_errors: dict[str, tk.StringVar] = {}
@@ -429,6 +434,8 @@ class LibraryGUIApp:
             self.keep_sources_check.configure(text=self.tr("keep_sources"))
         if hasattr(self, "deep_analysis_check"):
             self.deep_analysis_check.configure(text=self.tr("deep_analysis"))
+        if hasattr(self, "rename_output_check"):
+            self.rename_output_check.configure(text=self.tr("rename_output"))
 
         self._render_events(self.last_snapshot)
 
@@ -914,6 +921,19 @@ class LibraryGUIApp:
         )
         self.deep_analysis_check.pack(side=tk.RIGHT, anchor="se", padx=(0, 12))
 
+        self.rename_output_check = tk.Checkbutton(
+            footer_controls,
+            text=self.tr("rename_output"),
+            variable=self.rename_output_var,
+            font=self.font_legend,
+            bg=self._c("ctrl_bg"),
+            fg=self._c("text_secondary"),
+            activebackground=self._c("ctrl_bg"),
+            activeforeground=self._c("text_primary"),
+            selectcolor=self._c("ctrl_bg"),
+        )
+        self.rename_output_check.pack(side=tk.RIGHT, anchor="se", padx=(0, 12))
+
     def _apply_initial_dirs(self) -> None:
         # SOURCE_DIRS не подставляем автоматически при старте.
         self.source_var.set("")
@@ -1171,6 +1191,8 @@ class LibraryGUIApp:
                 "TARGET_HASH_SCAN_WORKERS", lp.DEFAULT_TARGET_HASH_SCAN_WORKERS, min_value=1
             ),
             isbn_lookup=self._setting_bool("ISBN_LOOKUP", lp.DEFAULT_ISBN_LOOKUP),
+            translate_output_names=bool(self.rename_output_var.get()),
+            output_language=self.language,
             ephemeral_mode=True,
         )
 

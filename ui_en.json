@@ -31,6 +31,7 @@
   "shutdown_after_done": "⏻ Shut down PC when done",
   "keep_sources": "Keep sources",
   "deep_analysis": "Deep analysis",
+  "rename_output": "Rename",
   "mode_IDLE": "Idle",
   "mode_INIT": "Preparing",
   "mode_RUNNING": "Running",

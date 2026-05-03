@@ -31,6 +31,7 @@
   "shutdown_after_done": "⏻ Выключить ПК после завершения",
   "keep_sources": "Не удалять исходники",
   "deep_analysis": "Глубокий анализ",
+  "rename_output": "Переименование",
   "mode_IDLE": "Ожидание",
   "mode_INIT": "Подготовка",
   "mode_RUNNING": "Работает",
