@@ -2383,12 +2383,26 @@ class LibrarySorter:
             self.metrics.mark_book_done(result)
 
     def _source_delete_after_pack_is_safe(self, task: FileTask) -> bool:
-        if not task.dest_zip or not task.dest_zip.exists():
+        if not task.dest_zip or not task.dest_zip.exists() or not task.dest_zip.is_file():
             return False
         try:
-            if task.path.resolve(strict=False) == task.dest_zip.resolve(strict=False):
+            source_path = task.path.resolve(strict=False)
+            dest_path = task.dest_zip.resolve(strict=False)
+            target_dir = self.config.target_dir.resolve(strict=False)
+            if source_path == dest_path:
+                self.logger.warning(
+                    "Source delete skipped: source and destination are the same path=%s",
+                    task.path,
+                )
                 return False
+            dest_path.relative_to(target_dir)
         except Exception:
+            self.logger.warning(
+                "Source delete skipped: packed destination is outside target source=%s dest=%s target=%s",
+                task.path,
+                task.dest_zip,
+                self.config.target_dir,
+            )
             return False
         if not task.xxh64:
             return False
@@ -2583,16 +2597,11 @@ class LibrarySorter:
                 self._archive_has_book.discard(archive_path)
                 self._archive_failed.discard(archive_path)
                 if not failed and self.config.delete_source_after_pack:
-                    action = "delete" if has_book else "move_nobook"
+                    action = "preserve_archive" if has_book else "move_nobook"
 
-        if action == "delete" and archive_path.exists():
-            try:
-                archive_path.unlink(missing_ok=True)
-                self.metrics.add_event(f"Source archive removed after pipeline: {archive_path.name}")
-            except Exception as exc:
-                self.logger.warning(
-                    "Не удалось удалить исходный архив %s: %s", archive_path, exc
-                )
+        if action == "preserve_archive" and archive_path.exists():
+            self.logger.info("Source archive preserved after pipeline: %s", archive_path)
+            self.metrics.add_event(f"Source archive preserved: {archive_path.name}")
         elif action == "move_nobook" and archive_path.exists():
             try:
                 dst = self._move_source_to_nobook(
