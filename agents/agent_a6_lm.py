@@ -21,7 +21,8 @@ def _lm_loop(self, worker_idx: int) -> None:
                 break
             continue
         try:
-            self.metrics.set_active_item("A6", active_slot, task.path.name)
+            display_name = display_task_name(task)
+            self.metrics.set_active_item("A6", active_slot, display_name)
             self.metrics.mark_stage("A6")
             decision = self._lm_decision(task.metadata)
             self.logger.info(
@@ -66,11 +67,11 @@ def _lm_loop(self, worker_idx: int) -> None:
                             task, max_chars=self.config.lm_input_chars
                         )
                         lm_input_mode = "fallback_context"
-                        self.metrics.add_event(f"LM fallback-context: {task.path.name}")
+                        self.metrics.add_event(f"LM fallback-context: {display_name}")
                     else:
                         lm_input = ""
                         lm_input_mode = "none"
-                        self.metrics.add_event(f"LM skip(no text): {task.path.name}")
+                        self.metrics.add_event(f"LM skip(no text): {display_name}")
                     self.logger.info(
                         "A6 full_input path=%s mode=%s chars=%d",
                         task.path,

@@ -43,7 +43,8 @@ def _extract_metadata(self, task: FileTask) -> Metadata:
     ext = suffix_lower(task.path)
 
     # 1) Имя файла
-    parsed = parse_filename(task.path.stem)
+    filename_stem = display_path_name(task.path).rsplit(".", 1)[0]
+    parsed = parse_filename(filename_stem)
     if parsed.get("title"):
         md.title = parsed["title"]
         md.source = "filename"
@@ -58,7 +59,7 @@ def _extract_metadata(self, task: FileTask) -> Metadata:
     try:
         if ext == ".epub":
             fmt_tags = extract_epub_metadata(task.path)
-        elif ext == ".fb2":
+        elif ext in {".fb2", ".fb2.zip"}:
             fmt_tags = extract_fb2_metadata(task.path)
         elif ext in {".docx"}:
             fmt_tags = extract_docx_metadata(task.path)
