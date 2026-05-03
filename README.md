@@ -16,6 +16,7 @@ TARGET_DIR\Жанр\Первая буква автора\Автор\Книга.z
 run.py                Точка входа GUI
 ui.py                 Tkinter-интерфейс
 library_pipeline.py   Основной многопоточный конвейер
+agents/               Реализация рабочих агентов A1-A8
 setting.py            Пути, воркеры, Ollama и настройки GUI
 ui_ru.json            Русские строки интерфейса
 ui_en.json            Английские строки интерфейса
@@ -24,7 +25,18 @@ logs/                 Логи запусков
 db/                   Служебные данные, если используются
 ```
 
-`run.py` намеренно маленький: он создает окно и запускает интерфейс из `ui.py`. Вся логика сортировки находится в `library_pipeline.py`.
+`run.py` намеренно маленький: он создает окно и запускает интерфейс из `ui.py`. `library_pipeline.py` содержит общую инфраструктуру конвейера, БД, метрики и подключение агентов. Рабочая логика стадий вынесена в отдельные файлы:
+
+```text
+agents/agent_a1_search.py    A1 Поиск
+agents/agent_a2_unpack.py    A2 Распаковка
+agents/agent_a3_detect.py    A3 Книга?
+agents/agent_a4_dedupe.py    A4 XXH64 и дубликаты
+agents/agent_a5_tags.py      A5 Теги и первичные метаданные
+agents/agent_a6_lm.py        A6 Ollama
+agents/agent_a7_rename.py    A7 Переименование и путь назначения
+agents/agent_a8_pack.py      A8 Упаковка
+```
 
 ## Быстрый Старт
 
