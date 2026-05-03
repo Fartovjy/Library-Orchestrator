@@ -120,6 +120,7 @@ DEFAULT_SEED_HASHES_FROM_TARGET = bool(getattr(setting, "SEED_HASHES_FROM_TARGET
 DEFAULT_TARGET_HASH_SCAN_WORKERS = int(
     getattr(setting, "TARGET_HASH_SCAN_WORKERS", max(2, min(8, os.cpu_count() or 4)))
 )
+DEFAULT_ISBN_LOOKUP = bool(getattr(setting, "ISBN_LOOKUP", True))
 
 ARCHIVE_EXTENSIONS = {
     ".zip",
@@ -391,6 +392,7 @@ class Config:
     lm_min_snippet_letters: int = DEFAULT_LM_MIN_SNIPPET_LETTERS
     seed_hashes_from_target: bool = DEFAULT_SEED_HASHES_FROM_TARGET
     target_hash_scan_workers: int = DEFAULT_TARGET_HASH_SCAN_WORKERS
+    isbn_lookup: bool = DEFAULT_ISBN_LOOKUP
     ephemeral_mode: bool = True
 
 
@@ -1114,7 +1116,13 @@ class LMStudioClient:
             self.logger.info("LM fast cache_hit path=%s key=%s", task.path, cache_key[:10])
             return cached
 
-        system_prompt = """РОЛЬ И ЗАДАЧА: Ты — машина для быстрой предварительной каталогизации книги. Используй только имя файла, путь, цепочку архивов и уже найденные метаданные. Не выдумывай. Если в каком-то поле нет уверенности, верни Unknown. Не добавляй никаких пояснений, только чистый JSON.
+        genre_list = ", ".join(CANONICAL_GENRES)
+        system_prompt = (
+            "РОЛЬ И ЗАДАЧА: Ты — машина для быстрой предварительной каталогизации книги. "
+            "Используй только имя файла, путь, цепочку архивов и уже найденные метаданные. "
+            "Не выдумывай. Если в каком-то поле нет уверенности, верни Unknown. "
+            f"Жанр выбирай только из списка: {genre_list}. "
+            """Не добавляй никаких пояснений, только чистый JSON.
 
 ПРИМЕР ВЫВОДА:
 {
@@ -1130,6 +1138,7 @@ class LMStudioClient:
     }
   ]
 }"""
+        )
         user_prompt = (
             "БЫСТРЫЙ КОНТЕКСТ КНИГИ:\n"
             f"Имя файла: {task.path.name}\n"
@@ -1246,7 +1255,12 @@ class LMStudioClient:
             self.logger.info("LM full cache_hit path=%s key=%s", task.path, cache_key[:10])
             return cached
 
-        system_prompt = """РОЛЬ И ЗАДАЧА: Ты — машина для категоризации литературных произведений. Твоя задача — принять данные о книге и вернуть результат в строгом JSON-формате, где каждый объект описывает книгу и содержит максимально детализированный жанровый анализ. Не добавляй никаких вводных слов или заключений, только чистый JSON.
+        genre_list = ", ".join(CANONICAL_GENRES)
+        system_prompt = (
+            "РОЛЬ И ЗАДАЧА: Ты — машина для категоризации литературных произведений. "
+            "Твоя задача — принять данные о книге и вернуть результат в строгом JSON-формате. "
+            f"Жанр выбирай только из списка: {genre_list}. "
+            """Не добавляй никаких вводных слов или заключений, только чистый JSON.
 
 ПРИМЕР ВЫВОДА:
 {
@@ -1262,6 +1276,7 @@ class LMStudioClient:
     }
   ]
 }"""
+        )
         user_prompt = (
             "ДАННЫЕ О КНИГЕ:\n"
             f"Имя файла: {task.path.name}\n"
@@ -1391,6 +1406,7 @@ class LMStudioClient:
         system_prompt = (
             "Ты библиотекарь-каталогизатор. Верни ТОЛЬКО JSON без пояснений. "
             "Формат: {\"genre\":\"...\",\"confidence\":0.0}. "
+            f"Жанр выбирай только из списка: {', '.join(CANONICAL_GENRES)}. "
             "Если жанр определить нельзя, верни genre=\"Unknown\"."
         )
         user_prompt = (
@@ -2101,6 +2117,98 @@ class LibrarySorter:
             task.book_seen_counted = True
             self.metrics.mark_book_seen()
 
+    def _lookup_isbn_metadata(self, isbn: str) -> Optional[dict[str, str]]:
+        if not self.config.isbn_lookup or requests is None:
+            return None
+        cache_key = f"isbn_openlibrary_v1:{isbn}"
+        cached = self.db.get_lm_cache(cache_key)
+        if cached:
+            if cached.get("not_found"):
+                return None
+            return {str(k): str(v) for k, v in cached.items() if v}
+
+        url = "https://openlibrary.org/api/books"
+        try:
+            resp = requests.get(
+                url,
+                params={"bibkeys": f"ISBN:{isbn}", "format": "json", "jscmd": "data"},
+                timeout=(4, 8),
+            )
+            if resp.status_code >= 400:
+                self.logger.warning("ISBN lookup HTTP %s isbn=%s", resp.status_code, isbn)
+                return None
+            payload = resp.json()
+        except Exception as exc:
+            self.logger.warning("ISBN lookup failed isbn=%s: %s", isbn, exc)
+            return None
+
+        item = payload.get(f"ISBN:{isbn}") if isinstance(payload, dict) else None
+        if not isinstance(item, dict):
+            self.db.set_lm_cache(cache_key, {"not_found": True})
+            return None
+
+        title = clean_text(str(item.get("title", "")))
+        authors_raw = item.get("authors", [])
+        authors: list[str] = []
+        if isinstance(authors_raw, list):
+            for author in authors_raw:
+                if isinstance(author, dict):
+                    name = clean_text(str(author.get("name", "")))
+                    if name:
+                        authors.append(name)
+        subjects_raw = item.get("subjects", [])
+        subjects: list[str] = []
+        if isinstance(subjects_raw, list):
+            for subject in subjects_raw[:8]:
+                if isinstance(subject, dict):
+                    name = clean_text(str(subject.get("name", "")))
+                    if name:
+                        subjects.append(name)
+        genre = normalize_genre(" ".join(subjects))
+
+        out = {
+            "title": title,
+            "author": clean_text(", ".join(authors)),
+            "genre": genre,
+            "isbn": isbn,
+        }
+        out = {k: v for k, v in out.items() if v and v != "Unknown"}
+        if not out:
+            self.db.set_lm_cache(cache_key, {"not_found": True})
+            return None
+        self.db.set_lm_cache(cache_key, out)
+        return out
+
+    def _enrich_metadata_from_isbn(self, task: FileTask, md: Metadata, fmt_tags: dict[str, str]) -> None:
+        if not self.config.isbn_lookup:
+            return
+        haystack_parts = [
+            task.path.name,
+            task.path.stem,
+            md.title,
+            md.author,
+            md.genre,
+            *[str(v) for v in fmt_tags.values()],
+        ]
+        isbns = extract_isbns_from_text("\n".join(haystack_parts))
+        if not isbns:
+            snippet = extract_text_snippet(task.path, max_chars=1600)
+            isbns = extract_isbns_from_text(snippet)
+        for isbn in isbns:
+            data = self._lookup_isbn_metadata(isbn)
+            if not data:
+                continue
+            if data.get("title"):
+                md.title = data["title"]
+            if data.get("author"):
+                md.author = data["author"]
+            if data.get("genre"):
+                md.genre = normalize_genre(data["genre"])
+            md.source = "isbn"
+            md.confidence = max(md.confidence, 0.9)
+            self.logger.info("ISBN metadata isbn=%s path=%s data=%s", isbn, task.path, data)
+            return
+
     def _md_brief(self, md: Metadata) -> str:
         title = truncate(clean_text(md.title), 48)
         author = truncate(clean_text(md.author), 36)
@@ -2772,6 +2880,8 @@ class LibrarySorter:
             md.source = "tags"
             md.confidence = max(md.confidence, 0.75)
 
+        self._enrich_metadata_from_isbn(task, md, fmt_tags)
+
         # 3) Жанр из пути/цепочки
         if not md.genre:
             guess = infer_genre_from_path(task.path, task.archive_chain)
@@ -2849,7 +2959,7 @@ class LibrarySorter:
         if author:
             md.author = author
         if genre:
-            md.genre = clean_text(genre)
+            md.genre = normalize_genre(genre)
         if subgenres:
             md.subgenres = subgenres
         if conf > md.confidence:
@@ -2859,6 +2969,7 @@ class LibrarySorter:
 
     def _build_destination(self, task: FileTask) -> Path:
         md = task.metadata
+        md.genre = normalize_genre(md.genre or "Unknown")
         genre = sanitize_component(md.genre or "Unknown", max_len=48)
         author = sanitize_component(md.author or "Unknown Author", max_len=64)
         first = first_letter(author)
@@ -3581,6 +3692,57 @@ def parse_filename(stem: str) -> dict[str, str]:
     return {"title": stem_clean}
 
 
+def isbn13_is_valid(isbn: str) -> bool:
+    if len(isbn) != 13 or not isbn.isdigit() or not isbn.startswith(("978", "979")):
+        return False
+    total = sum((1 if idx % 2 == 0 else 3) * int(ch) for idx, ch in enumerate(isbn[:12]))
+    check = (10 - (total % 10)) % 10
+    return check == int(isbn[-1])
+
+
+def isbn10_is_valid(isbn: str) -> bool:
+    if len(isbn) != 10:
+        return False
+    total = 0
+    for idx, ch in enumerate(isbn):
+        if ch.upper() == "X" and idx == 9:
+            value = 10
+        elif ch.isdigit():
+            value = int(ch)
+        else:
+            return False
+        total += (10 - idx) * value
+    return total % 11 == 0
+
+
+def normalize_isbn_candidate(value: str) -> str:
+    cleaned = re.sub(r"[^0-9Xx]", "", value)
+    if len(cleaned) == 13 and isbn13_is_valid(cleaned):
+        return cleaned
+    if len(cleaned) == 10 and isbn10_is_valid(cleaned):
+        return cleaned.upper()
+    return ""
+
+
+def extract_isbns_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+    candidates: list[str] = []
+    patterns = [
+        r"(?i)\bISBN(?:-1[03])?\s*[:：]?\s*([0-9Xx][0-9Xx\-\s]{8,20}[0-9Xx])",
+        r"\b(97[89][0-9\-\s]{10,20}[0-9])\b",
+        r"\b([0-9][0-9\-\s]{8,16}[0-9Xx])\b",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            isbn = normalize_isbn_candidate(match.group(1))
+            if isbn and isbn not in candidates:
+                candidates.append(isbn)
+            if len(candidates) >= 3:
+                return candidates
+    return candidates
+
+
 def extract_epub_metadata(path: Path) -> dict[str, str]:
     out: dict[str, str] = {}
     with zipfile.ZipFile(path, "r") as zf:
@@ -3683,51 +3845,115 @@ def infer_genre_from_path(path: Path, chain: list[str]) -> str:
     return ""
 
 
+GENRE_NOISE_RE = re.compile(
+    r"(?i)(https?://|www\.|isbn|issn|doi|copyright|all rights reserved|"
+    r"издательств|перепечатка|front matter|subject|untitled|new subject|"
+    r"series|серия|guide to custom|handbook chemical process)"
+)
+
+CANONICAL_GENRES = (
+    "Фантастика",
+    "Фэнтези",
+    "Детективы и триллеры",
+    "Романы",
+    "Детская литература",
+    "Поэзия",
+    "Художественная литература",
+    "История",
+    "Военное дело",
+    "Политика и право",
+    "Экономика и бизнес",
+    "Наука",
+    "Техника",
+    "Программирование и IT",
+    "Медицина и здоровье",
+    "Биология и природа",
+    "Сельское хозяйство и садоводство",
+    "Дом, хобби и ремесла",
+    "Кулинария",
+    "Искусство и дизайн",
+    "Религия и философия",
+    "Психология и саморазвитие",
+    "Языкознание",
+    "Образование",
+    "Справочники и энциклопедии",
+    "Путешествия и география",
+    "Спорт",
+    "Документальная литература",
+    "Unknown",
+)
+
+
+GENRE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Справочники и энциклопедии", ("энциклоп", "encyclop", "справоч", "reference", "dictionary", "словар")),
+    ("Программирование и IT", ("programming", "software", "computer science", "network", "firewall", "embedded", "algorithm", "information theory", "алгоритм", "программ", "компьютер", "it_")),
+    ("Фантастика", ("science fiction", "sci-fi", "sf_", "sf ", "фантаст", "dystopian", "space opera")),
+    ("Фэнтези", ("fantasy", "фэнтез", "магич", "magical realism")),
+    ("Детективы и триллеры", ("detective", "mystery", "crime", "thriller", "детектив", "криминал")),
+    ("Романы", ("romance", "love_", "romantic", "роман", "erotica")),
+    ("Детская литература", ("children", "child_", "young adult", "сказк", "детск")),
+    ("Поэзия", ("poetry", "verse", "поэз", "стих")),
+    ("История", ("history", "истор", "археолог", "ancient history")),
+    ("Военное дело", ("military", "war ", "weapons", "firearms", "ballistics", "survival", "tactics", "военн", "оруж", "снайпер", "самообор")),
+    ("Политика и право", ("politic", "law", "legal", "juris", "право", "юрис", "полит", "закон")),
+    ("Экономика и бизнес", ("econom", "business", "finance", "management", "маркет", "бизнес", "эконом", "финанс")),
+    ("Медицина и здоровье", ("medicine", "medical", "health", "fitness", "dentistry", "yoga", "медицин", "здоров", "психотерап")),
+    ("Биология и природа", ("biology", "botany", "zoology", "nature", "natural history", "paleontology", "anthropology", "биолог", "ботан", "зоолог", "природ")),
+    ("Сельское хозяйство и садоводство", ("agriculture", "gardening", "garden", "home_garden", "veterinary", "pet care", "садов", "огород", "сельск", "пчелов", "животновод", "ветерин")),
+    ("Кулинария", ("culinary", "cooking", "cook", "кулинар", "рецепт", "винодел", "напит")),
+    ("Дом, хобби и ремесла", ("diy", "craft", "hobby", "home_", "home decor", "interior", "origami", "рукодел", "хобби", "ремес", "дом", "мебел", "быт")),
+    ("Искусство и дизайн", ("art", "design", "architecture", "photography", "music", "искусств", "дизайн", "архитект", "музык", "фотограф")),
+    ("Религия и философия", ("religion", "theology", "christian", "bible", "buddhism", "islam", "judaism", "orthodox", "philosophy", "esoteric", "религ", "православ", "философ", "мифолог", "эзотер")),
+    ("Психология и саморазвитие", ("psychology", "self-help", "self help", "parenting", "саморазвит", "самосоверш", "психолог")),
+    ("Языкознание", ("language", "linguistics", "esperanto", "grammar", "язык", "лингв", "граммат")),
+    ("Образование", ("education", "textbook", "text books", "учеб", "образован", "пособ")),
+    ("Путешествия и география", ("travel", "geography", "geology", "географ", "геолог", "путевод")),
+    ("Спорт", ("sport", "спорт", "хоккей")),
+    ("Техника", ("engineering", "technical", "technology", "manual", "automotive", "construction", "chemistry", "physics", "astronomy", "math", "mathematics", "электрон", "техник", "строитель", "хим", "физик", "математ", "автомоб")),
+    ("Наука", ("science", "наука", "науч", "academic journal")),
+    ("Документальная литература", ("nonfiction", "non-fiction", "memoir", "biography", "publicism", "document", "документ", "публицист", "биограф", "мемуар", "критика")),
+    ("Художественная литература", ("fiction", "literature", "novel", "short stories", "prose", "comedy", "humor", "adventure", "action", "folk", "folklore", "литератур", "проза", "юмор", "приключ")),
+)
+
+
 def infer_genre_from_title(title: str) -> str:
     t = clean_text(title).lower()
     if not t:
         return ""
-    keywords = {
-        "энциклопед": "Энциклопедии",
-        "словар": "Словари",
-        "справоч": "Справочники",
-        "учеб": "Учебная литература",
-        "истор": "История",
-        "фантаст": "Фантастика",
-        "роман": "Романы",
-        "поэз": "Поэзия",
-        "детск": "Детская литература",
-        "science": "Наука",
-        "наук": "Наука",
-    }
-    for key, val in keywords.items():
-        if key in t:
-            return val
+    genre = normalize_genre(t)
+    if genre != "Unknown":
+        return genre
     return ""
 
 
 def normalize_genre(genre: str) -> str:
-    g = clean_text(genre).lower()
+    raw = clean_text(genre)
+    g = raw.lower()
     if not g:
         return "Unknown"
-    mapping = {
-        "энциклоп": "Энциклопедии",
-        "словар": "Словари",
-        "справоч": "Справочники",
-        "учеб": "Учебная литература",
-        "истор": "История",
-        "фантаст": "Фантастика",
-        "science": "Наука",
-        "наука": "Наука",
-        "дет": "Детская литература",
-        "поэз": "Поэзия",
-        "роман": "Романы",
-        "документ": "Документальная литература",
-    }
-    for key, out in mapping.items():
-        if key in g:
-            return out
-    return clean_text(genre) or "Unknown"
+    if g in {"unknown", "unknown genre", "none", "null", "n/a", "na", "-", "_"}:
+        return "Unknown"
+    if GENRE_NOISE_RE.search(raw):
+        return "Unknown"
+    if re.fullmatch(r"[\d\s._#;,:/\\-]+", raw):
+        return "Unknown"
+    if len(raw) > 64:
+        return "Unknown"
+    digit_count = sum(ch.isdigit() for ch in raw)
+    if digit_count >= 5:
+        return "Unknown"
+
+    for canonical in CANONICAL_GENRES:
+        if g == canonical.lower():
+            return canonical
+
+    normalized = re.sub(r"[_/\\|;:,\-]+", " ", g)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    for out, keys in GENRE_RULES:
+        for key in keys:
+            if key in normalized or key in g:
+                return out
+    return "Unknown"
 
 
 def _strip_code_fence(text: str) -> str:
@@ -4165,6 +4391,11 @@ def parse_args() -> Config:
     p.add_argument("--lm-input-chars", type=int, default=DEFAULT_LM_INPUT_CHARS)
     p.add_argument("--lm-max-output-tokens", type=int, default=DEFAULT_LM_MAX_OUTPUT_TOKENS)
     p.add_argument(
+        "--no-isbn-lookup",
+        action="store_true",
+        help="Не искать метаданные по ISBN через Open Library.",
+    )
+    p.add_argument(
         "--persist-state",
         action="store_true",
         help="Сохранять служебную БД/логи после завершения (по умолчанию удаляются).",
@@ -4199,6 +4430,7 @@ def parse_args() -> Config:
         lm_timeout_sec=max(10, args.lm_timeout_sec),
         lm_input_chars=max(200, args.lm_input_chars),
         lm_max_output_tokens=max(40, args.lm_max_output_tokens),
+        isbn_lookup=DEFAULT_ISBN_LOOKUP and not args.no_isbn_lookup,
         ephemeral_mode=not args.persist_state,
     )
 

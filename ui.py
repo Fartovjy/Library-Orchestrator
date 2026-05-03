@@ -1170,6 +1170,7 @@ class LibraryGUIApp:
             target_hash_scan_workers=self._setting_int(
                 "TARGET_HASH_SCAN_WORKERS", lp.DEFAULT_TARGET_HASH_SCAN_WORKERS, min_value=1
             ),
+            isbn_lookup=self._setting_bool("ISBN_LOOKUP", lp.DEFAULT_ISBN_LOOKUP),
             ephemeral_mode=True,
         )
 
