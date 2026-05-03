@@ -150,7 +150,6 @@ ARCHIVE_EXTENSIONS = {
 BOOK_EXTENSIONS = {
     ".epub",
     ".fb2",
-    ".fb2.zip",
     ".pdf",
     ".djvu",
     ".mobi",
@@ -217,7 +216,6 @@ BOOK_ZIP_CONTAINER_EXTENSIONS = {
     ".odt",
     ".xps",
     ".oxps",
-    ".fb2.zip",
 }
 
 ARCHIVE_FILETYPE_MIMES = {
@@ -1114,7 +1112,7 @@ class LMStudioClient:
         )
         payload_seed = {
             "schema": "lm_results_fast_v3",
-            "path": display_task_name(task),
+            "path": task.path.name,
             "metadata": task.metadata.__dict__,
             "context": context,
         }
@@ -1151,7 +1149,7 @@ class LMStudioClient:
         )
         user_prompt = (
             "БЫСТРЫЙ КОНТЕКСТ КНИГИ:\n"
-            f"Имя файла: {display_task_name(task)}\n"
+            f"Имя файла: {task.path.name}\n"
             f"Текущие теги и эвристики: {json.dumps(task.metadata.__dict__, ensure_ascii=False)}\n"
             f"{context}\n"
             "Верни JSON строго по шаблону: один объект в массиве results для этой книги. "
@@ -1253,7 +1251,7 @@ class LMStudioClient:
         snippet = snippet[: self.config.lm_input_chars]
         payload_seed = {
             "schema": "lm_results_genre_analysis_v1",
-            "path": display_task_name(task),
+            "path": task.path.name,
             "metadata": task.metadata.__dict__,
             "snippet": snippet,
         }
@@ -1289,7 +1287,7 @@ class LMStudioClient:
         )
         user_prompt = (
             "ДАННЫЕ О КНИГЕ:\n"
-            f"Имя файла: {display_task_name(task)}\n"
+            f"Имя файла: {task.path.name}\n"
             f"Текущие теги и эвристики: {json.dumps(task.metadata.__dict__, ensure_ascii=False)}\n"
             "Фрагмент текста/контекст (ограниченный, не вся книга):\n"
             f"{snippet}"
@@ -1322,7 +1320,7 @@ class LMStudioClient:
                     self._response_error_brief(resp),
                 )
                 self.metrics.add_event(
-                    f"Ollama HTTP {resp.status_code}: fallback для {display_task_name(task)}"
+                    f"Ollama HTTP {resp.status_code}: fallback для {task.path.name}"
                 )
                 return None
             data = resp.json()
@@ -1379,7 +1377,7 @@ class LMStudioClient:
                     truncate(clean_text(retry_content), 200),
                 )
                 self.metrics.add_event(
-                    f"Ollama вернул не-JSON для {display_task_name(task)}: fallback"
+                    f"Ollama вернул не-JSON для {task.path.name}: fallback"
                 )
                 return None
             self.db.set_lm_cache(cache_key, parsed)
@@ -1400,7 +1398,7 @@ class LMStudioClient:
             return None
         payload_seed = {
             "mode": "genre_only",
-            "path": display_task_name(task),
+            "path": task.path.name,
             "title": task.metadata.title,
             "author": task.metadata.author,
             "genre": task.metadata.genre,
@@ -1420,7 +1418,7 @@ class LMStudioClient:
             "Если жанр определить нельзя, верни genre=\"Unknown\"."
         )
         user_prompt = (
-            f"Имя файла: {display_task_name(task)}\n"
+            f"Имя файла: {task.path.name}\n"
             f"Название: {task.metadata.title}\n"
             f"Автор: {task.metadata.author}\n"
             f"Текущий жанр: {task.metadata.genre}"
@@ -1449,7 +1447,7 @@ class LMStudioClient:
                     self._response_error_brief(resp),
                 )
                 self.metrics.add_event(
-                    f"LM genre-only HTTP {resp.status_code}: fallback для {display_task_name(task)}"
+                    f"LM genre-only HTTP {resp.status_code}: fallback для {task.path.name}"
                 )
                 return None
             data = resp.json()
@@ -1563,7 +1561,7 @@ class LMStudioClient:
             f"Title: {original_title}\n"
             f"Author: {original_author}\n"
             f"Genre: {canonical_genre}\n"
-            f"Filename: {display_task_name(task)}\n"
+            f"Filename: {task.path.name}\n"
             "Return JSON exactly like: {\"title\":\"...\",\"author\":\"...\"}"
         )
         request_payload = {
@@ -2695,9 +2693,6 @@ def iter_files(root: Path):
 
 
 def suffix_lower(path: Path) -> str:
-    name = path.name.lower()
-    if name.endswith(".fb2.zip"):
-        return ".fb2.zip"
     return path.suffix.lower()
 
 
@@ -2905,10 +2900,6 @@ def looks_binary(path: Path) -> bool:
 def extract_text_snippet(path: Path, max_chars: int = 1800) -> str:
     ext = suffix_lower(path)
     try:
-        if ext == ".fb2.zip":
-            raw = read_fb2_zip_payload(path, max_bytes=max_chars * 4)
-            txt = strip_xml_tags(decode_text_bytes(raw))
-            return clean_text(txt)[:max_chars]
         if ext in {".txt", ".md", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".fb2", ".rtf"}:
             return read_text_head(path, max_chars)
         if ext == ".docx":
@@ -3000,17 +2991,6 @@ def read_text_head(path: Path, max_chars: int) -> str:
     return ""
 
 
-def display_task_name(task: FileTask) -> str:
-    return display_path_name(task.path)
-
-
-def display_path_name(path: Path) -> str:
-    name = path.name
-    if name.lower().endswith(".fb2.zip"):
-        return name[:-4]
-    return name
-
-
 def parse_filename(stem: str) -> dict[str, str]:
     stem_clean = clean_text(stem.replace("_", " "))
     patterns = [
@@ -3099,12 +3079,9 @@ def extract_epub_metadata(path: Path) -> dict[str, str]:
 
 
 def extract_fb2_metadata(path: Path) -> dict[str, str]:
-    if suffix_lower(path) == ".fb2.zip":
-        raw = read_fb2_zip_payload(path, max_bytes=600_000)
-    else:
-        raw = b""
-        with open(path, "rb") as f:
-            raw = f.read(600_000)
+    raw = b""
+    with open(path, "rb") as f:
+        raw = f.read(600_000)
     txt = decode_text_bytes(raw)
     title = first_group(txt, r"<book-title>(.*?)</book-title>")
     genre = first_group(txt, r"<genre>(.*?)</genre>")
@@ -3119,23 +3096,6 @@ def extract_fb2_metadata(path: Path) -> dict[str, str]:
     if genre:
         out["genre"] = clean_text(genre)
     return out
-
-
-def read_fb2_zip_payload(path: Path, max_bytes: int = 600_000) -> bytes:
-    try:
-        with zipfile.ZipFile(path, "r") as zf:
-            infos = [
-                info
-                for info in zf.infolist()
-                if not info.is_dir() and info.filename.lower().endswith(".fb2")
-            ]
-            if not infos:
-                return b""
-            chosen = max(infos, key=lambda item: int(getattr(item, "file_size", 0) or 0))
-            with zf.open(chosen, "r") as entry:
-                return entry.read(max_bytes)
-    except Exception:
-        return b""
 
 
 def extract_docx_metadata(path: Path) -> dict[str, str]:
@@ -3566,16 +3526,15 @@ def normalize_model_payload(payload: dict[str, Any]) -> Optional[dict[str, Any]]
 
 def build_lm_fallback_context(task: FileTask, max_chars: int = 700) -> str:
     chain = " -> ".join(task.archive_chain) if task.archive_chain else ""
-    display_name = display_task_name(task)
     parts = [
-        f"Filename: {display_name}",
-        f"Stem: {Path(display_name).stem}",
-        f"Suffix: {Path(display_name).suffix.lower()}",
+        f"Filename: {task.path.name}",
+        f"Stem: {task.path.stem}",
+        f"Suffix: {task.path.suffix.lower()}",
         f"Parent: {task.path.parent.name}",
     ]
     if chain:
         parts.append(f"Archive chain: {chain}")
-    parsed = parse_filename(Path(display_name).stem)
+    parsed = parse_filename(task.path.stem)
     if parsed.get("author"):
         parts.append(f"Possible author from filename: {parsed['author']}")
     if parsed.get("title"):

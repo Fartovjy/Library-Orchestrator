@@ -21,7 +21,7 @@ def _lm_loop(self, worker_idx: int) -> None:
                 break
             continue
         try:
-            display_name = display_task_name(task)
+            display_name = task.path.name
             self.metrics.set_active_item("A6", active_slot, display_name)
             self.metrics.mark_stage("A6")
             decision = self._lm_decision(task.metadata)
