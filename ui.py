@@ -322,7 +322,6 @@ class LibraryGUIApp:
         self.shutdown_after_done_var = tk.BooleanVar(value=False)
         self.keep_sources_var = tk.BooleanVar(value=False)
         self.deep_analysis_var = tk.BooleanVar(value=False)
-        self.nobook_var_path = tk.StringVar(value=fix_mojibake(str(lp.DEFAULT_NOBOOK_DIR)))
         self.lm_url_var = tk.StringVar(value=self._setting_str("LM_URL", lp.DEFAULT_LM_URL))
         self.lm_model_var = tk.StringVar(value=self._setting_str("LM_MODEL", lp.DEFAULT_LM_MODEL))
         self.output_language_var = tk.StringVar(
@@ -1076,34 +1075,6 @@ class LibraryGUIApp:
             entry.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=2)
             row += 1
 
-        def add_path(label_key: str, var: tk.StringVar) -> None:
-            nonlocal row
-            label = tk.Label(
-                content,
-                text=self.tr(label_key),
-                font=self.font_legend,
-                bg=self._c("root_bg"),
-                fg=self._c("text_secondary"),
-                anchor="w",
-            )
-            label.grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
-            self.settings_text_widgets.append((label, label_key))
-            entry = tk.Entry(content, textvariable=var, font=self.font_legend)
-            entry.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(0, 8), pady=2)
-            btn = tk.Button(
-                content,
-                text=self.tr("browse"),
-                font=self.font_legend,
-                command=lambda v=var: self._browse_setting_dir(v),
-                bg=self._c("btn_secondary_bg"),
-                fg=self._c("btn_secondary_fg"),
-                activebackground=self._c("btn_secondary_active_bg"),
-                activeforeground=self._c("btn_secondary_active_fg"),
-            )
-            btn.grid(row=row, column=3, sticky="ew", pady=2)
-            self.settings_text_widgets.append((btn, "browse"))
-            row += 1
-
         def add_bool(label_key: str, var: tk.BooleanVar) -> None:
             nonlocal row
             check = tk.Checkbutton(
@@ -1121,9 +1092,6 @@ class LibraryGUIApp:
             check.grid(row=row, column=0, columnspan=2, sticky="w", pady=1)
             self.settings_text_widgets.append((check, label_key))
             row += 1
-
-        section("settings_paths")
-        add_path("settings_nobook_dir", self.nobook_var_path)
 
         section("settings_workers")
         worker_items = [
@@ -1259,12 +1227,6 @@ class LibraryGUIApp:
         for col in range(4):
             content.grid_columnconfigure(col, weight=1 if col in {1, 3} else 0)
 
-    def _browse_setting_dir(self, var: tk.StringVar) -> None:
-        initial = self._best_existing_dir(var.get())
-        picked = filedialog.askdirectory(title=self.tr("dialog_target_title"), initialdir=initial)
-        if picked:
-            var.set(str(Path(picked)))
-
     def _apply_initial_dirs(self) -> None:
         # SOURCE_DIRS не подставляем автоматически при старте.
         self.source_var.set("")
@@ -1358,7 +1320,7 @@ class LibraryGUIApp:
             return False
         target = Path(target_raw)
         dupes = target / "Duplicates"
-        nobook = Path(self.nobook_var_path.get().strip() or str(target / "NoBook"))
+        nobook = target / "NoBook"
 
         try:
             for source in source_dirs:
@@ -1499,7 +1461,6 @@ class LibraryGUIApp:
             source_dirs = [str(p) for p in lp.parse_sources_input([self.source_var.get().strip()])]
             values: dict[str, object] = {
                 "TARGET_DIR": self.target_var.get().strip(),
-                "NOBOOK_DIR": self.nobook_var_path.get().strip(),
                 "LM_URL": self.lm_url_var.get().strip() or lp.DEFAULT_LM_URL,
                 "LM_MODEL": self.lm_model_var.get().strip() or lp.DEFAULT_LM_MODEL,
                 "MAX_PARALLEL_ARCHIVES": self._entry_int("MAX_PARALLEL_ARCHIVES", lp.DEFAULT_MAX_PARALLEL_ARCHIVES, min_value=1),
@@ -1563,7 +1524,7 @@ class LibraryGUIApp:
         source_dirs = lp.parse_sources_input([self.source_var.get().strip()])
         target = Path(self.target_var.get().strip())
         dupes = target / "Duplicates"
-        nobook = Path(self.nobook_var_path.get().strip() or str(target / "NoBook"))
+        nobook = target / "NoBook"
         temp_base = self._resolve_temp_base(target)
 
         lm_url = self.lm_url_var.get().strip() or lp.DEFAULT_LM_URL
