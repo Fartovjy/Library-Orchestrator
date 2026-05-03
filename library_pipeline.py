@@ -458,10 +458,12 @@ class Metrics:
         self.mode = "RUNNING"
         self.books_seen = 0
         self.books_done = 0
+        self.nobook_files = 0
         self.total_tasks_seen = 0
         self.total_tasks_done = 0
         self.stage_processed: dict[str, int] = defaultdict(int)
         self.stage_errors: dict[str, int] = defaultdict(int)
+        self.stage_touched_at: dict[str, float] = {}
         self.results: dict[str, int] = defaultdict(int)
         self.book_results: dict[str, int] = defaultdict(int)
         self.lm_stats: dict[str, int] = defaultdict(int)
@@ -516,11 +518,16 @@ class Metrics:
         }
 
     def _snapshot_active_slots(self) -> dict[str, list[str]]:
-        return {
+        out = {
             stage: sorted(stage_map.keys())
             for stage, stage_map in self.active_stage_items.items()
             if stage_map
         }
+        if "A1" not in out:
+            touched = self.stage_touched_at.get("A1", 0.0)
+            if touched and time.time() - touched <= 2.0:
+                out["A1"] = ["W1"]
+        return out
 
     def _snapshot_active_elapsed(self, now: Optional[float] = None) -> dict[str, int]:
         ts = time.time() if now is None else now
@@ -553,8 +560,13 @@ class Metrics:
             self.books_done += 1
             self.book_results[result] += 1
 
+    def mark_nobook_file_saved(self) -> None:
+        with self.lock:
+            self.nobook_files += 1
+
     def mark_stage(self, stage: str, error: bool = False) -> None:
         with self.lock:
+            self.stage_touched_at[stage] = time.time()
             self.stage_processed[stage] += 1
             if error:
                 self.stage_errors[stage] += 1
@@ -667,6 +679,7 @@ class Metrics:
             results = dict(self.results)
             book_results = dict(self.book_results)
             lm_stats = dict(self.lm_stats)
+            nobook_files = self.nobook_files
             now = time.time()
             elapsed = int(now - self.start_ts)
             active_stage_counts = self._snapshot_active_counts()
@@ -728,6 +741,7 @@ class Metrics:
                 "mode": self.mode,
                 "seen": seen,
                 "done": done,
+                "nobook_files": nobook_files,
                 "tasks_seen": self.total_tasks_seen,
                 "tasks_done": self.total_tasks_done,
                 "pct": pct,
@@ -1528,7 +1542,7 @@ class TerminalUI:
                 f"Books found: {snap['seen']}   Books done: {snap['done']}   "
                 f"Packed: {book_results.get('packed', 0)}   "
                 f"Dupes: {book_results.get('duplicate', 0)}   "
-                f"NoBook: {snap['results'].get('nobook', 0)}   "
+                f"NoBook: {snap.get('nobook_files', 0)}   "
                 f"Book failed: {book_results.get('failed', 0)}"
             ).ljust(width)
         )
@@ -2319,6 +2333,14 @@ class LibrarySorter:
                     if task.book_seen_counted:
                         task.book_seen_counted = False
                         self.metrics.unmark_book_seen()
+                    if task.origin == "temp" and self._nobook_rejection_is_ambiguous(task, reason):
+                        self._preserve_archive_source(task.archive_source)
+                        self.logger.info(
+                            "Archive source preserved after ambiguous nobook path=%s reason=%s archive=%s",
+                            task.path,
+                            reason,
+                            task.archive_source or "",
+                        )
                     self._handle_nobook(task, reason)
                     self.db.mark_file(task, "nobook", reason)
                     self.logger.info(
@@ -2677,6 +2699,7 @@ class LibrarySorter:
                 )
                 out.parent.mkdir(parents=True, exist_ok=True)
                 safe_move(task.path, out)
+                self.metrics.mark_nobook_file_saved()
 
     def _move_source_to_nobook(
         self,
@@ -2689,6 +2712,7 @@ class LibrarySorter:
         dst = ensure_unique_file_path(self.config.nobook_dir / rel)
         dst.parent.mkdir(parents=True, exist_ok=True)
         safe_move(path, dst)
+        self.metrics.mark_nobook_file_saved()
         self.logger.info("NoBook move source=%s dest=%s reason=%s", path, dst, reason)
         return dst
 
@@ -3094,6 +3118,18 @@ class LibrarySorter:
             return
         with self._archive_state_lock:
             self._archive_has_book.add(archive_path)
+
+    def _preserve_archive_source(self, archive_path: Optional[Path]) -> None:
+        if not archive_path:
+            return
+        with self._archive_state_lock:
+            self._archive_failed.add(archive_path)
+
+    def _nobook_rejection_is_ambiguous(self, task: FileTask, reason: str) -> bool:
+        ext = suffix_lower(task.path)
+        if ext in BOOK_EXTENSIONS:
+            return True
+        return reason.startswith(("text_no_book_signals", "unknown_text_not_book_type"))
 
     def _mark_archive_progress(self, task: FileTask, result: str) -> None:
         archive_path = task.archive_source

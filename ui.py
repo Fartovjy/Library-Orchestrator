@@ -1303,7 +1303,7 @@ class LibraryGUIApp:
         self.done_var.set(self._fmt_num(done))
         self.packed_var.set(self._fmt_num(int(book_results.get("packed", 0))))
         self.dupes_var.set(self._fmt_num(int(book_results.get("duplicate", 0))))
-        self.nobook_var.set(self._fmt_num(int(results.get("nobook", 0))))
+        self.nobook_var.set(self._fmt_num(int(snap.get("nobook_files", 0))))
         self.failed_var.set(self._fmt_num(int(book_results.get("failed", 0))))
 
         stage_processed = snap.get("stage_processed", {}) or {}
