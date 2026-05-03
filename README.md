@@ -74,11 +74,16 @@ SOURCE_DIRS = [
     r"E:\Энциклопедии. Словари. Справочники",
 ]
 TARGET_DIR = r"E:\Sorted_Library"
-DUPES_DIR = r"E:\Sorted_Library\Duplicates"
 NOBOOK_DIR = r"E:\Sorted_Library\NoBook"
 ```
 
-Если `TEMP_BASE` не задан, временные файлы создаются здесь:
+Папка дубликатов создается автоматически внутри `TARGET_DIR`:
+
+```text
+<TARGET_DIR>\Duplicates
+```
+
+Временные файлы также создаются автоматически внутри `TARGET_DIR`:
 
 ```text
 <TARGET_DIR>\_TempPipeline

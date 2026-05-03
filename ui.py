@@ -322,9 +322,7 @@ class LibraryGUIApp:
         self.shutdown_after_done_var = tk.BooleanVar(value=False)
         self.keep_sources_var = tk.BooleanVar(value=False)
         self.deep_analysis_var = tk.BooleanVar(value=False)
-        self.dupes_var_path = tk.StringVar(value=fix_mojibake(str(lp.DEFAULT_DUPES_DIR)))
         self.nobook_var_path = tk.StringVar(value=fix_mojibake(str(lp.DEFAULT_NOBOOK_DIR)))
-        self.temp_base_var = tk.StringVar(value=fix_mojibake(str(lp.DEFAULT_TEMP_BASE)))
         self.lm_url_var = tk.StringVar(value=self._setting_str("LM_URL", lp.DEFAULT_LM_URL))
         self.lm_model_var = tk.StringVar(value=self._setting_str("LM_MODEL", lp.DEFAULT_LM_MODEL))
         self.output_language_var = tk.StringVar(
@@ -1125,9 +1123,7 @@ class LibraryGUIApp:
             row += 1
 
         section("settings_paths")
-        add_path("settings_dupes_dir", self.dupes_var_path)
         add_path("settings_nobook_dir", self.nobook_var_path)
-        add_path("settings_temp_base", self.temp_base_var)
 
         section("settings_workers")
         worker_items = [
@@ -1361,7 +1357,7 @@ class LibraryGUIApp:
             messagebox.showerror(self.tr("dialog_paths_title"), self.tr("dialog_target_missing"))
             return False
         target = Path(target_raw)
-        dupes = Path(self.dupes_var_path.get().strip() or str(target / "Duplicates"))
+        dupes = target / "Duplicates"
         nobook = Path(self.nobook_var_path.get().strip() or str(target / "NoBook"))
 
         try:
@@ -1408,17 +1404,6 @@ class LibraryGUIApp:
                 return
 
     def _resolve_temp_base(self, target_dir: Path) -> Path:
-        if hasattr(self, "temp_base_var"):
-            value = self.temp_base_var.get().strip()
-            if value:
-                return Path(value)
-        if setting is not None:
-            try:
-                temp_base = getattr(setting, "TEMP_BASE", None)
-                if temp_base:
-                    return Path(str(temp_base))
-            except Exception:
-                pass
         return target_dir / "_TempPipeline"
 
     def _setting_int(self, name: str, default: int, min_value: int = 1) -> int:
@@ -1514,9 +1499,7 @@ class LibraryGUIApp:
             source_dirs = [str(p) for p in lp.parse_sources_input([self.source_var.get().strip()])]
             values: dict[str, object] = {
                 "TARGET_DIR": self.target_var.get().strip(),
-                "DUPES_DIR": self.dupes_var_path.get().strip(),
                 "NOBOOK_DIR": self.nobook_var_path.get().strip(),
-                "TEMP_BASE": self.temp_base_var.get().strip(),
                 "LM_URL": self.lm_url_var.get().strip() or lp.DEFAULT_LM_URL,
                 "LM_MODEL": self.lm_model_var.get().strip() or lp.DEFAULT_LM_MODEL,
                 "MAX_PARALLEL_ARCHIVES": self._entry_int("MAX_PARALLEL_ARCHIVES", lp.DEFAULT_MAX_PARALLEL_ARCHIVES, min_value=1),
@@ -1579,7 +1562,7 @@ class LibraryGUIApp:
     def _build_config(self) -> lp.Config:
         source_dirs = lp.parse_sources_input([self.source_var.get().strip()])
         target = Path(self.target_var.get().strip())
-        dupes = Path(self.dupes_var_path.get().strip() or str(target / "Duplicates"))
+        dupes = target / "Duplicates"
         nobook = Path(self.nobook_var_path.get().strip() or str(target / "NoBook"))
         temp_base = self._resolve_temp_base(target)
 
