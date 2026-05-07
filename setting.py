@@ -14,7 +14,7 @@ NOBOOK_DIR = r"E:\Sorted_Library\NoBook"
 # Ollama OpenAI-compatible API.
 # Server must expose /v1/chat/completions.
 LM_URL = "http://127.0.0.1:11434/v1/chat/completions"
-LM_MODEL = "gemma4:e4b"
+LM_MODEL = "ibm/granite3.3:8b"
 
 # Необязательно.
 # Если не задавать TEMP_BASE, конвейер автоматически использует:
@@ -70,6 +70,8 @@ LM_ALWAYS_TRY_WITHOUT_SNIPPET = True
 LM_STRICT_JSON_MODE = True
 # Minimum letters in snippet to consider it meaningful text.
 LM_MIN_SNIPPET_LETTERS = 24
+# True: keep original source files after successfully packing output ZIPs.
+KEEP_SOURCES = False
 
 # GUI settings:
 # Window is fixed (min=max) and clamped in code to keep compact dashboard layout.

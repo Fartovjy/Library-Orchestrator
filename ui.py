@@ -320,7 +320,7 @@ class LibraryGUIApp:
         self.event_var = tk.StringVar(value=f"{self.tr('events_prefix')}: -")
         self.log_var = tk.StringVar(value=f"{self.tr('log_prefix')}: -")
         self.shutdown_after_done_var = tk.BooleanVar(value=False)
-        self.keep_sources_var = tk.BooleanVar(value=True)
+        self.keep_sources_var = tk.BooleanVar(value=self._setting_bool("KEEP_SOURCES", True))
         self.deep_analysis_var = tk.BooleanVar(value=False)
         self.lm_url_var = tk.StringVar(value=self._setting_str("LM_URL", lp.DEFAULT_LM_URL))
         self.lm_model_var = tk.StringVar(value=self._setting_str("LM_MODEL", lp.DEFAULT_LM_MODEL))
@@ -1476,6 +1476,7 @@ class LibraryGUIApp:
                 "LM_FAST_CONFIDENCE_MIN": self._entry_float(self.lm_confidence_var, lp.DEFAULT_LM_FAST_CONFIDENCE_MIN, min_value=0.0),
                 "LM_MIN_SNIPPET_LETTERS": self._entry_int("LM_MIN_SNIPPET_LETTERS", lp.DEFAULT_LM_MIN_SNIPPET_LETTERS, min_value=1),
                 "TRANSLATE_OUTPUT_NAMES": bool(self.rename_output_var.get()),
+                "KEEP_SOURCES": bool(self.keep_sources_var.get()),
                 "OUTPUT_LANGUAGE": self.output_language_var.get().strip().lower() or "auto",
                 "GUI_DEFAULT_LANGUAGE": self.language,
                 "GUI_WINDOW_WIDTH": self._entry_int("GUI_WINDOW_WIDTH", self.window_width, min_value=WINDOW_MIN_WIDTH),
