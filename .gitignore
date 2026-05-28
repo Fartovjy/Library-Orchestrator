@@ -1,0 +1,42 @@
+# --- Secrets / local config ---
+# setting.py contains a plaintext LM_API_KEY. Never commit it.
+# Use setting.example.py as the committed template.
+setting.py
+setting.py.bak*
+*.bak
+
+# --- Local data ---
+logs/
+*.log
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+_TempPipeline/
+C:/tmp/
+db/
+
+# --- Smoke / scratch dirs ---
+_smoke_*/
+_itest/
+Test_API.py
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+build/
+dist/
+
+# --- IDE / tooling ---
+.vscode/
+.idea/
+.claude/
+*.swp
+.DS_Store
+Thumbs.db

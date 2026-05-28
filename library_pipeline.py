@@ -1,0 +1,4595 @@
+﻿#!/usr/bin/env python3
+"""
+Надежный конвейер сортировки большой библиотеки:
+1) Поиск файлов
+2) Распаковка архивов (включая вложенные архивы)
+3) Определение "книга / не книга"
+4) Ранний отсев дубликатов по XXH64
+5) Чтение тегов и метаданных
+6) Доопределение метаданных через Ollama (JSON)
+7) Нормализация имени и пути назначения
+8) Упаковка книг в ZIP с максимальным сжатием (7-Zip)
+
+Управление:
+- Esc / Ctrl+S: "остановить и очистить" (сброс очередей + очистка temp)
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import ctypes
+import json
+import logging
+import os
+import queue
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+sys.modules.setdefault("library_pipeline", sys.modules[__name__])
+import threading
+import time
+import uuid
+import zipfile
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+try:
+    import requests
+except Exception:  # pragma: no cover
+    requests = None
+
+try:
+    import filetype
+except Exception:  # pragma: no cover
+    filetype = None
+
+try:
+    import xxhash
+except Exception as exc:  # pragma: no cover
+    raise SystemExit(
+        "Требуется пакет xxhash для XXH64. Установите: pip install xxhash"
+    ) from exc
+
+try:
+    import setting  # Локальный файл путей: setting.py
+except Exception:
+    setting = None
+
+
+_FALLBACK_SOURCE_DIR = (
+    r"E:\Энциклопедии. Словари. Справочники\[Мартенс]_Техническая энциклопедия"
+)
+
+
+def _default_source_dirs() -> list[str]:
+    if setting is not None:
+        raw_list = getattr(setting, "SOURCE_DIRS", None)
+        if isinstance(raw_list, (list, tuple)):
+            values = [str(x).strip() for x in raw_list if str(x).strip()]
+            if values:
+                return values
+        legacy_single = getattr(setting, "SOURCE_DIR", None)
+        if legacy_single and str(legacy_single).strip():
+            return [str(legacy_single).strip()]
+    return [_FALLBACK_SOURCE_DIR]
+
+
+DEFAULT_SOURCE_DIRS = _default_source_dirs()
+DEFAULT_TARGET_DIR = getattr(setting, "TARGET_DIR", r"E:\Sorted_Library")
+DEFAULT_DUPES_DIR = getattr(setting, "DUPES_DIR", r"E:\Sorted_Library\Duplicates")
+DEFAULT_NOBOOK_DIR = getattr(setting, "NOBOOK_DIR", r"E:\Sorted_Library\NoBook")
+DEFAULT_ERROR_DIR = getattr(setting, "ERROR_DIR", r"E:\Sorted_Library\Error")
+DEFAULT_LM_URL = getattr(setting, "LM_URL", "http://127.0.0.1:11434/v1/chat/completions")
+DEFAULT_LM_MODEL = getattr(setting, "LM_MODEL", "gemma4:e4b")
+DEFAULT_LM_API_KEY = str(getattr(setting, "LM_API_KEY", "")).strip()
+DEFAULT_LM_URL_RENAME = str(getattr(setting, "LM_URL_RENAME", "")).strip()
+DEFAULT_LM_MODEL_RENAME = str(getattr(setting, "LM_MODEL_RENAME", "")).strip()
+DEFAULT_LM_API_KEY_RENAME = str(getattr(setting, "LM_API_KEY_RENAME", "")).strip()
+_temp_from_setting = getattr(setting, "TEMP_BASE", None)
+if _temp_from_setting:
+    DEFAULT_TEMP_BASE = _temp_from_setting
+else:
+    DEFAULT_TEMP_BASE = str(Path(DEFAULT_TARGET_DIR) / "_TempPipeline")
+
+DEFAULT_QUEUE_SIZE = int(getattr(setting, "QUEUE_SIZE", 2000))
+DEFAULT_UNPACK_WORKERS = int(getattr(setting, "UNPACK_WORKERS", 2))
+DEFAULT_DETECT_WORKERS = int(getattr(setting, "DETECT_WORKERS", 2))
+DEFAULT_DEDUPE_WORKERS = int(getattr(setting, "DEDUPE_WORKERS", 1))
+DEFAULT_TAG_WORKERS = int(getattr(setting, "TAG_WORKERS", 2))
+DEFAULT_LM_WORKERS = int(getattr(setting, "LM_WORKERS", 1))
+DEFAULT_RENAME_WORKERS = int(getattr(setting, "RENAME_WORKERS", 1))
+DEFAULT_PACK_WORKERS = int(getattr(setting, "PACK_WORKERS", 3))
+DEFAULT_MAX_PARALLEL_ARCHIVES = int(getattr(setting, "MAX_PARALLEL_ARCHIVES", 1))
+DEFAULT_LM_TIMEOUT_SEC = int(getattr(setting, "LM_TIMEOUT_SEC", 40))
+DEFAULT_LM_INPUT_CHARS = int(getattr(setting, "LM_INPUT_CHARS", 700))
+DEFAULT_LM_MAX_OUTPUT_TOKENS = int(getattr(setting, "LM_MAX_OUTPUT_TOKENS", 120))
+DEFAULT_LM_FAST_PRECHECK = bool(getattr(setting, "LM_FAST_PRECHECK", True))
+DEFAULT_LM_FAST_INPUT_CHARS = int(getattr(setting, "LM_FAST_INPUT_CHARS", 900))
+DEFAULT_LM_FAST_MAX_OUTPUT_TOKENS = int(
+    getattr(setting, "LM_FAST_MAX_OUTPUT_TOKENS", 180)
+)
+DEFAULT_LM_FAST_CONFIDENCE_MIN = float(
+    getattr(setting, "LM_FAST_CONFIDENCE_MIN", 4.0)
+)
+DEFAULT_LM_FORCE_FULL_METADATA = bool(getattr(setting, "LM_FORCE_FULL_METADATA", True))
+DEFAULT_LM_FILL_UNKNOWN_AUTHOR = bool(getattr(setting, "LM_FILL_UNKNOWN_AUTHOR", False))
+DEFAULT_LM_ALWAYS_TRY_WITHOUT_SNIPPET = bool(
+    getattr(setting, "LM_ALWAYS_TRY_WITHOUT_SNIPPET", True)
+)
+DEFAULT_LM_STRICT_JSON_MODE = bool(getattr(setting, "LM_STRICT_JSON_MODE", True))
+DEFAULT_LM_MIN_SNIPPET_LETTERS = int(getattr(setting, "LM_MIN_SNIPPET_LETTERS", 24))
+DEFAULT_SEED_HASHES_FROM_TARGET = bool(getattr(setting, "SEED_HASHES_FROM_TARGET", True))
+DEFAULT_TARGET_HASH_SCAN_WORKERS = int(
+    getattr(setting, "TARGET_HASH_SCAN_WORKERS", max(2, min(8, os.cpu_count() or 4)))
+)
+DEFAULT_ISBN_LOOKUP = bool(getattr(setting, "ISBN_LOOKUP", True))
+DEFAULT_ISBN_PROVIDER = str(getattr(setting, "ISBN_PROVIDER", "auto")).strip().lower()
+DEFAULT_TRANSLATE_OUTPUT_NAMES = bool(
+    getattr(setting, "TRANSLATE_OUTPUT_NAMES", False)
+)
+DEFAULT_OUTPUT_LANGUAGE = str(getattr(setting, "OUTPUT_LANGUAGE", "auto")).strip().lower()
+DEFAULT_GUI_LANGUAGE = str(getattr(setting, "GUI_DEFAULT_LANGUAGE", "ru")).strip().lower()
+
+ARCHIVE_EXTENSIONS = {
+    ".zip",
+    ".7z",
+    ".rar",
+    ".tar",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".tgz",
+    ".tbz",
+    ".tbz2",
+    ".txz",
+    ".cbz",
+    ".cbr",
+    ".iso",
+}
+
+BOOK_EXTENSIONS = {
+    ".epub",
+    ".fb2",
+    ".pdf",
+    ".djvu",
+    ".mobi",
+    ".pdb",
+    ".azw",
+    ".azw3",
+    ".lit",
+    ".lrf",
+    ".prc",
+    ".rtf",
+    ".txt",
+    ".doc",
+    ".docx",
+    ".odt",
+    ".chm",
+    ".html",
+    ".htm",
+    ".md",
+    ".ppt",
+    ".pptx",
+    ".xls",
+    ".xlsx",
+    ".csv",
+    ".xps",
+    ".oxps",
+}
+
+BOOK_FILETYPE_MIMES = {
+    "application/pdf",
+    "application/epub+zip",
+    "application/x-mobipocket-ebook",
+    "application/vnd.ms-htmlhelp",
+    "application/msword",
+    "application/rtf",
+    "text/rtf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.oasis.opendocument.text",
+    "application/vnd.ms-xpsdocument",
+    "application/oxps",
+    "application/postscript",
+}
+
+BOOK_FILETYPE_EXTENSIONS = {
+    "pdf",
+    "epub",
+    "mobi",
+    "azw",
+    "azw3",
+    "doc",
+    "docx",
+    "rtf",
+    "odt",
+    "chm",
+    "xps",
+    "oxps",
+}
+
+BOOK_ZIP_CONTAINER_EXTENSIONS = {
+    ".epub",
+    ".docx",
+    ".pptx",
+    ".xlsx",
+    ".odt",
+    ".xps",
+    ".oxps",
+}
+
+ARCHIVE_FILETYPE_MIMES = {
+    "application/zip",
+    "application/x-7z-compressed",
+    "application/x-rar-compressed",
+    "application/gzip",
+    "application/x-gzip",
+    "application/x-bzip2",
+    "application/x-xz",
+    "application/x-tar",
+}
+
+NONBOOK_FILETYPE_MIME_PREFIXES = (
+    "image/",
+    "audio/",
+    "video/",
+    "font/",
+)
+
+NONBOOK_FILETYPE_MIMES = {
+    "application/x-msdownload",
+    "application/x-dosexec",
+    "application/vnd.microsoft.portable-executable",
+    "application/x-executable",
+    "application/x-mach-binary",
+    "application/x-elf",
+    "application/x-shockwave-flash",
+    "application/vnd.android.package-archive",
+    "application/java-archive",
+    "application/x-iso9660-image",
+    "application/vnd.ms-cab-compressed",
+}
+
+STRONG_NONBOOK_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".bmp",
+    ".webp",
+    ".tif",
+    ".tiff",
+    ".svg",
+    ".ico",
+    ".cur",
+    ".mp3",
+    ".wav",
+    ".flac",
+    ".ogg",
+    ".aac",
+    ".m4a",
+    ".wma",
+    ".mp4",
+    ".avi",
+    ".mkv",
+    ".mov",
+    ".wmv",
+    ".flv",
+    ".exe",
+    ".msi",
+    ".dll",
+    ".sys",
+    ".bin",
+    ".iso",
+    ".ttf",
+    ".otf",
+    ".woff",
+    ".woff2",
+    ".psd",
+    ".ai",
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+    ".swf",
+    ".js",
+    ".css",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".inf",
+    ".log",
+    ".tmp",
+    ".bak",
+    ".old",
+    ".dat",
+    ".hex",
+    ".cod",
+    ".pjt",
+    ".maa",
+    ".mos",
+    ".rom",
+    ".nes",
+    ".sfc",
+    ".smc",
+    ".gb",
+    ".gbc",
+    ".gba",
+    ".sav",
+    ".com",
+    ".bat",
+    ".cmd",
+    ".vbs",
+    ".ps1",
+    ".obj",
+    ".lib",
+    ".o",
+    ".class",
+    ".jar",
+    ".apk",
+    ".cab",
+    ".fbd",  # Flibusta/MyLib sidecar metadata — not a book
+}
+
+TINY_UNKNOWN_BINARY_BYTES = 64 * 1024
+
+TEXT_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".csv",
+    ".tsv",
+    ".json",
+    ".xml",
+    ".html",
+    ".htm",
+    ".fb2",
+    ".rtf",
+}
+
+# Контентные токены-сигналы для определения текстового файла как книги.
+# Только специфичные для книг слова — низкий риск ложных срабатываний.
+BOOK_CONTENT_TOKENS: tuple[str, ...] = (
+    # Структурные элементы книги (русский)
+    "isbn", "глава", "автор",
+    "пролог", "эпилог", "оглавление", "предисловие",
+    "посвящени", "издательств", "правообладател",
+    # Структурные элементы книги (английский)
+    "chapter", "prologue", "epilogue", "foreword",
+    "preface", "all rights reserved", "published by",
+    # Типографские маркеры
+    "©",
+)
+
+AGENT_KEYS = ("A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8")
+AGENT_LABELS = {
+    "A1": "Поиск",
+    "A2": "Распаковка",
+    "A3": "Книга?",
+    "A4": "XXH64",
+    "A5": "Теги",
+    "A6": "Ollama",
+    "A7": "Переименование",
+    "A8": "Упаковка",
+}
+AGENT_DB_SYNC_KEY = "A0"
+
+INVALID_FS_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+SPACES_RE = re.compile(r"\s+")
+JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+# Числовой ID-суффикс в имени файла: признак формата MyLib/Flibusta/LibRusEc.
+# Пример: "Gasnikov_Oktyabr.292696" — стем файла "Gasnikov_Oktyabr.292696.txt".
+LIBRARY_PORTAL_ID_RE = re.compile(r"\.\d{5,}$")
+
+
+@dataclass
+class Config:
+    source_dirs: list[Path] = field(
+        default_factory=lambda: [Path(p) for p in DEFAULT_SOURCE_DIRS]
+    )
+    target_dir: Path = Path(DEFAULT_TARGET_DIR)
+    dupes_dir: Path = Path(DEFAULT_DUPES_DIR)
+    nobook_dir: Path = Path(DEFAULT_NOBOOK_DIR)
+    error_dir: Path = Path(DEFAULT_ERROR_DIR)
+    temp_base: Path = Path(DEFAULT_TEMP_BASE)
+    lm_url: str = DEFAULT_LM_URL
+    lm_model: str = DEFAULT_LM_MODEL
+    lm_api_key: str = DEFAULT_LM_API_KEY
+    # A7-specific provider (falls back to primary if empty).
+    lm_url_rename: str = DEFAULT_LM_URL_RENAME
+    lm_model_rename: str = DEFAULT_LM_MODEL_RENAME
+    lm_api_key_rename: str = DEFAULT_LM_API_KEY_RENAME
+    queue_size: int = DEFAULT_QUEUE_SIZE
+    unpack_workers: int = DEFAULT_UNPACK_WORKERS
+    detect_workers: int = DEFAULT_DETECT_WORKERS
+    tag_workers: int = DEFAULT_TAG_WORKERS
+    lm_workers: int = DEFAULT_LM_WORKERS
+    rename_workers: int = DEFAULT_RENAME_WORKERS
+    dedupe_workers: int = DEFAULT_DEDUPE_WORKERS
+    pack_workers: int = DEFAULT_PACK_WORKERS
+    max_parallel_archives: int = DEFAULT_MAX_PARALLEL_ARCHIVES
+    delete_source_after_pack: bool = False
+    keep_temp_nobooks: bool = False
+    lm_timeout_sec: int = DEFAULT_LM_TIMEOUT_SEC
+    lm_input_chars: int = DEFAULT_LM_INPUT_CHARS
+    lm_max_output_tokens: int = DEFAULT_LM_MAX_OUTPUT_TOKENS
+    lm_fast_precheck: bool = DEFAULT_LM_FAST_PRECHECK
+    lm_fast_input_chars: int = DEFAULT_LM_FAST_INPUT_CHARS
+    lm_fast_max_output_tokens: int = DEFAULT_LM_FAST_MAX_OUTPUT_TOKENS
+    lm_fast_confidence_min: float = DEFAULT_LM_FAST_CONFIDENCE_MIN
+    lm_force_full_metadata: bool = DEFAULT_LM_FORCE_FULL_METADATA
+    lm_fill_unknown_author: bool = DEFAULT_LM_FILL_UNKNOWN_AUTHOR
+    lm_always_try_without_snippet: bool = DEFAULT_LM_ALWAYS_TRY_WITHOUT_SNIPPET
+    lm_strict_json_mode: bool = DEFAULT_LM_STRICT_JSON_MODE
+    lm_min_snippet_letters: int = DEFAULT_LM_MIN_SNIPPET_LETTERS
+    seed_hashes_from_target: bool = DEFAULT_SEED_HASHES_FROM_TARGET
+    target_hash_scan_workers: int = DEFAULT_TARGET_HASH_SCAN_WORKERS
+    isbn_lookup: bool = DEFAULT_ISBN_LOOKUP
+    isbn_provider: str = DEFAULT_ISBN_PROVIDER
+    translate_output_names: bool = DEFAULT_TRANSLATE_OUTPUT_NAMES
+    output_language: str = DEFAULT_OUTPUT_LANGUAGE
+    ephemeral_mode: bool = True
+
+
+class _IsbnRateLimited(Exception):
+    """Raised by _lookup_isbn_googlebooks when the server returns HTTP 429."""
+
+
+@dataclass
+class Metadata:
+    title: str = ""
+    author: str = ""
+    genre: str = ""
+    subgenres: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+    source: str = "none"
+
+
+@dataclass
+class FileTask:
+    task_id: str
+    path: Path
+    origin: str  # source | temp
+    source_root: Optional[Path] = None
+    archive_chain: list[str] = field(default_factory=list)
+    archive_source: Optional[Path] = None
+    cleanup_root: Optional[Path] = None
+    metadata: Metadata = field(default_factory=Metadata)
+    dest_zip: Optional[Path] = None
+    canonical_zip: Optional[Path] = None
+    xxh64: Optional[str] = None
+    is_book_candidate: bool = False
+    book_seen_counted: bool = False
+    book_done_counted: bool = False
+
+
+def format_duration_hms(seconds: Optional[int]) -> str:
+    if seconds is None:
+        return "--:--:--"
+    seconds = max(0, int(seconds))
+    hh = seconds // 3600
+    mm = (seconds % 3600) // 60
+    ss = seconds % 60
+    return f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+
+class AtomicCounter:
+    def __init__(self, initial: int = 0) -> None:
+        self._value = initial
+        self._lock = threading.Lock()
+
+    def inc(self, delta: int = 1) -> int:
+        with self._lock:
+            self._value += delta
+            return self._value
+
+    def dec(self, delta: int = 1) -> int:
+        with self._lock:
+            self._value -= delta
+            return self._value
+
+    def get(self) -> int:
+        with self._lock:
+            return self._value
+
+
+class Metrics:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.start_ts = time.time()
+        self.mode = "RUNNING"
+        self.books_seen = 0
+        self.books_done = 0
+        self.nobook_files = 0
+        self.total_tasks_seen = 0
+        self.total_tasks_done = 0
+        self.stage_processed: dict[str, int] = defaultdict(int)
+        self.stage_errors: dict[str, int] = defaultdict(int)
+        self.stage_touched_at: dict[str, float] = {}
+        self.results: dict[str, int] = defaultdict(int)
+        self.book_results: dict[str, int] = defaultdict(int)
+        self.lm_stats: dict[str, int] = defaultdict(int)
+        self.events: deque[str] = deque(maxlen=10)
+        self.active_stage_items: dict[str, dict[str, str]] = defaultdict(dict)
+        self.active_stage_started: dict[str, dict[str, float]] = defaultdict(dict)
+
+    def set_mode(self, mode: str) -> None:
+        with self.lock:
+            self.mode = mode
+
+    def add_event(self, text: str) -> None:
+        with self.lock:
+            ts = datetime.now().strftime("%H:%M:%S")
+            self.events.appendleft(f"[{ts}] {text}")
+
+    def set_active_item(self, stage: str, slot: str, text: str) -> None:
+        with self.lock:
+            previous = self.active_stage_items[stage].get(slot)
+            if previous != text:
+                self.active_stage_started[stage][slot] = time.time()
+            self.active_stage_items[stage][slot] = text
+
+    def clear_active_item(self, stage: str, slot: str) -> None:
+        with self.lock:
+            stage_map = self.active_stage_items.get(stage)
+            if not stage_map:
+                return
+            stage_map.pop(slot, None)
+            started_map = self.active_stage_started.get(stage)
+            if started_map:
+                started_map.pop(slot, None)
+                if not started_map:
+                    self.active_stage_started.pop(stage, None)
+            if not stage_map:
+                self.active_stage_items.pop(stage, None)
+
+    def _snapshot_active_items(self) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for stage, stage_map in self.active_stage_items.items():
+            if not stage_map:
+                continue
+            slot = sorted(stage_map.keys())[0]
+            out[stage] = stage_map[slot]
+        return out
+
+    def _snapshot_active_counts(self) -> dict[str, int]:
+        return {
+            stage: len(stage_map)
+            for stage, stage_map in self.active_stage_items.items()
+            if stage_map
+        }
+
+    def _snapshot_active_slots(self) -> dict[str, list[str]]:
+        out = {
+            stage: sorted(stage_map.keys())
+            for stage, stage_map in self.active_stage_items.items()
+            if stage_map
+        }
+        if "A1" not in out:
+            touched = self.stage_touched_at.get("A1", 0.0)
+            if touched and time.time() - touched <= 2.0:
+                out["A1"] = ["W1"]
+        return out
+
+    def _snapshot_active_elapsed(self, now: Optional[float] = None) -> dict[str, int]:
+        ts = time.time() if now is None else now
+        out: dict[str, int] = {}
+        for stage, started_map in self.active_stage_started.items():
+            if not started_map:
+                continue
+            out[stage] = max(0, int(max(ts - started for started in started_map.values())))
+        return out
+
+    def mark_task_seen(self) -> None:
+        with self.lock:
+            self.total_tasks_seen += 1
+
+    def mark_task_done(self, result: str) -> None:
+        with self.lock:
+            self.total_tasks_done += 1
+            self.results[result] += 1
+
+    def mark_book_seen(self) -> None:
+        with self.lock:
+            self.books_seen += 1
+
+    def unmark_book_seen(self) -> None:
+        with self.lock:
+            self.books_seen = max(0, self.books_seen - 1)
+
+    def mark_book_done(self, result: str) -> None:
+        with self.lock:
+            self.books_done += 1
+            self.book_results[result] += 1
+
+    def mark_nobook_file_saved(self) -> None:
+        with self.lock:
+            self.nobook_files += 1
+
+    def mark_stage(self, stage: str, error: bool = False) -> None:
+        with self.lock:
+            self.stage_touched_at[stage] = time.time()
+            self.stage_processed[stage] += 1
+            if error:
+                self.stage_errors[stage] += 1
+
+    def mark_lm_stat(self, key: str, delta: int = 1) -> dict[str, int]:
+        with self.lock:
+            self.lm_stats[key] += delta
+            return dict(self.lm_stats)
+
+    def snapshot(
+        self,
+        queue_sizes: dict[str, int],
+        stage_flags: Optional[dict[str, bool]] = None,
+    ) -> dict[str, Any]:
+        with self.lock:
+            seen = self.books_seen
+            done = self.books_done
+            stage_processed = dict(self.stage_processed)
+            stage_errors = dict(self.stage_errors)
+            results = dict(self.results)
+            book_results = dict(self.book_results)
+            lm_stats = dict(self.lm_stats)
+            nobook_files = self.nobook_files
+            now = time.time()
+            elapsed = int(now - self.start_ts)
+            active_stage_counts = self._snapshot_active_counts()
+            active_stage_slots = self._snapshot_active_slots()
+            active_stage_elapsed = self._snapshot_active_elapsed(now)
+            # Remaining work: books in flight + all downstream queues
+            a2_proc = int(stage_processed.get("A2", 0))
+            a3_proc = int(stage_processed.get("A3", 0))
+            a2_queue = max(0, int(queue_sizes.get("A2", 0)))
+            files_per_a2 = (a3_proc / max(1, a2_proc)) if a2_proc > 0 else 1.0
+            files_per_a2 = max(0.0, min(64.0, files_per_a2))
+            book_ratio = (seen / max(1, a3_proc)) if a3_proc > 0 else 1.0
+            book_ratio = max(0.0, min(1.0, book_ratio))
+            a2_estimated_books = int(a2_queue * files_per_a2 * book_ratio)
+
+            downstream_backlog = max(0, seen - done)
+            for stage in ("A3", "A4", "A5", "A6", "A7", "A8"):
+                downstream_backlog += max(0, int(queue_sizes.get(stage, 0)))
+                downstream_backlog += max(0, int(active_stage_counts.get(stage, 0)))
+
+            total_remaining = downstream_backlog + a2_estimated_books
+            total_estimated_books = done + total_remaining
+
+            pct = (
+                0.0
+                if total_estimated_books == 0
+                else (done / total_estimated_books) * 100.0
+            )
+            pct = max(0.0, min(100.0, pct))
+
+            eta_seconds: Optional[int]
+            if done > 0 and elapsed > 0:
+                speed = done / elapsed  # books per second
+                eta_seconds = int(total_remaining / max(speed, 1e-9)) if total_remaining > 0 else 0
+            else:
+                eta_seconds = None
+            return {
+                "mode": self.mode,
+                "seen": seen,
+                "done": done,
+                "nobook_files": nobook_files,
+                "tasks_seen": self.total_tasks_seen,
+                "tasks_done": self.total_tasks_done,
+                "pct": pct,
+                "progress_total_books": total_estimated_books,
+                "estimated_total_books": total_estimated_books,
+                "known_pipeline_backlog": total_remaining,
+                "elapsed_sec": elapsed,
+                "eta_sec": eta_seconds,
+                "elapsed": format_duration_hms(elapsed),
+                "eta": format_duration_hms(eta_seconds),
+                "stage_processed": stage_processed,
+                "stage_errors": stage_errors,
+                "results": results,
+                "book_results": book_results,
+                "lm_stats": lm_stats,
+                "events": list(self.events),
+                "active_stage_items": self._snapshot_active_items(),
+                "active_stage_counts": active_stage_counts,
+                "active_stage_slots": active_stage_slots,
+                "active_stage_elapsed": active_stage_elapsed,
+                "queue_sizes": queue_sizes,
+                "stage_flags": dict(stage_flags or {}),
+                "eta_model": "pipeline_backlog+A1/A2(active)/A3-A8",
+            }
+
+
+class ManifestDB:
+    def __init__(self, db_path: Path) -> None:
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=FULL")
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS hashes (
+                    xxh64 TEXT PRIMARY KEY,
+                    canonical_zip TEXT NOT NULL,
+                    title TEXT,
+                    author TEXT,
+                    genre TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS files (
+                    task_id TEXT PRIMARY KEY,
+                    source_path TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    message TEXT,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lm_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS target_index (
+                    path_key TEXT PRIMARY KEY,
+                    canonical_zip TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    xxh64 TEXT,
+                    status TEXT NOT NULL,
+                    note TEXT,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                UPDATE files
+                SET status = 'duplicate_temp'
+                WHERE status = 'duplicate'
+                  AND source_path LIKE '%_TempPipeline%'
+                """
+            )
+
+    def mark_file(self, task: FileTask, status: str, message: str = "") -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO files(task_id, source_path, status, message, updated_at)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    source_path=excluded.source_path,
+                    status=excluded.status,
+                    message=excluded.message,
+                    updated_at=excluded.updated_at
+                """,
+                (task.task_id, str(task.path), status, message, now),
+            )
+
+    def claim_hash(
+        self,
+        xxh64_hex: str,
+        canonical_zip: Path,
+        title: str,
+        author: str,
+        genre: str,
+    ) -> tuple[bool, Optional[str]]:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self.conn:
+            try:
+                self.conn.execute(
+                    """
+                    INSERT INTO hashes(xxh64, canonical_zip, title, author, genre, created_at)
+                    VALUES(?, ?, ?, ?, ?, ?)
+                    """,
+                    (xxh64_hex, str(canonical_zip), title, author, genre, now),
+                )
+                return True, None
+            except sqlite3.IntegrityError:
+                row = self.conn.execute(
+                    "SELECT canonical_zip FROM hashes WHERE xxh64 = ?",
+                    (xxh64_hex,),
+                ).fetchone()
+                return False, (row[0] if row else None)
+
+    def get_lm_cache(self, cache_key: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT payload_json FROM lm_cache WHERE cache_key = ?",
+                (cache_key,),
+            ).fetchone()
+            if not row:
+                return None
+            try:
+                return json.loads(row[0])
+            except Exception:
+                return None
+
+    def set_lm_cache(self, cache_key: str, payload: dict[str, Any]) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        with self._lock, self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO lm_cache(cache_key, payload_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    payload_json=excluded.payload_json,
+                    updated_at=excluded.updated_at
+                """,
+                (cache_key, payload_json, now),
+            )
+
+    def close(self) -> None:
+        with self._lock:
+            self.conn.close()
+
+    def remove_hash(self, xxh64_hex: str) -> None:
+        with self._lock, self.conn:
+            self.conn.execute("DELETE FROM hashes WHERE xxh64 = ?", (xxh64_hex,))
+
+    def get_target_index(self, path_key: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT path_key, canonical_zip, size_bytes, mtime_ns, xxh64, status, note
+                FROM target_index
+                WHERE path_key = ?
+                """,
+                (path_key,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "path_key": str(row[0]),
+            "canonical_zip": str(row[1]),
+            "size_bytes": int(row[2]),
+            "mtime_ns": int(row[3]),
+            "xxh64": str(row[4]) if row[4] else "",
+            "status": str(row[5]),
+            "note": str(row[6]) if row[6] else "",
+        }
+
+    def get_target_index_rows(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT path_key, canonical_zip, size_bytes, mtime_ns, xxh64, status, note
+                FROM target_index
+                """
+            ).fetchall()
+        return [
+            {
+                "path_key": str(row[0]),
+                "canonical_zip": str(row[1]),
+                "size_bytes": int(row[2]),
+                "mtime_ns": int(row[3]),
+                "xxh64": str(row[4]) if row[4] else "",
+                "status": str(row[5]),
+                "note": str(row[6]) if row[6] else "",
+            }
+            for row in rows
+        ]
+
+    def upsert_target_index_stat(
+        self,
+        path_key: str,
+        canonical_zip: Path,
+        size_bytes: int,
+        mtime_ns: int,
+        status: str = "pending",
+        note: str = "",
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO target_index(path_key, canonical_zip, size_bytes, mtime_ns, xxh64, status, note, updated_at)
+                VALUES(?, ?, ?, ?, NULL, ?, ?, ?)
+                ON CONFLICT(path_key) DO UPDATE SET
+                    canonical_zip=excluded.canonical_zip,
+                    size_bytes=excluded.size_bytes,
+                    mtime_ns=excluded.mtime_ns,
+                    xxh64=NULL,
+                    status=excluded.status,
+                    note=excluded.note,
+                    updated_at=excluded.updated_at
+                """,
+                (path_key, str(canonical_zip), size_bytes, mtime_ns, status, note, now),
+            )
+
+    def mark_target_index_hashed(
+        self,
+        path_key: str,
+        canonical_zip: Path,
+        size_bytes: int,
+        mtime_ns: int,
+        xxh64_hex: Optional[str],
+        status: str,
+        note: str,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO target_index(path_key, canonical_zip, size_bytes, mtime_ns, xxh64, status, note, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(path_key) DO UPDATE SET
+                    canonical_zip=excluded.canonical_zip,
+                    size_bytes=excluded.size_bytes,
+                    mtime_ns=excluded.mtime_ns,
+                    xxh64=excluded.xxh64,
+                    status=excluded.status,
+                    note=excluded.note,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    path_key,
+                    str(canonical_zip),
+                    size_bytes,
+                    mtime_ns,
+                    xxh64_hex or None,
+                    status,
+                    note,
+                    now,
+                ),
+            )
+
+    def remove_target_index(self, path_key: str) -> None:
+        with self._lock, self.conn:
+            self.conn.execute("DELETE FROM target_index WHERE path_key = ?", (path_key,))
+
+    def update_hash_record(
+        self,
+        xxh64_hex: str,
+        canonical_zip: Path,
+        title: str,
+        author: str,
+        genre: str,
+    ) -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                """
+                UPDATE hashes
+                SET canonical_zip = ?, title = ?, author = ?, genre = ?
+                WHERE xxh64 = ?
+                """,
+                (str(canonical_zip), title, author, genre, xxh64_hex),
+            )
+
+    def get_hash_rows(self) -> list[tuple[str, str]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT xxh64, canonical_zip FROM hashes"
+            ).fetchall()
+        return [(str(row[0]), str(row[1])) for row in rows]
+
+    def upsert_hash(
+        self,
+        xxh64_hex: str,
+        canonical_zip: Path,
+        title: str,
+        author: str,
+        genre: str,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO hashes(xxh64, canonical_zip, title, author, genre, created_at)
+                VALUES(?, ?, ?, ?, ?, ?)
+                ON CONFLICT(xxh64) DO UPDATE SET
+                    canonical_zip=excluded.canonical_zip,
+                    title=excluded.title,
+                    author=excluded.author,
+                    genre=excluded.genre
+                """,
+                (xxh64_hex, str(canonical_zip), title, author, genre, now),
+            )
+
+
+class TempTracker:
+    def __init__(self, logger: logging.Logger, metrics: Metrics) -> None:
+        self._lock = threading.Lock()
+        self._refs: dict[Path, int] = defaultdict(int)
+        self.logger = logger
+        self.metrics = metrics
+
+    def register(self, root: Optional[Path]) -> None:
+        if not root:
+            return
+        with self._lock:
+            self._refs[root] += 1
+
+    def release(self, root: Optional[Path]) -> None:
+        if not root:
+            return
+        should_delete = False
+        with self._lock:
+            if root not in self._refs:
+                return
+            self._refs[root] -= 1
+            if self._refs[root] <= 0:
+                del self._refs[root]
+                should_delete = True
+        if should_delete:
+            try:
+                shutil.rmtree(root, ignore_errors=True)
+                self.metrics.add_event(f"Temp cleaned: {root}")
+            except Exception as exc:
+                self.logger.exception("Ошибка очистки temp %s: %s", root, exc)
+
+
+class LMStudioClient:
+    def __init__(
+        self,
+        config: Config,
+        logger: logging.Logger,
+        metrics: Metrics,
+        db: ManifestDB,
+    ) -> None:
+        self.config = config
+        self.logger = logger
+        self.metrics = metrics
+        self.db = db
+        self.available = requests is not None
+
+    def _response_error_brief(self, resp: Any, max_len: int = 220) -> str:
+        try:
+            raw = resp.text or ""
+        except Exception:
+            raw = ""
+        brief = clean_text(raw)
+        return truncate(brief, max_len)
+
+    def _post_chat(
+        self,
+        payload: dict[str, Any],
+        timeout: tuple[int, int],
+        *,
+        url: str = "",
+        api_key: Optional[str] = None,
+    ) -> tuple[Any, str]:
+        """Post a chat-completion request.
+
+        ``url`` and ``api_key`` override the primary config values when set.
+        Pass ``api_key=""`` to explicitly send *no* Authorization header
+        (e.g. when the rename provider is a local Ollama with no key).
+        Pass ``api_key=None`` (default) to inherit from ``self.config.lm_api_key``.
+        """
+        if requests is None:
+            raise RuntimeError("requests is unavailable")
+
+        effective_url = url or self.config.lm_url
+        effective_api_key = api_key if api_key is not None else self.config.lm_api_key
+
+        messages = payload.get("messages", [])
+        attempts: list[tuple[str, dict[str, Any]]] = []
+        if self.config.lm_strict_json_mode:
+            strict_payload = {**payload, "response_format": {"type": "json_object"}}
+            attempts.append(("strict_json", strict_payload))
+        attempts.append(("default", payload))
+        # Compatibility fallback for OpenAI-compatible servers that reject some optional fields.
+        attempts.append(
+            (
+                "minimal",
+                {
+                    "model": payload.get("model", self.config.lm_model),
+                    "messages": messages,
+                },
+            )
+        )
+        if "max_tokens" in payload:
+            attempts.append(
+                (
+                    "minimal_max_completion",
+                    {
+                        "model": payload.get("model", self.config.lm_model),
+                        "messages": messages,
+                        "max_completion_tokens": payload.get("max_tokens"),
+                    },
+                )
+            )
+
+        # Build request headers. Authorization header is required for cloud
+        # providers (OpenRouter, OpenAI, etc.) and safely ignored by Ollama.
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if effective_api_key:
+            headers["Authorization"] = f"Bearer {effective_api_key}"
+            # OpenRouter uses these to identify the application and grant free-tier access.
+            if "openrouter.ai" in effective_url:
+                headers["HTTP-Referer"] = "https://github.com/LibSort"
+                headers["X-Title"] = "LibSort"
+
+        tried: set[str] = set()
+        last_resp: Any = None
+        last_mode = "none"
+        for mode, body in attempts:
+            try_key = json.dumps(body, ensure_ascii=False, sort_keys=True, default=str)
+            if try_key in tried:
+                continue
+            tried.add(try_key)
+            resp = requests.post(effective_url, json=body, headers=headers, timeout=timeout)
+            last_resp = resp
+            last_mode = mode
+            if resp.status_code < 400:
+                return resp, mode
+            if resp.status_code not in {400, 404, 409, 415, 422}:
+                return resp, mode
+        return last_resp, last_mode
+
+    def _is_unknown_title(self, value: str) -> bool:
+        return clean_text(value).strip().lower() in {
+            "",
+            "unknown",
+            "unknown title",
+        }
+
+    def _is_unknown_author(self, value: str) -> bool:
+        return clean_text(value).strip().lower() in {
+            "",
+            "unknown",
+            "unknown author",
+        }
+
+    def _is_unknown_genre(self, value: str) -> bool:
+        return clean_text(value).strip().lower() in {
+            "",
+            "unknown",
+            "unknown genre",
+        }
+
+    def _lm_result_is_strong(self, parsed: Optional[dict[str, Any]]) -> bool:
+        if not parsed:
+            return False
+        title = clean_text(parsed.get("title", ""))
+        author = clean_text(parsed.get("author", ""))
+        genre = normalize_genre(clean_text(parsed.get("genre", "")) or "Unknown")
+        try:
+            conf = float(parsed.get("confidence", 0.0))
+        except Exception:
+            conf = 0.0
+        if self._is_unknown_title(title):
+            return False
+        if self._is_unknown_author(author):
+            return False
+        if self._is_unknown_genre(genre):
+            return False
+        return conf >= float(self.config.lm_fast_confidence_min)
+
+    def _fast_enrich_from_context(self, task: FileTask) -> Optional[dict[str, Any]]:
+        if not self.available or not self.config.lm_fast_precheck:
+            return None
+
+        context = build_lm_fallback_context(
+            task, max_chars=max(200, int(self.config.lm_fast_input_chars))
+        )
+        payload_seed = {
+            "schema": "lm_results_fast_v3",
+            "path": task.path.name,
+            "metadata": task.metadata.__dict__,
+            "context": context,
+        }
+        cache_key = xxhash.xxh64(
+            json.dumps(payload_seed, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        cached = self.db.get_lm_cache(cache_key)
+        if cached:
+            self.logger.info("LM fast cache_hit path=%s key=%s", task.path, cache_key[:10])
+            return cached
+
+        genre_list = ", ".join(CANONICAL_GENRES)
+        system_prompt = (
+            "РОЛЬ И ЗАДАЧА: Ты — машина для быстрой предварительной каталогизации книги. "
+            "Используй только имя файла, путь, цепочку архивов и уже найденные метаданные. "
+            "Не выдумывай. Если в каком-то поле нет уверенности, верни Unknown. "
+            f"Жанр выбирай только из списка: {genre_list}. "
+            """Не добавляй никаких пояснений, только чистый JSON.
+
+ПРИМЕР ВЫВОДА:
+{
+  "results": [
+    {
+      "title": "Название А",
+      "author": "Автор X",
+      "genre_analysis": {
+        "primary_genre": "Научная фантастика",
+        "subgenres": [],
+        "confidence_score": 5.0
+      }
+    }
+  ]
+}"""
+        )
+        user_prompt = (
+            "БЫСТРЫЙ КОНТЕКСТ КНИГИ:\n"
+            f"Имя файла: {task.path.name}\n"
+            f"Текущие теги и эвристики: {json.dumps(task.metadata.__dict__, ensure_ascii=False)}\n"
+            f"{context}\n"
+            "Верни JSON строго по шаблону: один объект в массиве results для этой книги. "
+            "Если title, author или genre определить надежно нельзя, используй Unknown."
+        )
+        request_payload = {
+            "model": self.config.lm_model,
+            "temperature": 0.0,
+            "max_tokens": min(
+                int(self.config.lm_fast_max_output_tokens),
+                int(self.config.lm_max_output_tokens),
+            ),
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        try:
+            resp, req_mode = self._post_chat(
+                request_payload, timeout=(6, self.config.lm_timeout_sec)
+            )
+            if resp.status_code >= 400:
+                self.logger.warning(
+                    "LM fast HTTP %s mode=%s path=%s body=%s",
+                    resp.status_code,
+                    req_mode,
+                    task.path,
+                    self._response_error_brief(resp),
+                )
+                return None
+            data = resp.json()
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            parsed = parse_model_payload(content)
+            retry_content = ""
+            if not parsed:
+                retry_payload = {
+                    **request_payload,
+                    "messages": request_payload["messages"]
+                    + [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Верни только валидный JSON-объект без markdown и текста вокруг. "
+                                "Строго структура: {\"results\":[{\"title\":\"...\",\"author\":\"...\","
+                                "\"genre_analysis\":{\"primary_genre\":\"...\",\"subgenres\":[],"
+                                "\"confidence_score\":5.0}}]}"
+                            ),
+                        }
+                    ],
+                }
+                retry, retry_mode = self._post_chat(
+                    retry_payload, timeout=(6, self.config.lm_timeout_sec)
+                )
+                if retry.status_code < 400:
+                    retry_data = retry.json()
+                    retry_content = (
+                        retry_data.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content", "")
+                        .strip()
+                    )
+                    parsed = parse_model_payload(retry_content)
+                else:
+                    self.logger.warning(
+                        "LM fast retry HTTP %s mode=%s path=%s body=%s",
+                        retry.status_code,
+                        retry_mode,
+                        task.path,
+                        self._response_error_brief(retry),
+                    )
+            if not parsed:
+                self.logger.warning(
+                    "LM fast non-json path=%s raw=%s retry=%s",
+                    task.path,
+                    truncate(clean_text(content), 180),
+                    truncate(clean_text(retry_content), 180),
+                )
+                return None
+            self.db.set_lm_cache(cache_key, parsed)
+            self.logger.info(
+                "LM fast parsed path=%s payload=%s",
+                task.path,
+                json.dumps(parsed, ensure_ascii=False),
+            )
+            return parsed
+        except Exception as exc:
+            self.logger.warning("Ollama fast precheck недоступен: %s", exc)
+            return None
+
+    def enrich(self, task: FileTask, snippet: str) -> Optional[dict[str, Any]]:
+        if not self.available:
+            self.logger.warning("LM full unavailable: requests import failed")
+            return None
+        snippet = snippet[: self.config.lm_input_chars]
+        payload_seed = {
+            "schema": "lm_results_genre_analysis_v1",
+            "path": task.path.name,
+            "metadata": task.metadata.__dict__,
+            "snippet": snippet,
+        }
+        cache_key = xxhash.xxh64(
+            json.dumps(payload_seed, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        cached = self.db.get_lm_cache(cache_key)
+        if cached:
+            self.logger.info("LM full cache_hit path=%s key=%s", task.path, cache_key[:10])
+            return cached
+
+        genre_list = ", ".join(CANONICAL_GENRES)
+        system_prompt = (
+            "РОЛЬ И ЗАДАЧА: Ты — машина для категоризации литературных произведений. "
+            "Твоя задача — принять данные о книге и вернуть результат в строгом JSON-формате. "
+            f"Жанр выбирай только из списка: {genre_list}. "
+            """Не добавляй никаких вводных слов или заключений, только чистый JSON.
+
+ПРИМЕР ВЫВОДА:
+{
+  "results": [
+    {
+      "title": "Название А",
+      "author": "Автор X",
+      "genre_analysis": {
+        "primary_genre": "Научная фантастика",
+        "subgenres": ["Транспортный триллер", "Дистопия"],
+        "confidence_score": 5.0
+      }
+    }
+  ]
+}"""
+        )
+        user_prompt = (
+            "ДАННЫЕ О КНИГЕ:\n"
+            f"Имя файла: {task.path.name}\n"
+            f"Текущие теги и эвристики: {json.dumps(task.metadata.__dict__, ensure_ascii=False)}\n"
+            "Фрагмент текста/контекст (ограниченный, не вся книга):\n"
+            f"{snippet}"
+        )
+        archive_chain = " -> ".join(task.archive_chain) if task.archive_chain else "(none)"
+        user_prompt += (
+            f"\nПолный путь: {task.path}\n"
+            f"Цепочка архивов: {archive_chain}\n"
+            "Верни JSON строго по шаблону: один объект в массиве results для этой книги."
+        )
+        request_payload = {
+            "model": self.config.lm_model,
+            "temperature": 0.1,
+            "max_tokens": self.config.lm_max_output_tokens,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        try:
+            resp, req_mode = self._post_chat(
+                request_payload, timeout=(6, self.config.lm_timeout_sec)
+            )
+            if resp.status_code >= 400:
+                self.logger.warning(
+                    "LM full HTTP %s mode=%s path=%s body=%s",
+                    resp.status_code,
+                    req_mode,
+                    task.path,
+                    self._response_error_brief(resp),
+                )
+                self.metrics.add_event(
+                    f"Ollama HTTP {resp.status_code}: fallback для {task.path.name}"
+                )
+                return None
+            data = resp.json()
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            parsed = parse_model_payload(content)
+            retry_content = ""
+            if not parsed:
+                retry_payload = {
+                    **request_payload,
+                    "temperature": 0.0,
+                    "messages": request_payload["messages"]
+                    + [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Верни только валидный JSON-объект без markdown и текста вокруг. "
+                                "Строго структура: {\"results\":[{\"title\":\"...\",\"author\":\"...\","
+                                "\"genre_analysis\":{\"primary_genre\":\"...\",\"subgenres\":[\"...\"],"
+                                "\"confidence_score\":5.0}}]}"
+                            ),
+                        }
+                    ],
+                }
+                retry, retry_mode = self._post_chat(
+                    retry_payload, timeout=(6, self.config.lm_timeout_sec)
+                )
+                if retry.status_code < 400:
+                    retry_data = retry.json()
+                    retry_content = (
+                        retry_data.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content", "")
+                        .strip()
+                    )
+                    parsed = parse_model_payload(retry_content)
+                else:
+                    self.logger.warning(
+                        "LM full retry HTTP %s mode=%s path=%s body=%s",
+                        retry.status_code,
+                        retry_mode,
+                        task.path,
+                        self._response_error_brief(retry),
+                    )
+            if not parsed:
+                self.logger.warning(
+                    "LM full non-json path=%s raw=%s retry=%s",
+                    task.path,
+                    truncate(clean_text(content), 200),
+                    truncate(clean_text(retry_content), 200),
+                )
+                self.metrics.add_event(
+                    f"Ollama вернул не-JSON для {task.path.name}: fallback"
+                )
+                return None
+            self.db.set_lm_cache(cache_key, parsed)
+            self.logger.info(
+                "LM full parsed path=%s payload=%s",
+                task.path,
+                json.dumps(parsed, ensure_ascii=False),
+            )
+            return parsed
+        except Exception as exc:
+            self.logger.warning("Ollama недоступен: %s", exc)
+            self.metrics.add_event(f"Ollama недоступен: {exc}")
+            return None
+
+    def enrich_genre_only(self, task: FileTask) -> Optional[dict[str, Any]]:
+        if not self.available:
+            self.logger.warning("LM genre-only unavailable: requests import failed")
+            return None
+        payload_seed = {
+            "mode": "genre_only",
+            "path": task.path.name,
+            "title": task.metadata.title,
+            "author": task.metadata.author,
+            "genre": task.metadata.genre,
+        }
+        cache_key = xxhash.xxh64(
+            json.dumps(payload_seed, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        cached = self.db.get_lm_cache(cache_key)
+        if cached:
+            self.logger.info("LM genre-only cache_hit path=%s key=%s", task.path, cache_key[:10])
+            return cached
+
+        system_prompt = (
+            "You are a library cataloguer. Return ONLY a JSON object, no explanations. "
+            "Format: {\"genre\":\"...\",\"confidence\":0.0} where confidence is 0.0–1.0. "
+            f"Choose genre strictly from this list: {', '.join(CANONICAL_GENRES)}. "
+            "Use title, author, filename, path, archive folder names and text snippet as clues. "
+            "Make your best guess even with limited data — use 'Unknown' only if there are "
+            "absolutely no clues at all."
+        )
+        snippet = extract_text_snippet(task.path, max_chars=300)
+        archive_chain = " -> ".join(task.archive_chain) if task.archive_chain else ""
+        user_prompt = (
+            f"Filename: {task.path.name}\n"
+            f"Title: {task.metadata.title}\n"
+            f"Author: {task.metadata.author}\n"
+            f"Archive path: {archive_chain or task.path}\n"
+        )
+        if snippet:
+            user_prompt += f"Text snippet:\n{snippet[:300]}\n"
+        request_payload = {
+            "model": self.config.lm_model,
+            "temperature": 0.0,
+            "max_tokens": min(60, self.config.lm_max_output_tokens),
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        try:
+            resp, req_mode = self._post_chat(
+                request_payload, timeout=(6, self.config.lm_timeout_sec)
+            )
+            if resp.status_code >= 400:
+                self.logger.warning(
+                    "LM genre-only HTTP %s mode=%s path=%s body=%s",
+                    resp.status_code,
+                    req_mode,
+                    task.path,
+                    self._response_error_brief(resp),
+                )
+                self.metrics.add_event(
+                    f"LM genre-only HTTP {resp.status_code}: fallback для {task.path.name}"
+                )
+                return None
+            data = resp.json()
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            parsed = parse_model_payload(content)
+            retry_content = ""
+            if not parsed:
+                retry_payload = {
+                    **request_payload,
+                    "temperature": 0.0,
+                    "messages": request_payload["messages"]
+                    + [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Верни только валидный JSON-объект без markdown и текста вокруг. "
+                                "Строго ключи: genre, confidence."
+                            ),
+                        }
+                    ],
+                }
+                retry, retry_mode = self._post_chat(
+                    retry_payload, timeout=(6, self.config.lm_timeout_sec)
+                )
+                if retry.status_code < 400:
+                    retry_data = retry.json()
+                    retry_content = (
+                        retry_data.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content", "")
+                        .strip()
+                    )
+                    parsed = parse_model_payload(retry_content)
+                else:
+                    self.logger.warning(
+                        "LM genre-only retry HTTP %s mode=%s path=%s body=%s",
+                        retry.status_code,
+                        retry_mode,
+                        task.path,
+                        self._response_error_brief(retry),
+                    )
+            if not parsed:
+                self.logger.warning(
+                    "LM genre-only non-json path=%s raw=%s retry=%s",
+                    task.path,
+                    truncate(clean_text(content), 180),
+                    truncate(clean_text(retry_content), 180),
+                )
+                return None
+            self.db.set_lm_cache(cache_key, parsed)
+            self.logger.info(
+                "LM genre-only parsed path=%s payload=%s",
+                task.path,
+                json.dumps(parsed, ensure_ascii=False),
+            )
+            return parsed
+        except Exception as exc:
+            self.logger.warning("Ollama genre-only недоступен: %s", exc)
+            return None
+
+    def translate_output_metadata(
+        self,
+        task: FileTask,
+        md: Metadata,
+        target_language: str,
+    ) -> dict[str, str]:
+        lang = normalize_output_language(target_language)
+        original_title = clean_text(md.title or task.path.stem)
+        original_author = clean_text(md.author or "Unknown Author")
+        canonical_genre = normalize_genre(md.genre or "Unknown")
+        translated: dict[str, str] = {
+            "genre": translate_genre_for_output(canonical_genre, lang),
+        }
+
+        if not self.available:
+            self.logger.warning("LM rename unavailable: requests import failed")
+            return translated
+
+        payload_seed = {
+            "schema": "output_name_translation_v1",
+            "target_language": lang,
+            "title": original_title,
+            "author": original_author,
+            "genre": canonical_genre,
+        }
+        cache_key = "rename:" + xxhash.xxh64(
+            json.dumps(payload_seed, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        cached = self.db.get_lm_cache(cache_key)
+        if cached:
+            self.logger.info("LM rename cache_hit path=%s key=%s", task.path, cache_key[:16])
+            return {str(k): str(v) for k, v in cached.items() if v}
+
+        target_name = "Russian" if lang == "ru" else "English"
+        system_prompt = (
+            "You are a careful library catalog translator. "
+            f"Translate output display names to {target_name}. "
+            "Return only a valid JSON object with keys title and author. "
+            "Do not add explanations. Preserve volume numbers, part numbers, editions, "
+            "technical abbreviations, ISBNs and series markers. "
+            "For authors, use the established name in the target language when it is well known; "
+            "otherwise transliterate. Do not invent missing metadata."
+        )
+        user_prompt = (
+            f"Target language: {target_name}\n"
+            f"Title: {original_title}\n"
+            f"Author: {original_author}\n"
+            f"Genre: {canonical_genre}\n"
+            f"Filename: {task.path.name}\n"
+            "Return JSON exactly like: {\"title\":\"...\",\"author\":\"...\"}"
+        )
+        # Use rename-specific provider if configured, otherwise fall back to primary.
+        rename_url = self.config.lm_url_rename or self.config.lm_url
+        rename_model = self.config.lm_model_rename or self.config.lm_model
+        rename_api_key: Optional[str] = (
+            self.config.lm_api_key_rename
+            if self.config.lm_url_rename   # rename URL set → use its own key (may be "")
+            else None                       # no rename URL → inherit primary key
+        )
+        request_payload = {
+            "model": rename_model,
+            "temperature": 0.0,
+            "max_tokens": min(160, self.config.lm_max_output_tokens),
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        try:
+            self.metrics.mark_lm_stat("rename_request")
+            resp, req_mode = self._post_chat(
+                request_payload,
+                timeout=(6, self.config.lm_timeout_sec),
+                url=rename_url,
+                api_key=rename_api_key,
+            )
+            if resp.status_code >= 400:
+                self.logger.warning(
+                    "LM rename HTTP %s mode=%s path=%s body=%s",
+                    resp.status_code,
+                    req_mode,
+                    task.path,
+                    self._response_error_brief(resp),
+                )
+                self.metrics.mark_lm_stat("rename_no_result")
+                return translated
+
+            data = resp.json()
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            parsed = parse_model_payload(content)
+            if not parsed:
+                retry_payload = {
+                    **request_payload,
+                    "messages": request_payload["messages"] + [
+                        {"role": "user", "content": (
+                            f'Return only valid JSON: {{"title":"{original_title}",'
+                            f'"author":"{original_author}"}}'
+                        )},
+                    ],
+                }
+                retry_resp, _ = self._post_chat(
+                    retry_payload,
+                    timeout=(6, self.config.lm_timeout_sec),
+                    url=rename_url,
+                    api_key=rename_api_key,
+                )
+                retry_content = (
+                    retry_resp.json()
+                    .get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                    .strip()
+                ) if retry_resp.status_code < 400 else ""
+                parsed = parse_model_payload(retry_content)
+                if not parsed:
+                    self.logger.warning(
+                        "LM rename non-json path=%s raw=%s",
+                        task.path,
+                        truncate(clean_text(content), 180),
+                    )
+                    self.metrics.mark_lm_stat("rename_no_result")
+                    return translated
+
+            title = clean_text(parsed.get("title", ""))
+            author = clean_text(parsed.get("author", ""))
+            if title and not self._is_unknown_title(title):
+                translated["title"] = title
+            if author and not self._is_unknown_author(author):
+                translated["author"] = author
+            self.db.set_lm_cache(cache_key, translated)
+            self.metrics.mark_lm_stat("rename_ok")
+            self.logger.info(
+                "LM rename parsed path=%s lang=%s payload=%s",
+                task.path,
+                lang,
+                json.dumps(translated, ensure_ascii=False),
+            )
+            return translated
+        except Exception as exc:
+            self.metrics.mark_lm_stat("rename_no_result")
+            self.logger.warning("Ollama rename недоступен: %s", exc)
+            return translated
+
+
+class TerminalUI:
+    def __init__(self, metrics: Metrics, pipeline: "LibrarySorter") -> None:
+        self.metrics = metrics
+        self.pipeline = pipeline
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="UI", daemon=True)
+
+    def start(self) -> None:
+        enable_ansi_on_windows()
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=3)
+        # Показываем курсор обратно.
+        sys.stdout.write("\x1b[?25h\n")
+        sys.stdout.flush()
+
+    def _run(self) -> None:
+        sys.stdout.write("\x1b[?25l")
+        while not self.stop_event.is_set():
+            queue_sizes = self.pipeline.queue_sizes()
+            snap = self.metrics.snapshot(queue_sizes, self.pipeline.stage_flags())
+            frame = self._render_frame(snap)
+            sys.stdout.write("\x1b[H\x1b[2J")
+            sys.stdout.write(frame)
+            sys.stdout.flush()
+            time.sleep(0.5)
+
+    def _render_frame(self, snap: dict[str, Any]) -> str:
+        width = 118
+        bar_width = 48
+        ratio = max(0.0, min(1.0, snap["pct"] / 100.0))
+        filled = int(bar_width * ratio)
+        bar = ("#" * filled).ljust(bar_width, "-")
+        book_results = snap.get("book_results", {})
+
+        lines = []
+        lines.append("LIBRARY SORTER PIPELINE".ljust(width))
+        lines.append(
+            (
+                f"State: {snap['mode']:<18} "
+                f"Elapsed: {snap['elapsed']}   "
+                "Keys: Esc/Ctrl+S=Stop+Cleanup"
+            ).ljust(width)
+        )
+        lines.append(
+            (
+                f"Progress: [{bar}] {snap['pct']:6.2f}%   "
+                f"Books found: {snap['seen']}   Books done: {snap['done']}   "
+                f"Packed: {book_results.get('packed', 0)}   "
+                f"Dupes: {book_results.get('duplicate', 0)}   "
+                f"NoBook: {snap.get('nobook_files', 0)}   "
+                f"Book failed: {book_results.get('failed', 0)}"
+            ).ljust(width)
+        )
+        lines.append("-" * width)
+        lines.append(
+            f"{'Agent':<6} {'Role':<16} {'Processed':>10} {'Errors':>8} {'Queue':>8}"
+        )
+        lines.append("-" * width)
+        for key in AGENT_KEYS:
+            role = AGENT_LABELS[key]
+            processed = snap["stage_processed"].get(key, 0)
+            errors = snap["stage_errors"].get(key, 0)
+            qsize = snap["queue_sizes"].get(key, 0)
+            lines.append(
+                f"{key:<6} {role:<16} {processed:>10} {errors:>8} {qsize:>8}"
+            )
+        lines.append("-" * width)
+        lines.append("Recent events:".ljust(width))
+        events = snap["events"][:10]
+        if not events:
+            events = ["(пока без событий)"]
+        for ev in events:
+            lines.append(truncate(ev, width))
+        while len(lines) < 26:
+            lines.append("")
+        return "\n".join(lines)
+
+
+class KeyboardWatcher:
+    def __init__(self, pipeline: "LibrarySorter", metrics: Metrics) -> None:
+        self.pipeline = pipeline
+        self.metrics = metrics
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="Keyboard", daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=2)
+
+    def _run(self) -> None:
+        if os.name != "nt":
+            return
+        import msvcrt  # type: ignore
+
+        while not self.stop_event.is_set():
+            try:
+                if msvcrt.kbhit():
+                    ch = msvcrt.getch()
+                    # ESC / Ctrl+S -> stop pipeline + cleanup temp
+                    if ch in (b"\x1b", b"\x13"):
+                        self.metrics.add_event("Esc/Ctrl+S: стоп конвейера и очистка temp")
+                        self.pipeline.request_stop_and_cleanup()
+                time.sleep(0.05)
+            except Exception:
+                time.sleep(0.2)
+
+
+class LibrarySorter:
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.session_id = (
+            datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
+        )
+        self.runtime_dir = self.config.temp_base / "runtime" / self.session_id
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        self.app_dir = Path(__file__).resolve().parent
+        self.log_file = self.app_dir / "logs" / f"library_sorter_{self.session_id}.log"
+        self.stop_event = threading.Event()
+        self.cleanup_event = threading.Event()
+        self.scan_done = threading.Event()
+        self.unpack_done = threading.Event()
+        self.detect_done = threading.Event()
+        self.tag_done = threading.Event()
+        self.lm_done = threading.Event()
+        self.rename_done = threading.Event()
+        self.dedupe_done = threading.Event()
+        self.target_index_stop = threading.Event()
+        self.target_index_done = threading.Event()
+        self.target_index_thread: Optional[threading.Thread] = None
+
+        self.unpack_active = AtomicCounter(0)
+        self.extract_semaphore = threading.Semaphore(config.max_parallel_archives)
+
+        self.metrics = Metrics()
+        self.logger = self._init_logger()
+        self.db_path = self.config.target_dir / build_source_db_name(self.config.source_dirs)
+        self.db = ManifestDB(self.db_path)
+        self.temp_tracker = TempTracker(self.logger, self.metrics)
+        self.lm_client = LMStudioClient(config, self.logger, self.metrics, self.db)
+        self.seven_zip = self._detect_7zip()
+
+        self._archive_state_lock = threading.Lock()
+        self._archive_pending: dict[Path, int] = defaultdict(int)
+        self._archive_failed: set[Path] = set()
+        self._archive_has_book: set[Path] = set()
+        self._archive_book_total: dict[Path, int] = defaultdict(int)
+        self._archive_book_packed: dict[Path, int] = defaultdict(int)
+
+        self.q12 = queue.Queue()
+        self.q23 = queue.Queue(maxsize=config.queue_size)
+        self.q34 = queue.Queue(maxsize=config.queue_size)
+        self.q45 = queue.Queue(maxsize=config.queue_size)
+        self.q56 = queue.Queue(maxsize=config.queue_size)
+        self.q67 = queue.Queue(maxsize=config.queue_size)
+        self.q78 = queue.Queue(maxsize=config.queue_size)
+
+        self.threads: list[threading.Thread] = []
+        self.ui = TerminalUI(self.metrics, self)
+        self.keyboard = KeyboardWatcher(self, self.metrics)
+
+    def _init_logger(self) -> logging.Logger:
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
+
+        logger = logging.getLogger(f"library_sorter.{self.session_id}")
+        logger.setLevel(logging.INFO)
+        logger.handlers.clear()
+        logger.propagate = False
+
+        formatter = logging.Formatter(
+            "%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s"
+        )
+        fh = logging.FileHandler(self.log_file, encoding="utf-8")
+        fh.setFormatter(formatter)
+        sh = logging.StreamHandler(sys.stderr)
+        sh.setFormatter(formatter)
+        sh.setLevel(logging.WARNING)
+        logger.addHandler(fh)
+        logger.addHandler(sh)
+        return logger
+
+    def _detect_7zip(self) -> str:
+        seven = shutil.which("7z") or shutil.which("7za")
+        if not seven and os.name == "nt":
+            candidates = [
+                Path(r"C:\Program Files\7-Zip\7z.exe"),
+                Path(r"C:\Program Files (x86)\7-Zip\7z.exe"),
+                Path(r"C:\Program Files\7-Zip\7za.exe"),
+                Path(r"C:\Program Files (x86)\7-Zip\7za.exe"),
+            ]
+            for cand in candidates:
+                if cand.exists():
+                    seven = str(cand)
+                    break
+        if not seven:
+            raise RuntimeError(
+                "Не найден 7-Zip в PATH. Установите 7-Zip или добавьте 7z.exe в PATH."
+            )
+        return seven
+
+    def request_stop_and_cleanup(self) -> None:
+        self.metrics.set_mode("STOP_CLEANUP")
+        self.cleanup_event.set()
+        self.stop_event.set()
+
+    def should_stop(self) -> bool:
+        return self.stop_event.is_set()
+
+    def queue_sizes(self) -> dict[str, int]:
+        return {
+            "A1": 0,
+            "A2": self.q12.qsize(),
+            "A3": self.q23.qsize(),
+            "A4": self.q34.qsize(),
+            "A5": self.q45.qsize(),
+            "A6": self.q56.qsize(),
+            "A7": self.q67.qsize(),
+            "A8": self.q78.qsize(),
+        }
+
+    def stage_flags(self) -> dict[str, bool]:
+        return {
+            "scan_done": self.scan_done.is_set(),
+            "unpack_done": self.unpack_done.is_set(),
+            "detect_done": self.detect_done.is_set(),
+            "dedupe_done": self.dedupe_done.is_set(),
+        }
+
+    def ensure_dirs(self) -> None:
+        for src in self.config.source_dirs:
+            src.mkdir(parents=True, exist_ok=True)
+        self.config.target_dir.mkdir(parents=True, exist_ok=True)
+        self.config.dupes_dir.mkdir(parents=True, exist_ok=True)
+        self.config.nobook_dir.mkdir(parents=True, exist_ok=True)
+        self.config.error_dir.mkdir(parents=True, exist_ok=True)
+        self.config.temp_base.mkdir(parents=True, exist_ok=True)
+        (self.config.temp_base / "extract").mkdir(parents=True, exist_ok=True)
+
+    def _path_key(self, value: Path | str) -> str:
+        try:
+            p = Path(value).resolve(strict=False)
+        except Exception:
+            p = Path(str(value))
+        key = str(p)
+        if os.name == "nt":
+            return key.lower()
+        return key
+
+    def _is_under(self, path: Path, parent: Path) -> bool:
+        try:
+            path.relative_to(parent)
+            return True
+        except Exception:
+            return False
+
+    def _metadata_from_target_zip_path(self, zip_path: Path) -> tuple[str, str, str]:
+        rel = safe_relative(zip_path, self.config.target_dir)
+        parts = rel.parts
+        title = clean_text(zip_path.stem) or zip_path.stem or "Unknown Title"
+        author = "Unknown Author"
+        genre = "Unknown"
+        if len(parts) >= 2:
+            author = clean_text(parts[-2]) or author
+        if len(parts) >= 4:
+            genre = clean_text(parts[-4]) or genre
+        genre = normalize_genre(genre or "Unknown")
+        return title, author, genre
+
+    def _iter_target_zips_for_db_sync(self):
+        target = self.config.target_dir.resolve(strict=False)
+        excluded_roots: list[Path] = []
+        for candidate in (self.config.dupes_dir, self.config.nobook_dir, self.config.error_dir, self.config.temp_base):
+            try:
+                excluded_roots.append(candidate.resolve(strict=False))
+            except Exception:
+                continue
+
+        for root, dirs, files in os.walk(target, topdown=True, followlinks=False):
+            if self.should_stop():
+                return
+            root_path = Path(root)
+            keep_dirs: list[str] = []
+            for d in dirs:
+                child = (root_path / d).resolve(strict=False)
+                skip = False
+                for ex in excluded_roots:
+                    if self._is_under(child, ex):
+                        skip = True
+                        break
+                if not skip:
+                    keep_dirs.append(d)
+            dirs[:] = keep_dirs
+
+            for name in files:
+                lname = name.lower()
+                if not lname.endswith(".zip"):
+                    continue
+                if lname.startswith(".__tmp_"):
+                    continue
+                yield root_path / name
+
+    def _run_startup_db_sync_agent(self) -> None:
+        if not self.config.seed_hashes_from_target:
+            self.metrics.add_event("Agent0: TARGET_DIR sync skipped by config")
+            self.target_index_done.set()
+            return
+
+        def runner() -> None:
+            try:
+                self._sync_db_with_target_dir()
+            except Exception as exc:
+                self.metrics.mark_stage(AGENT_DB_SYNC_KEY, error=True)
+                self.logger.exception("Agent0 sync failed: %s", exc)
+                self.metrics.add_event(f"Agent0: background index error: {exc}")
+            finally:
+                self.target_index_done.set()
+
+        sync_thread = threading.Thread(
+            target=runner,
+            name="A0-DBSync",
+            daemon=True,
+        )
+        self.target_index_thread = sync_thread
+        sync_thread.start()
+        self.metrics.add_event("Agent0: TARGET_DIR indexing started in background")
+
+    def _stop_background_indexing(self, timeout_sec: float = 3.0) -> None:
+        thread = self.target_index_thread
+        if thread is None or not thread.is_alive():
+            return
+        self.target_index_stop.set()
+        thread.join(timeout=timeout_sec)
+        if thread.is_alive():
+            self.metrics.add_event("Agent0: background index still stopping")
+
+    def _sync_db_with_target_dir(self) -> None:
+        started = time.time()
+        workers = max(1, int(self.config.target_hash_scan_workers))
+        self.metrics.add_event(
+            f"Agent0: fast TARGET stat scan start (workers={workers})"
+        )
+        self.logger.info(
+            "A0 background index start target=%s workers=%s db=%s",
+            self.config.target_dir,
+            workers,
+            self.db_path,
+        )
+
+        task_q: queue.Queue[Optional[tuple[Path, str, int, int]]] = queue.Queue(
+            maxsize=max(512, workers * 32)
+        )
+        producer_done = threading.Event()
+        lock = threading.Lock()
+        seen_path_keys: set[str] = set()
+        counters: dict[str, int] = defaultdict(int)
+
+        def put_index_item(item: Optional[tuple[Path, str, int, int]]) -> bool:
+            while not self.should_stop() and not self.target_index_stop.is_set():
+                try:
+                    task_q.put(item, timeout=0.2)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def worker_loop(worker_idx: int) -> None:
+            while not self.should_stop() and not self.target_index_stop.is_set():
+                try:
+                    item = task_q.get(timeout=0.2)
+                except queue.Empty:
+                    if producer_done.is_set():
+                        break
+                    continue
+                if item is None:
+                    task_q.task_done()
+                    break
+                zip_path, path_key, size_bytes, mtime_ns = item
+                try:
+                    self.metrics.set_active_item(
+                        AGENT_DB_SYNC_KEY, f"W{worker_idx}", zip_path.name
+                    )
+                    xxh_hex, note = xxh64_zip_payload(zip_path)
+                    with lock:
+                        counters["hashed"] += 1
+                        hashed_now = counters["hashed"]
+                    if xxh_hex:
+                        title, author, genre = self._metadata_from_target_zip_path(zip_path)
+                        self.db.mark_target_index_hashed(
+                            path_key,
+                            zip_path,
+                            size_bytes,
+                            mtime_ns,
+                            xxh_hex,
+                            "ok",
+                            note,
+                        )
+                        self.db.upsert_hash(xxh_hex, zip_path, title, author, genre)
+                        self.metrics.mark_stage(AGENT_DB_SYNC_KEY)
+                        with lock:
+                            counters["hashed_ok"] += 1
+                    else:
+                        self.db.mark_target_index_hashed(
+                            path_key,
+                            zip_path,
+                            size_bytes,
+                            mtime_ns,
+                            None,
+                            "failed",
+                            note,
+                        )
+                        self.metrics.mark_stage(AGENT_DB_SYNC_KEY, error=True)
+                        with lock:
+                            counters["hashed_failed"] += 1
+                            failed_now = counters["hashed_failed"]
+                        if failed_now <= 10 or (failed_now % 200 == 0):
+                            self.metrics.add_event(
+                                f"Agent0/W{worker_idx}: skip {zip_path.name} ({note})"
+                            )
+                    if hashed_now and (hashed_now % 500 == 0):
+                        self.metrics.add_event(
+                            f"Agent0: background hashed {hashed_now} changed zips..."
+                        )
+                finally:
+                    self.metrics.clear_active_item(AGENT_DB_SYNC_KEY, f"W{worker_idx}")
+                    task_q.task_done()
+
+        workers_threads = [
+            threading.Thread(
+                target=worker_loop,
+                name=f"A0-W{i+1}",
+                args=(i + 1,),
+                daemon=False,
+            )
+            for i in range(workers)
+        ]
+        for t in workers_threads:
+            t.start()
+
+        discovered = 0
+        queued = 0
+        for zip_path in self._iter_target_zips_for_db_sync():
+            if self.should_stop() or self.target_index_stop.is_set():
+                break
+            discovered += 1
+            try:
+                st = zip_path.stat()
+            except Exception as exc:
+                with lock:
+                    counters["stat_failed"] += 1
+                self.metrics.add_event(f"Agent0: stat failed {zip_path.name}: {exc}")
+                continue
+            path_key = self._path_key(zip_path)
+            size_bytes = int(st.st_size)
+            mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)))
+            seen_path_keys.add(path_key)
+            cached = self.db.get_target_index(path_key)
+            if (
+                cached
+                and int(cached.get("size_bytes", -1)) == size_bytes
+                and int(cached.get("mtime_ns", -1)) == mtime_ns
+                and cached.get("xxh64")
+                and cached.get("status") == "ok"
+            ):
+                title, author, genre = self._metadata_from_target_zip_path(zip_path)
+                self.db.upsert_hash(str(cached["xxh64"]), zip_path, title, author, genre)
+                with lock:
+                    counters["stat_cached"] += 1
+                continue
+
+            if cached and cached.get("xxh64"):
+                self.db.remove_hash(str(cached["xxh64"]))
+            self.db.upsert_target_index_stat(
+                path_key,
+                zip_path,
+                size_bytes,
+                mtime_ns,
+                status="pending",
+                note="queued_for_hash",
+            )
+            queued += 1
+            if not put_index_item((zip_path, path_key, size_bytes, mtime_ns)):
+                break
+            if discovered and (discovered % 1000 == 0):
+                self.metrics.add_event(
+                    f"Agent0: stat scanned {discovered} zips; queued={queued}"
+                )
+
+        producer_done.set()
+        if self.should_stop() or self.target_index_stop.is_set():
+            while True:
+                try:
+                    _ = task_q.get_nowait()
+                    task_q.task_done()
+                except queue.Empty:
+                    break
+            for t in workers_threads:
+                t.join(timeout=2)
+            self.metrics.add_event("Agent0: sync interrupted by stop")
+            return
+
+        for _ in workers_threads:
+            put_index_item(None)
+        while True:
+            if self.should_stop() or self.target_index_stop.is_set():
+                while True:
+                    try:
+                        _ = task_q.get_nowait()
+                        task_q.task_done()
+                    except queue.Empty:
+                        break
+                break
+            if getattr(task_q, "unfinished_tasks", 0) <= 0:
+                break
+            time.sleep(0.1)
+        for t in workers_threads:
+            t.join(timeout=2 if self.target_index_stop.is_set() else None)
+
+        if self.should_stop() or self.target_index_stop.is_set():
+            self.metrics.add_event("Agent0: sync interrupted by stop")
+            return
+
+        stale_index_removed = 0
+        for row in self.db.get_target_index_rows():
+            path_key = str(row.get("path_key", ""))
+            if path_key in seen_path_keys:
+                continue
+            old_hash = str(row.get("xxh64") or "")
+            if old_hash:
+                self.db.remove_hash(old_hash)
+            if path_key:
+                self.db.remove_target_index(path_key)
+                stale_index_removed += 1
+
+        rows = self.db.get_hash_rows()
+
+        removed_missing = 0
+        for xxh_hex, canonical in rows:
+            canonical_path = Path(canonical)
+            try:
+                exists = canonical_path.is_file()
+            except Exception:
+                exists = False
+            if not exists:
+                self.db.remove_hash(xxh_hex)
+                removed_missing += 1
+
+        elapsed = int(time.time() - started)
+        self.metrics.add_event(
+            "Agent0: sync done; "
+            f"found={discovered} cached={counters.get('stat_cached', 0)} "
+            f"queued={queued} ok={counters.get('hashed_ok', 0)} "
+            f"fail={counters.get('hashed_failed', 0)} "
+            f"rm_index={stale_index_removed} rm_hash={removed_missing} t={elapsed}s"
+        )
+        self.logger.info(
+            "A0 background index done found=%s cached=%s queued=%s ok=%s fail=%s "
+            "stale_index_removed=%s removed_missing_hashes=%s elapsed=%ss",
+            discovered,
+            counters.get("stat_cached", 0),
+            queued,
+            counters.get("hashed_ok", 0),
+            counters.get("hashed_failed", 0),
+            stale_index_removed,
+            removed_missing,
+            elapsed,
+        )
+
+    def run(self) -> int:
+        exit_code = 0
+        self.ensure_dirs()
+        self.metrics.set_mode("RUNNING")
+        self.metrics.add_event("Старт конвейера")
+        self.metrics.add_event(
+            f"SOURCE_DIRS={'; '.join(str(p) for p in self.config.source_dirs)}"
+        )
+        self.metrics.add_event(f"TARGET_DIR={self.config.target_dir}")
+        self.metrics.add_event(f"LOG_PATH={self.log_file}")
+        self.metrics.add_event(f"DB_PATH={self.db_path}")
+        self.logger.info(
+            "Run start sources=%s target=%s db_path=%s log=%s",
+            [str(p) for p in self.config.source_dirs],
+            self.config.target_dir,
+            self.db_path,
+            self.log_file,
+        )
+
+        self.ui.start()
+        self.keyboard.start()
+
+        try:
+            self._run_startup_db_sync_agent()
+            if not self.should_stop():
+                self._start_threads()
+                for t in self.threads:
+                    t.join()
+            if self.cleanup_event.is_set():
+                self._clear_all_queues()
+            self._cleanup_temp_base()
+            self._cleanup_empty_source_dirs()
+            self.metrics.add_event("Конвейер завершил работу")
+        except KeyboardInterrupt:
+            self.metrics.add_event("KeyboardInterrupt: остановка")
+            self.request_stop_and_cleanup()
+            self._clear_all_queues()
+            self._cleanup_temp_base()
+        except Exception as exc:
+            self.logger.exception("Критическая ошибка: %s", exc)
+            self.metrics.add_event(f"Критическая ошибка: {exc}")
+            self._clear_all_queues()
+            self._cleanup_temp_base()
+            exit_code = 2
+        finally:
+            if exit_code == 0:
+                self.metrics.set_mode("END")
+            else:
+                self.metrics.set_mode("END_ERROR")
+            self._stop_background_indexing()
+            self.ui.stop()
+            self.keyboard.stop()
+            self.db.close()
+            if self.config.ephemeral_mode:
+                self._cleanup_runtime_state()
+        return exit_code
+
+    def _start_threads(self) -> None:
+        scanner = threading.Thread(target=self._scanner_loop, name="Agent1-Scanner")
+        self.threads.append(scanner)
+        scanner.start()
+
+        self._spawn_group("A2", self.config.unpack_workers, self._unpack_loop, self.unpack_done)
+        self._spawn_group("A3", self.config.detect_workers, self._detect_loop, self.detect_done)
+        self._spawn_group(
+            "A4", self.config.dedupe_workers, self._dedupe_loop, self.dedupe_done
+        )
+        self._spawn_group("A5", self.config.tag_workers, self._tags_loop, self.tag_done)
+        self._spawn_group("A6", self.config.lm_workers, self._lm_loop, self.lm_done)
+        self._spawn_group(
+            "A7", self.config.rename_workers, self._rename_loop, self.rename_done
+        )
+        self._spawn_group("A8", self.config.pack_workers, self._pack_loop, threading.Event())
+
+    def _spawn_group(
+        self,
+        key: str,
+        workers: int,
+        fn,
+        done_event: threading.Event,
+    ) -> None:
+        counter = AtomicCounter(workers)
+
+        def wrapped(worker_idx: int) -> None:
+            try:
+                fn(worker_idx)
+            except Exception as exc:
+                self.logger.exception("Ошибка %s-%d: %s", key, worker_idx, exc)
+                self.metrics.mark_stage(key, error=True)
+            finally:
+                left = counter.dec()
+                if left == 0:
+                    done_event.set()
+
+        for i in range(workers):
+            t = threading.Thread(
+                target=wrapped,
+                args=(i + 1,),
+                name=f"{key}-W{i + 1}",
+            )
+            self.threads.append(t)
+            t.start()
+
+    def _put_with_stop(self, q: queue.Queue, item: Any, timeout: float = 0.2) -> bool:
+        while not self.should_stop():
+            try:
+                q.put(item, timeout=timeout)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _mark_discovered_task(self, task: FileTask) -> None:
+        self.metrics.mark_task_seen()
+        self.metrics.mark_stage("A1")
+        if suffix_lower(task.path) in BOOK_EXTENSIONS and not task.book_seen_counted:
+            task.book_seen_counted = True
+            self.metrics.mark_book_seen()
+
+    def _isbn_provider_order(self) -> list[str]:
+        provider = clean_text(str(self.config.isbn_provider or "auto")).lower()
+        provider = provider.replace("-", "").replace("_", "")
+        if provider in {"google", "googlebooks", "booksgoogle"}:
+            return ["googlebooks"]
+        if provider in {"openlibrary", "openlib", "ol"}:
+            return ["openlibrary"]
+        if provider in {"auto", "fallback", ""}:
+            return ["openlibrary", "googlebooks"]
+        self.logger.warning("Unknown ISBN_PROVIDER=%s; using auto", self.config.isbn_provider)
+        return ["openlibrary", "googlebooks"]
+
+    def _lookup_isbn_metadata(self, isbn: str) -> Optional[dict[str, str]]:
+        if not self.config.isbn_lookup or requests is None:
+            return None
+        for provider in self._isbn_provider_order():
+            data = self._lookup_isbn_metadata_with_provider(isbn, provider)
+            if data:
+                return data
+        return None
+
+    def _lookup_isbn_metadata_with_provider(
+        self,
+        isbn: str,
+        provider: str,
+    ) -> Optional[dict[str, str]]:
+        cache_key = f"isbn_{provider}_v1:{isbn}"
+        cached = self.db.get_lm_cache(cache_key)
+        if cached:
+            if cached.get("not_found"):
+                return None
+            return {str(k): str(v) for k, v in cached.items() if v}
+
+        try:
+            if provider == "googlebooks":
+                out = self._lookup_isbn_googlebooks(isbn)
+            else:
+                out = self._lookup_isbn_openlibrary(isbn)
+        except _IsbnRateLimited:
+            # Server was rate-limiting; skip caching so the next run can retry.
+            return None
+
+        if out:
+            out["provider"] = provider
+            self.db.set_lm_cache(cache_key, out)
+            return out
+        self.db.set_lm_cache(cache_key, {"not_found": True})
+        return None
+
+    def _lookup_isbn_openlibrary(self, isbn: str) -> Optional[dict[str, str]]:
+        url = "https://openlibrary.org/api/books"
+        try:
+            resp = requests.get(
+                url,
+                params={"bibkeys": f"ISBN:{isbn}", "format": "json", "jscmd": "data"},
+                timeout=(4, 8),
+            )
+            if resp.status_code >= 400:
+                self.logger.warning(
+                    "ISBN lookup openlibrary HTTP %s isbn=%s",
+                    resp.status_code,
+                    isbn,
+                )
+                return None
+            payload = resp.json()
+        except Exception as exc:
+            self.logger.warning("ISBN lookup openlibrary failed isbn=%s: %s", isbn, exc)
+            return None
+
+        item = payload.get(f"ISBN:{isbn}") if isinstance(payload, dict) else None
+        if not isinstance(item, dict):
+            return None
+
+        title = clean_text(str(item.get("title", "")))
+        authors_raw = item.get("authors", [])
+        authors: list[str] = []
+        if isinstance(authors_raw, list):
+            for author in authors_raw:
+                if isinstance(author, dict):
+                    name = clean_text(str(author.get("name", "")))
+                    if name:
+                        authors.append(name)
+        subjects_raw = item.get("subjects", [])
+        subjects: list[str] = []
+        if isinstance(subjects_raw, list):
+            for subject in subjects_raw[:8]:
+                if isinstance(subject, dict):
+                    name = clean_text(str(subject.get("name", "")))
+                    if name:
+                        subjects.append(name)
+        genre = normalize_genre(" ".join(subjects))
+
+        out = {
+            "title": title,
+            "author": clean_text(", ".join(authors)),
+            "genre": genre,
+            "isbn": isbn,
+        }
+        out = {k: v for k, v in out.items() if v and v != "Unknown"}
+        return out or None
+
+    def _lookup_isbn_googlebooks(self, isbn: str) -> Optional[dict[str, str]]:
+        # Rate-limit: Google Books allows ~1 req/sec per IP without an API key.
+        # Serialize all workers through a single lock and enforce a 1.2-second gap.
+        _GBOOKS_MIN_INTERVAL = 1.2
+        with _GBOOKS_LOCK:
+            now = time.monotonic()
+            wait = _GBOOKS_LAST_REQUEST[0] + _GBOOKS_MIN_INTERVAL - now
+            if wait > 0:
+                time.sleep(wait)
+            _GBOOKS_LAST_REQUEST[0] = time.monotonic()
+
+        url = "https://www.googleapis.com/books/v1/volumes"
+        try:
+            resp = requests.get(
+                url,
+                params={"q": f"isbn:{isbn}", "maxResults": 1, "printType": "books"},
+                timeout=(4, 8),
+            )
+            if resp.status_code == 429:
+                # Rate-limited despite our throttle — back off, then raise so
+                # the caller does NOT cache this as "not_found".
+                self.logger.warning(
+                    "ISBN lookup googlebooks rate-limited (429), backing off isbn=%s",
+                    isbn,
+                )
+                time.sleep(5.0)
+                raise _IsbnRateLimited(isbn)
+            if resp.status_code >= 400:
+                self.logger.warning(
+                    "ISBN lookup googlebooks HTTP %s isbn=%s",
+                    resp.status_code,
+                    isbn,
+                )
+                return None
+            payload = resp.json()
+        except Exception as exc:
+            self.logger.warning("ISBN lookup googlebooks failed isbn=%s: %s", isbn, exc)
+            return None
+
+        items = payload.get("items", []) if isinstance(payload, dict) else []
+        if not isinstance(items, list) or not items:
+            return None
+        volume = items[0].get("volumeInfo", {}) if isinstance(items[0], dict) else {}
+        if not isinstance(volume, dict):
+            return None
+
+        title = clean_text(str(volume.get("title", "")))
+        subtitle = clean_text(str(volume.get("subtitle", "")))
+        if title and subtitle and subtitle.lower() not in title.lower():
+            title = clean_text(f"{title}: {subtitle}")
+
+        authors_raw = volume.get("authors", [])
+        authors: list[str] = []
+        if isinstance(authors_raw, list):
+            authors = [clean_text(str(author)) for author in authors_raw if clean_text(str(author))]
+
+        categories_raw = volume.get("categories", [])
+        categories: list[str] = []
+        if isinstance(categories_raw, list):
+            categories = [
+                clean_text(str(category))
+                for category in categories_raw[:8]
+                if clean_text(str(category))
+            ]
+        genre = normalize_genre(" ".join(categories))
+
+        out = {
+            "title": title,
+            "author": clean_text(", ".join(authors)),
+            "genre": genre,
+            "isbn": isbn,
+        }
+        out = {k: v for k, v in out.items() if v and v != "Unknown"}
+        return out or None
+
+    def _enrich_metadata_from_isbn(self, task: FileTask, md: Metadata, fmt_tags: dict[str, str]) -> None:
+        if not self.config.isbn_lookup:
+            return
+        haystack_parts = [
+            task.path.name,
+            task.path.stem,
+            md.title,
+            md.author,
+            md.genre,
+            *[str(v) for v in fmt_tags.values()],
+        ]
+        isbns = extract_isbns_from_text("\n".join(haystack_parts))
+        if not isbns:
+            snippet = extract_text_snippet(task.path, max_chars=1600)
+            isbns = extract_isbns_from_text(snippet)
+        for isbn in isbns:
+            data = self._lookup_isbn_metadata(isbn)
+            if not data:
+                continue
+            if data.get("title"):
+                md.title = data["title"]
+            if data.get("author"):
+                md.author = data["author"]
+            if data.get("genre"):
+                md.genre = normalize_genre(data["genre"])
+            md.source = "isbn"
+            md.confidence = max(md.confidence, 0.9)
+            self.logger.info("ISBN metadata isbn=%s path=%s data=%s", isbn, task.path, data)
+            return
+
+    def _md_brief(self, md: Metadata) -> str:
+        title = truncate(clean_text(md.title), 48)
+        author = truncate(clean_text(md.author), 36)
+        genre = truncate(clean_text(md.genre), 28)
+        return (
+            f"src={md.source}; conf={md.confidence:.2f}; "
+            f"title={title!r}; author={author!r}; genre={genre!r}"
+        )
+
+    def _lm_decision(self, md: Metadata) -> str:
+        if self.config.lm_force_full_metadata:
+            return "full"
+        if self._needs_lm(md):
+            return "full"
+        if self._needs_genre_only_lm(md):
+            return "genre_only"
+        if md.source == "tags" and md.confidence >= 0.75:
+            return "skip:tags_confident"
+        return "skip:metadata_sufficient"
+
+    def _move_to_error_dir(self, task: FileTask, reason: str) -> None:
+        """Move the original source file (or archive) to error_dir after a pipeline failure.
+
+        Concurrency: multiple A8 workers may fail on inner books of the same archive
+        and call this for one shared archive_source. The first one wins; the rest hit
+        FileNotFoundError and exit silently. Also tolerates the file vanishing between
+        the .exists() check and shutil.move (TOCTOU)."""
+        # For temp-origin tasks the real source is the archive that was unpacked.
+        if task.origin == "temp" and task.archive_source and task.archive_source.exists():
+            src = task.archive_source
+        elif task.origin == "source" and task.path.exists():
+            src = task.path
+        else:
+            return  # nothing to move (already cleaned up or already in error_dir)
+        try:
+            # Bucket by first 2 alphanumeric chars of stem (uppercased). Falls back to
+            # error_dir root when stem is empty or starts with non-alphanumerics.
+            stem_alnum = "".join(ch for ch in src.stem if ch.isalnum())[:2].upper()
+            err_dir = (self.config.error_dir / stem_alnum) if stem_alnum else self.config.error_dir
+            err_dir.mkdir(parents=True, exist_ok=True)
+            dst = ensure_unique_file_path(err_dir / src.name)
+            try:
+                safe_move(src, dst)
+            except FileNotFoundError:
+                # Lost the race to another worker — that's fine, the file already moved.
+                self.logger.debug("_move_to_error_dir: source already gone %s", src)
+                return
+            self.logger.info(
+                "Moved failed source to Error dir: %s -> %s (reason: %s)",
+                src, dst, reason,
+            )
+            self.metrics.add_event(f"Error: {src.name} -> Error/{dst.parent.name}/{dst.name}")
+        except Exception as exc:
+            self.logger.warning("_move_to_error_dir failed for %s: %s", src, exc)
+
+    def _finalize_task(
+        self,
+        task: FileTask,
+        result: str,
+        delete_source: bool = False,
+    ) -> None:
+        try:
+            if (
+                delete_source
+                and self.config.delete_source_after_pack
+                and not self.should_stop()
+                and not self.cleanup_event.is_set()
+                and task.origin == "source"
+                and task.path.exists()
+            ):
+                if self._source_delete_after_pack_is_safe(task):
+                    task.path.unlink(missing_ok=True)
+                    self.logger.info("Source removed after verified pack: %s", task.path)
+                else:
+                    self.logger.warning(
+                        "Source delete skipped: verification failed source=%s dest=%s",
+                        task.path,
+                        task.dest_zip or "",
+                    )
+        except Exception as exc:
+            self.logger.warning("Не удалось удалить исходник %s: %s", task.path, exc)
+
+        self.temp_tracker.release(task.cleanup_root)
+        self._mark_archive_progress(task, result)
+        self.metrics.mark_task_done(result)
+        if task.is_book_candidate and not task.book_done_counted:
+            task.book_done_counted = True
+            self.metrics.mark_book_done(result)
+
+    def _source_delete_after_pack_is_safe(self, task: FileTask) -> bool:
+        try:
+            source_path = task.path.resolve(strict=False)
+        except Exception:
+            self.logger.warning(
+                "Source delete skipped: cannot resolve source=%s",
+                task.path,
+            )
+            return False
+        if task.dest_zip:
+            try:
+                if source_path == task.dest_zip.resolve(strict=False):
+                    self.logger.warning(
+                        "Source delete skipped: source and destination are the same path=%s",
+                        task.path,
+                    )
+                    return False
+            except Exception:
+                return False
+        if not self._source_file_is_delete_candidate(task.path):
+            return False
+        return self._packed_output_is_verified(task)
+
+    def _source_file_is_delete_candidate(self, path: Path) -> bool:
+        if not path.exists() or not path.is_file():
+            return False
+        if path.is_symlink():
+            self.logger.warning("Source delete skipped: symlink source=%s", path)
+            return False
+        try:
+            source_path = path.resolve(strict=False)
+        except Exception:
+            return False
+        for source_dir in self.config.source_dirs:
+            try:
+                source_path.relative_to(source_dir.resolve(strict=False))
+                return True
+            except Exception:
+                continue
+        self.logger.warning("Source delete skipped: outside SOURCE_DIRS path=%s", path)
+        return False
+
+    def _packed_output_is_verified(self, task: FileTask) -> bool:
+        if not task.dest_zip or not task.dest_zip.exists() or not task.dest_zip.is_file():
+            self.logger.warning(
+                "Pack verification failed: destination missing source=%s dest=%s",
+                task.path,
+                task.dest_zip or "",
+            )
+            return False
+        try:
+            task.dest_zip.resolve(strict=False).relative_to(
+                self.config.target_dir.resolve(strict=False)
+            )
+        except Exception:
+            self.logger.warning(
+                "Pack verification failed: destination outside target source=%s dest=%s target=%s",
+                task.path,
+                task.dest_zip,
+                self.config.target_dir,
+            )
+            return False
+        if not task.xxh64:
+            self.logger.warning(
+                "Pack verification failed: missing source hash source=%s dest=%s",
+                task.path,
+                task.dest_zip,
+            )
+            return False
+        try:
+            packed_hash, note = xxh64_zip_payload(task.dest_zip)
+        except Exception as exc:
+            self.logger.warning(
+                "Pack verification failed: cannot hash packed payload source=%s dest=%s error=%s",
+                task.path,
+                task.dest_zip,
+                exc,
+            )
+            return False
+        if packed_hash != task.xxh64:
+            self.logger.warning(
+                "Pack verification failed: packed hash mismatch source=%s dest=%s expected=%s got=%s note=%s",
+                task.path,
+                task.dest_zip,
+                task.xxh64,
+                packed_hash or "",
+                note,
+            )
+            return False
+        return True
+
+    def _duplicate_output_is_verified(self, task: FileTask) -> bool:
+        canonical = task.canonical_zip
+        if not canonical or not canonical.exists() or not canonical.is_file():
+            self.logger.warning(
+                "Duplicate verification failed: canonical missing source=%s canonical=%s",
+                task.path,
+                canonical or "",
+            )
+            return False
+        try:
+            canonical.resolve(strict=False).relative_to(
+                self.config.target_dir.resolve(strict=False)
+            )
+        except Exception:
+            self.logger.warning(
+                "Duplicate verification failed: canonical outside target source=%s canonical=%s target=%s",
+                task.path,
+                canonical,
+                self.config.target_dir,
+            )
+            return False
+        if not task.xxh64:
+            self.logger.warning(
+                "Duplicate verification failed: missing source hash source=%s canonical=%s",
+                task.path,
+                canonical,
+            )
+            return False
+        try:
+            canonical_hash, note = xxh64_zip_payload(canonical)
+        except Exception as exc:
+            self.logger.warning(
+                "Duplicate verification failed: cannot hash canonical source=%s canonical=%s error=%s",
+                task.path,
+                canonical,
+                exc,
+            )
+            return False
+        if canonical_hash != task.xxh64:
+            self.logger.warning(
+                "Duplicate verification failed: hash mismatch source=%s canonical=%s expected=%s got=%s note=%s",
+                task.path,
+                canonical,
+                task.xxh64,
+                canonical_hash or "",
+                note,
+            )
+            return False
+        return True
+
+    def _clear_all_queues(self) -> None:
+        for q in (self.q12, self.q23, self.q34, self.q45, self.q56, self.q67, self.q78):
+            while True:
+                try:
+                    _ = q.get_nowait()
+                    q.task_done()
+                except queue.Empty:
+                    break
+                except Exception:
+                    break
+
+    def _is_safe_temp_base_for_cleanup(self) -> tuple[bool, str]:
+        try:
+            temp = self.config.temp_base.resolve(strict=False)
+        except Exception as exc:
+            return False, f"cannot resolve TEMP_BASE: {exc}"
+
+        if not temp.exists():
+            return True, "not exists"
+        if not temp.is_dir():
+            return False, "TEMP_BASE is not a directory"
+        if temp.is_symlink():
+            return False, "TEMP_BASE is a symlink"
+
+        try:
+            if temp == Path(temp.anchor).resolve(strict=False):
+                return False, "TEMP_BASE points to drive/root"
+        except Exception:
+            pass
+
+        protected = [
+            self.config.target_dir,
+            self.config.dupes_dir,
+            self.config.nobook_dir,
+            self.config.error_dir,
+            *self.config.source_dirs,
+        ]
+        for raw in protected:
+            try:
+                p = raw.resolve(strict=False)
+            except Exception:
+                continue
+            if temp == p:
+                return False, f"TEMP_BASE equals protected path: {p}"
+            try:
+                p.relative_to(temp)
+                return False, f"TEMP_BASE is parent of protected path: {p}"
+            except Exception:
+                continue
+
+        return True, "ok"
+
+    def _cleanup_temp_base(self) -> None:
+        safe, reason = self._is_safe_temp_base_for_cleanup()
+        if not safe:
+            self.logger.warning("Temp cleanup skipped: %s (%s)", reason, self.config.temp_base)
+            self.metrics.add_event(f"Temp cleanup skipped: {reason}")
+            return
+
+        try:
+            if not self.config.temp_base.exists():
+                self.metrics.add_event("Temp уже пуст")
+                return
+            for child in self.config.temp_base.iterdir():
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+            self.metrics.add_event("Temp очищен полностью")
+        except Exception as exc:
+            self.logger.exception("Ошибка очистки temp: %s", exc)
+            self.metrics.add_event(f"Ошибка очистки temp: {exc}")
+
+    def _source_dir_has_any_files(self, source_dir: Path) -> bool:
+        for _root, _dirs, files in os.walk(source_dir, topdown=True, followlinks=False):
+            if files:
+                return True
+        return False
+
+    def _cleanup_empty_source_dirs(self) -> None:
+        seen: set[str] = set()
+        for source_dir in self.config.source_dirs:
+            try:
+                src = source_dir.resolve(strict=False)
+            except Exception:
+                src = source_dir
+
+            src_key = str(src).lower()
+            if src_key in seen:
+                continue
+            seen.add(src_key)
+
+            if not src.exists() or not src.is_dir():
+                continue
+
+            if src.is_symlink():
+                self.metrics.add_event(f"Source cleanup skipped (symlink): {src}")
+                continue
+
+            try:
+                root = Path(src.anchor).resolve(strict=False)
+                if src == root:
+                    self.metrics.add_event(f"Source cleanup skipped (drive root): {src}")
+                    continue
+            except Exception:
+                pass
+
+            if self._source_dir_has_any_files(src):
+                continue
+
+            try:
+                shutil.rmtree(src)
+                self.metrics.add_event(f"Source dir removed (empty): {src}")
+            except Exception as exc:
+                self.logger.warning("Cannot remove empty source dir %s: %s", src, exc)
+                self.metrics.add_event(f"Source dir cleanup error: {src}: {exc}")
+
+    def _cleanup_runtime_state(self) -> None:
+        try:
+            shutil.rmtree(self.runtime_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    def _register_archive_child(self, archive_path: Optional[Path]) -> None:
+        if not archive_path:
+            return
+        with self._archive_state_lock:
+            self._archive_pending[archive_path] += 1
+
+    def _mark_archive_has_book(self, archive_path: Optional[Path]) -> None:
+        if not archive_path:
+            return
+        with self._archive_state_lock:
+            self._archive_has_book.add(archive_path)
+
+    def _register_archive_book(self, archive_path: Optional[Path]) -> None:
+        if not archive_path:
+            return
+        with self._archive_state_lock:
+            self._archive_book_total[archive_path] += 1
+
+    def _preserve_archive_source(self, archive_path: Optional[Path]) -> None:
+        if not archive_path:
+            return
+        with self._archive_state_lock:
+            self._archive_failed.add(archive_path)
+
+    def _nobook_rejection_is_ambiguous(self, task: FileTask, reason: str) -> bool:
+        return False
+
+    def _mark_archive_progress(self, task: FileTask, result: str) -> None:
+        archive_path = task.archive_source
+        if not archive_path:
+            return
+
+        action = ""
+        book_verified = True
+        if task.is_book_candidate:
+            if result == "packed":
+                book_verified = self._packed_output_is_verified(task)
+            elif result in {"duplicate", "duplicate_temp"}:
+                book_verified = self._duplicate_output_is_verified(task)
+            else:
+                book_verified = False
+
+        with self._archive_state_lock:
+            if archive_path not in self._archive_pending:
+                return
+
+            if task.is_book_candidate:
+                if book_verified:
+                    self._archive_book_packed[archive_path] += 1
+                else:
+                    self._archive_failed.add(archive_path)
+
+            if result == "failed":
+                self._archive_failed.add(archive_path)
+
+            self._archive_pending[archive_path] -= 1
+            pending = self._archive_pending[archive_path]
+            failed = archive_path in self._archive_failed
+
+            if pending <= 0:
+                del self._archive_pending[archive_path]
+                has_book = archive_path in self._archive_has_book
+                book_total = self._archive_book_total.pop(archive_path, 0)
+                book_packed = self._archive_book_packed.pop(archive_path, 0)
+                self._archive_has_book.discard(archive_path)
+                self._archive_failed.discard(archive_path)
+                stop_requested = self.should_stop() or self.cleanup_event.is_set()
+                if not failed and self.config.delete_source_after_pack and not stop_requested:
+                    if has_book and book_total > 0 and book_packed == book_total:
+                        action = "delete_archive"
+                    elif has_book:
+                        action = "preserve_archive"
+                    else:
+                        action = "move_nobook"
+
+        if action == "delete_archive" and archive_path.exists():
+            if self._source_file_is_delete_candidate(archive_path):
+                try:
+                    archive_path.unlink(missing_ok=True)
+                    self.metrics.add_event(
+                        f"Source archive removed after verified books: {archive_path.name}"
+                    )
+                    self.logger.info(
+                        "Source archive removed after verified books: %s", archive_path
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        "Не удалось удалить исходный архив %s: %s", archive_path, exc
+                    )
+            else:
+                self.logger.warning(
+                    "Source archive delete skipped: unsafe source archive=%s", archive_path
+                )
+        elif action == "preserve_archive" and archive_path.exists():
+            self.logger.info("Source archive preserved after pipeline: %s", archive_path)
+            self.metrics.add_event(f"Source archive preserved: {archive_path.name}")
+        elif action == "move_nobook" and archive_path.exists():
+            try:
+                dst = self._move_source_to_nobook(
+                    archive_path,
+                    self._source_root_for_path(archive_path),
+                    "archive_without_books",
+                )
+                self.metrics.add_event(f"NoBook archive -> {dst.name} (archive_without_books)")
+            except Exception as exc:
+                self.logger.warning(
+                    "Не удалось перенести исходный архив в NoBook %s: %s",
+                    archive_path,
+                    exc,
+                )
+
+    def _run_cmd_with_cancel(
+        self,
+        cmd: list[str],
+        timeout_sec: int,
+        cwd: Optional[Path] = None,
+    ) -> subprocess.CompletedProcess:
+        started = time.time()
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            cwd=str(cwd) if cwd else None,
+        )
+        interrupted = False
+        while True:
+            if self.should_stop():
+                interrupted = True
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                break
+            if proc.poll() is not None:
+                break
+            if (time.time() - started) > timeout_sec:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                break
+            time.sleep(0.2)
+
+        try:
+            out_bytes, err_bytes = proc.communicate(timeout=5)
+        except Exception:
+            out_bytes, err_bytes = b"", b"communicate_timeout"
+        out = decode_subprocess_output(out_bytes)
+        err = decode_subprocess_output(err_bytes)
+        code = proc.returncode if proc.returncode is not None else -1
+        if interrupted and code == 0:
+            code = -1
+        if interrupted and not err:
+            err = "interrupted_by_stop_signal"
+        if (time.time() - started) > timeout_sec and code == 0:
+            code = 124
+        return subprocess.CompletedProcess(cmd, code, out, err)
+
+
+def enable_ansi_on_windows() -> None:
+    if os.name != "nt":
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.GetStdHandle(-11)
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+    except Exception:
+        pass
+
+
+def iter_files(root: Path):
+    stack = [root]
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            yield Path(entry.path)
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+
+
+def suffix_lower(path: Path) -> str:
+    return path.suffix.lower()
+
+
+def guess_filetype_kind(path: Path) -> tuple[str, str]:
+    if filetype is None:
+        return "", ""
+    try:
+        kind = filetype.guess(str(path))
+    except Exception:
+        return "", ""
+    if not kind:
+        return "", ""
+    kind_ext = clean_text(str(getattr(kind, "extension", "") or "")).lower().lstrip(".")
+    mime = clean_text(str(getattr(kind, "mime", "") or "")).lower()
+    return kind_ext, mime
+
+
+def filetype_is_book(kind_ext: str, mime: str, ext: str) -> bool:
+    if mime in BOOK_FILETYPE_MIMES:
+        return True
+    if kind_ext in BOOK_FILETYPE_EXTENSIONS:
+        return True
+    if mime in ARCHIVE_FILETYPE_MIMES and ext in BOOK_ZIP_CONTAINER_EXTENSIONS:
+        return True
+    return False
+
+
+def filetype_is_archive(kind_ext: str, mime: str) -> bool:
+    if mime in ARCHIVE_FILETYPE_MIMES:
+        return True
+    return kind_ext in {"zip", "7z", "rar", "gz", "bz2", "xz", "tar"}
+
+
+def filetype_is_nonbook(kind_ext: str, mime: str, ext: str) -> bool:
+    if not kind_ext and not mime:
+        return False
+    if filetype_is_book(kind_ext, mime, ext):
+        return False
+    if filetype_is_archive(kind_ext, mime):
+        return False
+    if mime in NONBOOK_FILETYPE_MIMES:
+        return True
+    if any(mime.startswith(prefix) for prefix in NONBOOK_FILETYPE_MIME_PREFIXES):
+        return True
+    return bool(kind_ext or mime)
+
+
+def is_archive(path: Path) -> bool:
+    ext = suffix_lower(path)
+    if ext in BOOK_ZIP_CONTAINER_EXTENSIONS:
+        return False
+    if ext in ARCHIVE_EXTENSIONS:
+        return True
+    kind_ext, mime = guess_filetype_kind(path)
+    if filetype_is_archive(kind_ext, mime):
+        return True
+    try:
+        with open(path, "rb") as f:
+            sig = f.read(8)
+        if sig.startswith(b"PK\x03\x04"):
+            return True
+        if sig.startswith(b"Rar!\x1a\x07"):
+            return True
+        if sig.startswith(b"7z\xbc\xaf'\x1c"):
+            return True
+    except Exception:
+        return False
+    return False
+
+
+# Google Books API rate-limiter (shared across all pipeline workers).
+_GBOOKS_LOCK: threading.Lock = threading.Lock()
+_GBOOKS_LAST_REQUEST: list[float] = [0.0]  # mutable container so workers share state
+
+
+def xxh64_file(path: Path, chunk_size: int = 4 * 1024 * 1024, timeout: float = 60.0) -> str:
+    result: list[str] = []
+    error: list[Exception] = []
+
+    def _hash() -> None:
+        try:
+            h = xxhash.xxh64()
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            result.append(h.hexdigest())
+        except Exception as exc:
+            error.append(exc)
+
+    t = threading.Thread(target=_hash, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if not t.is_alive():
+        if error:
+            raise error[0]
+        return result[0] if result else ""
+    raise TimeoutError(f"xxh64_file timeout after {timeout}s: {path}")
+
+
+def decode_subprocess_output(data: bytes | str | None) -> str:
+    if not data:
+        return ""
+    if isinstance(data, str):
+        return data
+
+    candidates = ["utf-8-sig", "utf-8"]
+    if os.name == "nt":
+        try:
+            oem_cp = int(ctypes.windll.kernel32.GetOEMCP())  # type: ignore[attr-defined]
+            candidates.append(f"cp{oem_cp}")
+        except Exception:
+            pass
+        try:
+            acp = int(ctypes.windll.kernel32.GetACP())  # type: ignore[attr-defined]
+            candidates.append(f"cp{acp}")
+        except Exception:
+            pass
+        candidates.append("mbcs")
+    candidates.extend(["cp866", "cp1251"])
+
+    russian_letters = set(
+        "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
+        "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+    )
+    common_text = set(
+        " оеаинтсрвлкмдпуяызьбгчйхжюшцщэфъ"
+        "ОЕАИНТСРВЛКМДПУЯЫЗЬБГЧЙХЖЮШЦЩЭФЪ"
+    )
+
+    def score(text: str) -> int:
+        value = 0
+        for ch in text:
+            code = ord(ch)
+            if ch == "\ufffd":
+                value -= 100
+            elif code < 32 and ch not in "\r\n\t":
+                value -= 20
+            elif 0x2500 <= code <= 0x259F:
+                value -= 30
+            elif "\u0400" <= ch <= "\u04ff" and ch not in russian_letters:
+                value -= 12
+            elif ch in common_text:
+                value += 4
+            elif ch in russian_letters:
+                value += 2
+            elif 32 <= code <= 126:
+                value += 1
+        return value
+
+    best_text = ""
+    best_score = -10**9
+    seen: set[str] = set()
+    for enc in candidates:
+        key = enc.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            decoded = data.decode(enc)
+        except Exception:
+            continue
+        current_score = score(decoded)
+        if current_score > best_score:
+            best_text = decoded
+            best_score = current_score
+    if best_text:
+        return best_text
+    return data.decode("utf-8", errors="replace")
+
+
+def xxh64_zip_payload(path: Path, chunk_size: int = 4 * 1024 * 1024) -> tuple[Optional[str], str]:
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            infos = [i for i in zf.infolist() if not i.is_dir()]
+            if not infos:
+                return None, "empty_zip"
+
+            preferred = [
+                info
+                for info in infos
+                if suffix_lower(Path(info.filename)) in BOOK_EXTENSIONS
+            ]
+            pool = preferred or infos
+            chosen = max(pool, key=lambda x: int(getattr(x, "file_size", 0) or 0))
+
+            h = xxhash.xxh64()
+            with zf.open(chosen, "r") as entry:
+                while True:
+                    chunk = entry.read(chunk_size)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            return h.hexdigest(), chosen.filename
+    except zipfile.BadZipFile:
+        return None, "bad_zip"
+    except RuntimeError as exc:
+        return None, f"runtime_error: {exc}"
+    except Exception as exc:
+        return None, f"zip_error: {exc}"
+
+
+def safe_filesize(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except Exception:
+        return 0
+
+
+_UTF16_BOMS = (b"\xff\xfe", b"\xfe\xff")
+
+# Сигнатуры книжных форматов, которые библиотека filetype не распознаёт.
+# Порядок важен: более специфичные — раньше.
+_BOOK_MAGIC_SIGNATURES: tuple[tuple[bytes, str], ...] = (
+    (b"\xef\xbb\xbf<?xml", "xml_utf8bom"),   # UTF-8 BOM + XML (FB2 и др.)
+    (b"<?xml",             "xml"),            # XML без BOM (FB2, OPF)
+    (b"%PDF",              "pdf"),            # PDF (запасной вариант)
+    (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", "ole_doc"),  # OLE Compound (DOC, XLS)
+)
+
+
+def sniff_book_magic(path: Path) -> str:
+    """Проверяет сигнатуру файла для форматов, не распознаваемых filetype.
+
+    Используется как последний шанс для файлов с неизвестными/числовыми расширениями.
+    Возвращает непустую метку, если формат похож на книгу, иначе пустую строку.
+    """
+    try:
+        with open(path, "rb") as f:
+            header = f.read(16)
+    except Exception:
+        return ""
+    for sig, label in _BOOK_MAGIC_SIGNATURES:
+        if header.startswith(sig):
+            return label
+    return ""
+
+
+def looks_binary(path: Path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            data = f.read(4096)
+        if not data:
+            return False
+        # UTF-16 файлы содержат нулевые байты по своей природе — проверяем BOM раньше.
+        if data[:2] in _UTF16_BOMS:
+            try:
+                data.decode("utf-16")
+                return False
+            except Exception:
+                pass
+        if b"\x00" in data:
+            return True
+        text_chars = sum((32 <= b <= 126) or b in b"\r\n\t\f\b" for b in data)
+        return (text_chars / len(data)) < 0.65
+    except Exception:
+        return True
+
+
+def extract_text_snippet(path: Path, max_chars: int = 1800) -> str:
+    ext = suffix_lower(path)
+    try:
+        if ext in {".txt", ".md", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".fb2", ".rtf"}:
+            return read_text_head(path, max_chars)
+        if ext == ".docx":
+            with zipfile.ZipFile(path, "r") as zf:
+                if "word/document.xml" in zf.namelist():
+                    raw = zf.read("word/document.xml")
+                    txt = strip_xml_tags(raw.decode("utf-8", errors="ignore"))
+                    return clean_text(txt)[:max_chars]
+        if ext == ".epub":
+            with zipfile.ZipFile(path, "r") as zf:
+                candidates = [n for n in zf.namelist() if n.lower().endswith((".xhtml", ".html", ".htm"))]
+                for name in candidates[:3]:
+                    raw = zf.read(name)
+                    txt = strip_xml_tags(raw.decode("utf-8", errors="ignore"))
+                    if txt.strip():
+                        return clean_text(txt)[:max_chars]
+        if ext == ".pdf":
+            try:
+                import pypdf  # type: ignore
+
+                reader = pypdf.PdfReader(str(path))
+                if reader.pages:
+                    txt = reader.pages[0].extract_text() or ""
+                    return clean_text(txt)[:max_chars]
+            except Exception:
+                return ""
+        if ext in {".djvu", ".djv"}:
+            return extract_djvu_text_snippet(path, max_chars)
+        if ext == ".doc":
+            return extract_doc_text_snippet(path, max_chars)
+    except Exception:
+        return ""
+    return ""
+
+
+def decode_text_bytes(raw: bytes) -> str:
+    for enc in ("utf-8", "utf-16", "cp1251", "latin1"):
+        try:
+            return raw.decode(enc, errors="ignore")
+        except Exception:
+            continue
+    return ""
+
+
+def run_text_tool(args: list[str], timeout_sec: int = 15) -> str:
+    try:
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+    except Exception:
+        return ""
+    if proc.returncode != 0 or not proc.stdout:
+        return ""
+    return clean_text(decode_text_bytes(proc.stdout))
+
+
+def extract_djvu_text_snippet(path: Path, max_chars: int) -> str:
+    tool = shutil.which("djvutxt")
+    if not tool:
+        return ""
+    for page_arg in ("--page=1", "-page=1"):
+        text = run_text_tool([tool, page_arg, str(path)], timeout_sec=20)
+        if text:
+            return text[:max_chars]
+    return ""
+
+
+def extract_doc_text_snippet(path: Path, max_chars: int) -> str:
+    tool = shutil.which("antiword")
+    if not tool:
+        return ""
+    text = run_text_tool([tool, str(path)], timeout_sec=15)
+    return text[:max_chars] if text else ""
+
+
+def read_text_head(path: Path, max_chars: int) -> str:
+    raw = b""
+    with open(path, "rb") as f:
+        raw = f.read(max_chars * 4)
+    for enc in ("utf-8", "utf-16", "cp1251", "latin1"):
+        try:
+            txt = raw.decode(enc, errors="ignore")
+            return clean_text(txt)[:max_chars]
+        except Exception:
+            continue
+    return ""
+
+
+def parse_filename(stem: str) -> dict[str, str]:
+    stem_clean = clean_text(stem.replace("_", " "))
+    patterns = [
+        r"^\s*(?P<author>.+?)\s*[-–—]\s*(?P<title>.+?)\s*$",
+        r"^\s*(?P<title>.+?)\s*\((?P<author>.+?)\)\s*$",
+    ]
+    for pat in patterns:
+        m = re.match(pat, stem_clean)
+        if m:
+            return {
+                "author": clean_text(m.groupdict().get("author", "")),
+                "title": clean_text(m.groupdict().get("title", "")),
+            }
+    return {"title": stem_clean}
+
+
+def filename_looks_like_book_stem(stem: str) -> bool:
+    """Эвристика для файлов вида Фамилия_Имя_Название_Книги.
+
+    Критерии: нет дефиса-разделителя (тот формат обрабатывает parse_filename),
+    минимум 3 сегмента по «_», минимум 2 сегмента начинаются с заглавной буквы
+    и состоят только из букв — признак имени собственного.
+    """
+    if any(sep in stem for sep in ("-", "–", "—")):
+        return False
+    parts = [p for p in stem.split("_") if len(p) >= 2]
+    if len(parts) < 3:
+        return False
+    capitalized = sum(1 for p in parts if p[0].isupper() and p.isalpha())
+    return capitalized >= 2
+
+
+def isbn13_is_valid(isbn: str) -> bool:
+    if len(isbn) != 13 or not isbn.isdigit() or not isbn.startswith(("978", "979")):
+        return False
+    total = sum((1 if idx % 2 == 0 else 3) * int(ch) for idx, ch in enumerate(isbn[:12]))
+    check = (10 - (total % 10)) % 10
+    return check == int(isbn[-1])
+
+
+def isbn10_is_valid(isbn: str) -> bool:
+    if len(isbn) != 10:
+        return False
+    total = 0
+    for idx, ch in enumerate(isbn):
+        if ch.upper() == "X" and idx == 9:
+            value = 10
+        elif ch.isdigit():
+            value = int(ch)
+        else:
+            return False
+        total += (10 - idx) * value
+    return total % 11 == 0
+
+
+def normalize_isbn_candidate(value: str) -> str:
+    cleaned = re.sub(r"[^0-9Xx]", "", value)
+    if len(cleaned) == 13 and isbn13_is_valid(cleaned):
+        return cleaned
+    if len(cleaned) == 10 and isbn10_is_valid(cleaned):
+        return cleaned.upper()
+    return ""
+
+
+def extract_isbns_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+    candidates: list[str] = []
+    patterns = [
+        r"(?i)\bISBN(?:-1[03])?\s*[:：]?\s*([0-9Xx][0-9Xx\-\s]{8,20}[0-9Xx])",
+        r"\b(97[89][0-9\-\s]{10,20}[0-9])\b",
+        r"\b([0-9][0-9\-\s]{8,16}[0-9Xx])\b",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            isbn = normalize_isbn_candidate(match.group(1))
+            if isbn and isbn not in candidates:
+                candidates.append(isbn)
+            if len(candidates) >= 3:
+                return candidates
+    return candidates
+
+
+def _run_with_timeout(fn: "Callable[[], dict[str, str]]", timeout: float = 8.0) -> dict[str, str]:
+    result: dict[str, str] = {}
+
+    def _wrap() -> None:
+        try:
+            result.update(fn())
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_wrap, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    return result
+
+
+def extract_epub_metadata(path: Path) -> dict[str, str]:
+    def _read() -> dict[str, str]:
+        out: dict[str, str] = {}
+        with zipfile.ZipFile(path, "r") as zf:
+            container = "META-INF/container.xml"
+            if container not in zf.namelist():
+                return out
+            container_xml = zf.read(container).decode("utf-8", errors="ignore")
+            m = re.search(r'full-path="([^"]+)"', container_xml)
+            if not m:
+                return out
+            opf_path = m.group(1)
+            if opf_path not in zf.namelist():
+                return out
+            opf_xml = zf.read(opf_path).decode("utf-8", errors="ignore")
+            out["title"] = first_group(opf_xml, r"<dc:title[^>]*>(.*?)</dc:title>")
+            out["author"] = first_group(opf_xml, r"<dc:creator[^>]*>(.*?)</dc:creator>")
+            out["genre"] = first_group(opf_xml, r"<dc:subject[^>]*>(.*?)</dc:subject>")
+        return {k: clean_text(v) for k, v in out.items() if v}
+
+    return _run_with_timeout(_read)
+
+
+def extract_fb2_metadata(path: Path) -> dict[str, str]:
+    raw = b""
+    with open(path, "rb") as f:
+        raw = f.read(600_000)
+    txt = decode_text_bytes(raw)
+    title = first_group(txt, r"<book-title>(.*?)</book-title>")
+    genre = first_group(txt, r"<genre>(.*?)</genre>")
+    first = first_group(txt, r"<first-name>(.*?)</first-name>")
+    last = first_group(txt, r"<last-name>(.*?)</last-name>")
+    author = clean_text(" ".join(x for x in (first, last) if x))
+    out = {}
+    if title:
+        out["title"] = clean_text(title)
+    if author:
+        out["author"] = author
+    if genre:
+        out["genre"] = clean_text(genre)
+    return out
+
+
+def extract_docx_metadata(path: Path) -> dict[str, str]:
+    def _read() -> dict[str, str]:
+        out: dict[str, str] = {}
+        with zipfile.ZipFile(path, "r") as zf:
+            if "docProps/core.xml" not in zf.namelist():
+                return out
+            core = zf.read("docProps/core.xml").decode("utf-8", errors="ignore")
+            title = first_group(core, r"<dc:title>(.*?)</dc:title>")
+            creator = first_group(core, r"<dc:creator>(.*?)</dc:creator>")
+            subj = first_group(core, r"<dc:subject>(.*?)</dc:subject>")
+            if title:
+                out["title"] = clean_text(title)
+            if creator:
+                out["author"] = clean_text(creator)
+            if subj:
+                out["genre"] = clean_text(subj)
+        return out
+
+    return _run_with_timeout(_read)
+
+
+def extract_pdf_metadata(path: Path, timeout: float = 8.0) -> dict[str, str]:
+    result: dict[str, str] = {}
+
+    def _read() -> None:
+        try:
+            import pypdf  # type: ignore
+
+            reader = pypdf.PdfReader(str(path))
+            meta = reader.metadata or {}
+            title = clean_text(str(meta.get("/Title", "")))
+            author = clean_text(str(meta.get("/Author", "")))
+            subj = clean_text(str(meta.get("/Subject", "")))
+            if title:
+                result["title"] = title
+            if author:
+                result["author"] = author
+            if subj:
+                result["genre"] = subj
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_read, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    return result
+
+
+def infer_genre_from_path(path: Path, chain: list[str]) -> str:
+    haystack = " ".join(
+        [path.name.lower(), *[x.lower() for x in chain], *[p.lower() for p in path.parts]]
+    )
+    # Более специфичные подстроки — раньше, чтобы не перекрывались менее точными.
+    keywords = (
+        # Фантастика
+        ("science fiction", "Фантастика"),
+        ("sci-fi", "Фантастика"),
+        ("scifi", "Фантастика"),
+        ("фантастик", "Фантастика"),
+        # Фэнтези
+        ("фэнтез", "Фэнтези"),
+        ("fantasy", "Фэнтези"),
+        # Детективы и триллеры
+        ("детектив", "Детективы и триллеры"),
+        ("триллер", "Детективы и триллеры"),
+        ("thriller", "Детективы и триллеры"),
+        ("криминал", "Детективы и триллеры"),
+        ("mystery", "Детективы и триллеры"),
+        # Поэзия
+        ("поэзи", "Поэзия"),
+        ("поэз", "Поэзия"),
+        ("стихи", "Поэзия"),
+        ("poetry", "Поэзия"),
+        # Детская литература
+        ("детск", "Детская литература"),
+        ("сказк", "Детская литература"),
+        ("children", "Детская литература"),
+        # Романы
+        ("romance", "Романы"),
+        ("роман", "Романы"),
+        # Документальная (перед "fiction", чтобы non-fiction не ушло в художественную)
+        ("non-fiction", "Документальная литература"),
+        ("nonfiction", "Документальная литература"),
+        ("документальн", "Документальная литература"),
+        ("биограф", "Документальная литература"),
+        ("мемуар", "Документальная литература"),
+        # Образование — раньше "литератур", иначе "учебная литература" → художественная
+        ("образован", "Образование"),
+        ("учеб", "Образование"),
+        # Справочники — раньше "право", иначе "спра-ВО-чники" → политика
+        ("энциклопед", "Справочники и энциклопедии"),
+        ("справоч", "Справочники и энциклопедии"),
+        ("словар", "Справочники и энциклопедии"),
+        # Художественная литература
+        ("художественн", "Художественная литература"),
+        ("fiction", "Художественная литература"),
+        ("проза", "Художественная литература"),
+        ("литератур", "Художественная литература"),
+        # История
+        ("истор", "История"),
+        ("history", "История"),
+        # Военное дело
+        ("военн", "Военное дело"),
+        ("military", "Военное дело"),
+        ("оруж", "Военное дело"),
+        # Политика и право ("право" убрано — слишком короткое, даёт коллизии)
+        ("полит", "Политика и право"),
+        ("юрид", "Политика и право"),
+        ("law", "Политика и право"),
+        # Экономика и бизнес
+        ("эконом", "Экономика и бизнес"),
+        ("бизнес", "Экономика и бизнес"),
+        ("финанс", "Экономика и бизнес"),
+        ("business", "Экономика и бизнес"),
+        # Программирование и IT (перед "наук"/science)
+        ("программ", "Программирование и IT"),
+        ("компьютер", "Программирование и IT"),
+        ("programming", "Программирование и IT"),
+        # Наука
+        ("наук", "Наука"),
+        ("science", "Наука"),
+        # Техника
+        ("техник", "Техника"),
+        ("engineering", "Техника"),
+        ("technology", "Техника"),
+        # Медицина и здоровье
+        ("медицин", "Медицина и здоровье"),
+        ("здоров", "Медицина и здоровье"),
+        ("health", "Медицина и здоровье"),
+        ("medicine", "Медицина и здоровье"),
+        # Биология и природа
+        ("биолог", "Биология и природа"),
+        ("природ", "Биология и природа"),
+        ("biology", "Биология и природа"),
+        # Сельское хозяйство
+        ("сельск", "Сельское хозяйство и садоводство"),
+        ("садов", "Сельское хозяйство и садоводство"),
+        ("огород", "Сельское хозяйство и садоводство"),
+        # Кулинария
+        ("кулинар", "Кулинария"),
+        ("рецепт", "Кулинария"),
+        ("cooking", "Кулинария"),
+        # Дом, хобби и ремесла
+        ("хобби", "Дом, хобби и ремесла"),
+        ("ремесл", "Дом, хобби и ремесла"),
+        # Искусство и дизайн
+        ("искусств", "Искусство и дизайн"),
+        ("дизайн", "Искусство и дизайн"),
+        # Религия и философия
+        ("религи", "Религия и философия"),
+        ("философ", "Религия и философия"),
+        ("religion", "Религия и философия"),
+        # Психология и саморазвитие
+        ("психолог", "Психология и саморазвитие"),
+        ("саморазвит", "Психология и саморазвитие"),
+        ("psychology", "Психология и саморазвитие"),
+        # Языкознание
+        ("языкознан", "Языкознание"),
+        ("лингв", "Языкознание"),
+        ("linguistics", "Языкознание"),
+        # Путешествия и география
+        ("путешест", "Путешествия и география"),
+        ("географ", "Путешествия и география"),
+        ("travel", "Путешествия и география"),
+        # Спорт
+        ("спорт", "Спорт"),
+        ("sport", "Спорт"),
+    )
+    for key, val in keywords:
+        if key in haystack:
+            return val
+    return ""
+
+
+GENRE_NOISE_RE = re.compile(
+    r"(?i)(https?://|www\.|isbn|issn|doi|copyright|all rights reserved|"
+    r"издательств|перепечатка|front matter|subject|untitled|new subject|"
+    r"series|серия|guide to custom|handbook chemical process)"
+)
+
+CANONICAL_GENRES = (
+    "Фантастика",
+    "Фэнтези",
+    "Детективы и триллеры",
+    "Романы",
+    "Детская литература",
+    "Поэзия",
+    "Художественная литература",
+    "История",
+    "Военное дело",
+    "Политика и право",
+    "Экономика и бизнес",
+    "Наука",
+    "Техника",
+    "Программирование и IT",
+    "Медицина и здоровье",
+    "Биология и природа",
+    "Сельское хозяйство и садоводство",
+    "Дом, хобби и ремесла",
+    "Кулинария",
+    "Искусство и дизайн",
+    "Религия и философия",
+    "Психология и саморазвитие",
+    "Языкознание",
+    "Образование",
+    "Справочники и энциклопедии",
+    "Путешествия и география",
+    "Спорт",
+    "Документальная литература",
+    "Unknown",
+)
+
+
+GENRE_OUTPUT_TRANSLATIONS_EN = {
+    "Фантастика": "Science Fiction",
+    "Фэнтези": "Fantasy",
+    "Детективы и триллеры": "Mystery and Thrillers",
+    "Романы": "Romance",
+    "Детская литература": "Children's Literature",
+    "Поэзия": "Poetry",
+    "Художественная литература": "Fiction",
+    "История": "History",
+    "Военное дело": "Military",
+    "Политика и право": "Politics and Law",
+    "Экономика и бизнес": "Business and Economics",
+    "Наука": "Science",
+    "Техника": "Engineering and Technology",
+    "Программирование и IT": "Programming and IT",
+    "Медицина и здоровье": "Medicine and Health",
+    "Биология и природа": "Biology and Nature",
+    "Сельское хозяйство и садоводство": "Agriculture and Gardening",
+    "Дом, хобби и ремесла": "Home, Hobbies and Crafts",
+    "Кулинария": "Cooking",
+    "Искусство и дизайн": "Art and Design",
+    "Религия и философия": "Religion and Philosophy",
+    "Психология и саморазвитие": "Psychology and Self-Development",
+    "Языкознание": "Language and Linguistics",
+    "Образование": "Education",
+    "Справочники и энциклопедии": "References and Encyclopedias",
+    "Путешествия и география": "Travel and Geography",
+    "Спорт": "Sports",
+    "Документальная литература": "Nonfiction",
+    "Unknown": "Unknown",
+}
+
+
+def normalize_output_language(language: str) -> str:
+    lang = clean_text(language).lower()
+    if lang == "auto":
+        lang = DEFAULT_GUI_LANGUAGE
+    if lang.startswith("en"):
+        return "en"
+    return "ru"
+
+
+def translate_genre_for_output(genre: str, target_language: str) -> str:
+    canonical = normalize_genre(genre or "Unknown")
+    if normalize_output_language(target_language) == "en":
+        return GENRE_OUTPUT_TRANSLATIONS_EN.get(canonical, canonical)
+    return canonical
+
+
+GENRE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Справочники и энциклопедии", ("энциклоп", "encyclop", "справоч", "reference", "dictionary", "словар")),
+    ("Программирование и IT", ("programming", "software", "computer science", "network", "firewall", "embedded", "algorithm", "information theory", "алгоритм", "программ", "компьютер", "it_")),
+    ("Фантастика", ("science fiction", "sci-fi", "sf_", "sf ", "фантаст", "dystopian", "space opera")),
+    ("Фэнтези", ("fantasy", "фэнтез", "магич", "magical realism")),
+    ("Детективы и триллеры", ("detective", "mystery", "crime", "thriller", "детектив", "криминал")),
+    ("Романы", ("romance", "love_", "romantic", "роман", "erotica")),
+    ("Детская литература", ("children", "child_", "young adult", "сказк", "детск")),
+    ("Поэзия", ("poetry", "verse", "поэз", "стих")),
+    ("История", ("history", "истор", "археолог", "ancient history")),
+    ("Военное дело", ("military", "war ", "weapons", "firearms", "ballistics", "survival", "tactics", "военн", "оруж", "снайпер", "самообор")),
+    ("Политика и право", ("politic", "law", "legal", "juris", "право", "юрис", "полит", "закон")),
+    ("Экономика и бизнес", ("econom", "business", "finance", "management", "маркет", "бизнес", "эконом", "финанс")),
+    ("Медицина и здоровье", ("medicine", "medical", "health", "fitness", "dentistry", "yoga", "медицин", "здоров", "психотерап")),
+    ("Биология и природа", ("biology", "botany", "zoology", "nature", "natural history", "paleontology", "anthropology", "биолог", "ботан", "зоолог", "природ")),
+    ("Сельское хозяйство и садоводство", ("agriculture", "gardening", "garden", "home_garden", "veterinary", "pet care", "садов", "огород", "сельск", "пчелов", "животновод", "ветерин")),
+    ("Кулинария", ("culinary", "cooking", "cook", "кулинар", "рецепт", "винодел", "напит")),
+    ("Дом, хобби и ремесла", ("diy", "craft", "hobby", "home_", "home decor", "interior", "origami", "рукодел", "хобби", "ремес", "дом", "мебел", "быт")),
+    ("Искусство и дизайн", ("art", "design", "architecture", "photography", "music", "искусств", "дизайн", "архитект", "музык", "фотограф")),
+    ("Религия и философия", ("religion", "theology", "christian", "bible", "buddhism", "islam", "judaism", "orthodox", "philosophy", "esoteric", "религ", "православ", "философ", "мифолог", "эзотер")),
+    ("Психология и саморазвитие", ("psychology", "self-help", "self help", "parenting", "саморазвит", "самосоверш", "психолог")),
+    ("Языкознание", ("language", "linguistics", "esperanto", "grammar", "язык", "лингв", "граммат")),
+    ("Образование", ("education", "textbook", "text books", "учеб", "образован", "пособ")),
+    ("Путешествия и география", ("travel", "geography", "geology", "географ", "геолог", "путевод")),
+    ("Спорт", ("sport", "спорт", "хоккей")),
+    ("Техника", ("engineering", "technical", "technology", "manual", "automotive", "construction", "chemistry", "physics", "astronomy", "math", "mathematics", "электрон", "техник", "строитель", "хим", "физик", "математ", "автомоб")),
+    ("Наука", ("science", "наука", "науч", "academic journal")),
+    ("Документальная литература", ("nonfiction", "non-fiction", "memoir", "biography", "publicism", "document", "документ", "публицист", "биограф", "мемуар", "критика")),
+    ("Художественная литература", ("fiction", "literature", "novel", "short stories", "prose", "comedy", "humor", "adventure", "action", "folk", "folklore", "литератур", "проза", "юмор", "приключ")),
+)
+
+
+def infer_genre_from_title(title: str) -> str:
+    t = clean_text(title).lower()
+    if not t:
+        return ""
+    genre = normalize_genre(t)
+    if genre != "Unknown":
+        return genre
+    return ""
+
+
+def normalize_genre(genre: str) -> str:
+    raw = clean_text(genre)
+    g = raw.lower()
+    if not g:
+        return "Unknown"
+    if g in {"unknown", "unknown genre", "none", "null", "n/a", "na", "-", "_"}:
+        return "Unknown"
+    if GENRE_NOISE_RE.search(raw):
+        return "Unknown"
+    if re.fullmatch(r"[\d\s._#;,:/\\-]+", raw):
+        return "Unknown"
+    if len(raw) > 64:
+        return "Unknown"
+    digit_count = sum(ch.isdigit() for ch in raw)
+    if digit_count >= 5:
+        return "Unknown"
+
+    for canonical in CANONICAL_GENRES:
+        if g == canonical.lower():
+            return canonical
+
+    normalized = re.sub(r"[_/\\|;:,\-]+", " ", g)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    for out, keys in GENRE_RULES:
+        for key in keys:
+            if key in normalized or key in g:
+                return out
+    return "Unknown"
+
+
+def _strip_code_fence(text: str) -> str:
+    t = text.strip()
+    if not t.startswith("```"):
+        return t
+    t = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", t)
+    if t.endswith("```"):
+        t = t[:-3]
+    return t.strip()
+
+
+def _extract_first_braced_object(text: str) -> Optional[str]:
+    if not text:
+        return None
+    start = text.find("{")
+    while start >= 0:
+        depth = 0
+        in_str = False
+        quote = ""
+        escaped = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_str:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == quote:
+                    in_str = False
+                continue
+            if ch in {'"', "'"}:
+                in_str = True
+                quote = ch
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+        start = text.find("{", start + 1)
+    return None
+
+
+def _try_parse_json_like(candidate: str) -> Optional[dict[str, Any]]:
+    if not candidate:
+        return None
+    try:
+        payload = json.loads(candidate)
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        pass
+    repaired = re.sub(r",\s*([}\]])", r"\1", candidate)
+    repaired = repaired.replace("“", '"').replace("”", '"').replace("’", "'")
+    repaired = re.sub(r"(?<!\\)'", '"', repaired)
+    try:
+        payload = json.loads(repaired)
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        pass
+    try:
+        payload = ast.literal_eval(candidate)
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        pass
+    return None
+
+
+def parse_json_object(text: str) -> Optional[dict[str, Any]]:
+    if not text:
+        return None
+    text = _strip_code_fence(text)
+    payload = _try_parse_json_like(text)
+    if payload:
+        return payload
+    candidate = _extract_first_braced_object(text)
+    if candidate:
+        return _try_parse_json_like(candidate)
+    m = JSON_OBJECT_RE.search(text)
+    if not m:
+        return None
+    return _try_parse_json_like(m.group(0))
+
+
+def parse_model_payload(text: str) -> Optional[dict[str, Any]]:
+    """
+    Устойчивый разбор ответа модели:
+    1) обычный JSON-объект
+    2) JSON-like c лишним текстом
+    3) строки вида key: value
+    """
+    payload = parse_json_object(text)
+    if payload:
+        return normalize_model_payload(payload)
+
+    if not text:
+        return None
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`").strip()
+
+    fields: dict[str, Any] = {}
+    sep = r"[:=\-–—]"
+
+    # Английские ключи
+    key_pattern_en = re.compile(
+        rf'(?im)\b(title|author|genre|primary_genre|confidence|confidence_score)\b\s*{sep}\s*(?:"([^"]*)"|\'([^\']*)\'|([^\n,;]+))'
+    )
+    for m in key_pattern_en.finditer(cleaned):
+        key = m.group(1).lower()
+        if key == "primary_genre":
+            key = "genre"
+        elif key == "confidence_score":
+            key = "confidence"
+        raw = m.group(2) or m.group(3) or m.group(4) or ""
+        fields[key] = clean_text(raw)
+
+    # Русские синонимы ключей
+    key_pattern_ru = re.compile(
+        rf'(?im)\b(название(?:\s+книги)?|автор|жанр|уверенность|достоверность)\b\s*{sep}\s*(?:"([^"]*)"|\'([^\']*)\'|([^\n,;]+))'
+    )
+    ru_map = {
+        "название": "title",
+        "название книги": "title",
+        "автор": "author",
+        "жанр": "genre",
+        "уверенность": "confidence",
+        "достоверность": "confidence",
+    }
+    for m in key_pattern_ru.finditer(cleaned):
+        key_raw = clean_text(m.group(1)).lower()
+        key = ru_map.get(key_raw)
+        if not key:
+            continue
+        raw = m.group(2) or m.group(3) or m.group(4) or ""
+        fields[key] = clean_text(raw)
+
+    if fields:
+        return normalize_model_payload(fields)
+    return None
+
+
+def normalize_model_payload(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+    if isinstance(payload.get("results"), list) and payload["results"]:
+        first = payload["results"][0]
+        if isinstance(first, dict):
+            return normalize_model_payload(first)
+
+    out: dict[str, Any] = {}
+    if "title" in payload:
+        out["title"] = clean_text(str(payload.get("title", "")))
+    if "author" in payload:
+        out["author"] = clean_text(str(payload.get("author", "")))
+
+    genre_analysis = payload.get("genre_analysis")
+    if isinstance(genre_analysis, dict):
+        primary_genre = clean_text(str(genre_analysis.get("primary_genre", "")))
+        if primary_genre:
+            out["genre"] = primary_genre
+        subgenres_raw = genre_analysis.get("subgenres", [])
+        if isinstance(subgenres_raw, list):
+            out["subgenres"] = [
+                clean_text(str(x)) for x in subgenres_raw if clean_text(str(x))
+            ]
+        elif subgenres_raw:
+            out["subgenres"] = [clean_text(str(subgenres_raw))]
+        if "confidence_score" in genre_analysis:
+            try:
+                out["confidence"] = float(genre_analysis.get("confidence_score", 0.0))
+            except Exception:
+                out["confidence"] = 0.0
+
+    if "genre" in payload and "genre" not in out:
+        out["genre"] = clean_text(str(payload.get("genre", "")))
+    if "primary_genre" in payload and "genre" not in out:
+        out["genre"] = clean_text(str(payload.get("primary_genre", "")))
+    if "subgenres" in payload and "subgenres" not in out:
+        subgenres_raw = payload.get("subgenres", [])
+        if isinstance(subgenres_raw, list):
+            out["subgenres"] = [
+                clean_text(str(x)) for x in subgenres_raw if clean_text(str(x))
+            ]
+        elif subgenres_raw:
+            out["subgenres"] = [clean_text(str(subgenres_raw))]
+
+    if "confidence" in payload and "confidence" not in out:
+        try:
+            out["confidence"] = float(payload.get("confidence", 0.0))
+        except Exception:
+            out["confidence"] = 0.0
+    if "confidence_score" in payload and "confidence" not in out:
+        try:
+            out["confidence"] = float(payload.get("confidence_score", 0.0))
+        except Exception:
+            out["confidence"] = 0.0
+
+    # Разрешаем частичный ответ (например только genre в режиме genre-only).
+    if not out:
+        return None
+    return out
+
+
+def build_lm_fallback_context(task: FileTask, max_chars: int = 700) -> str:
+    chain = " -> ".join(task.archive_chain) if task.archive_chain else ""
+    parts = [
+        f"Filename: {task.path.name}",
+        f"Stem: {task.path.stem}",
+        f"Suffix: {task.path.suffix.lower()}",
+        f"Parent: {task.path.parent.name}",
+    ]
+    if chain:
+        parts.append(f"Archive chain: {chain}")
+    parsed = parse_filename(task.path.stem)
+    if parsed.get("author"):
+        parts.append(f"Possible author from filename: {parsed['author']}")
+    if parsed.get("title"):
+        parts.append(f"Possible title from filename: {parsed['title']}")
+    text = clean_text("\n".join(parts))
+    return text[:max_chars]
+
+
+def has_meaningful_lm_text(text: str, min_letters: int = 24) -> bool:
+    t = clean_text(text)
+    if not t:
+        return False
+    letters = sum(1 for ch in t if ch.isalpha())
+    return letters >= min_letters
+
+
+def sanitize_component(value: str, max_len: int = 90) -> str:
+    value = clean_text(value)
+    value = INVALID_FS_CHARS.sub("_", value)
+    value = value.strip(" .")
+    value = SPACES_RE.sub(" ", value)
+    if not value:
+        value = "Unknown"
+    if len(value) > max_len:
+        value = value[:max_len].rstrip(" .")
+    return value or "Unknown"
+
+
+def shorten_with_hash(value: str, max_len: int) -> str:
+    value = sanitize_component(value, max_len=300)
+    if len(value) <= max_len:
+        return value
+    h = xxhash.xxh64(value.encode("utf-8", errors="ignore")).hexdigest()[:8]
+    keep = max(1, max_len - 9)
+    return f"{value[:keep].rstrip(' .')}_{h}"
+
+
+def clean_text(value: str) -> str:
+    if value is None:
+        return ""
+    value = str(value)
+    value = strip_xml_tags(value)
+    value = value.replace("\ufeff", "").replace("\u200b", "")
+    value = SPACES_RE.sub(" ", value).strip()
+    return value
+
+
+def strip_xml_tags(text: str) -> str:
+    return re.sub(r"<[^>]+>", " ", text)
+
+
+def first_group(text: str, pattern: str) -> str:
+    m = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return ""
+    return clean_text(m.group(1))
+
+
+def first_letter(author: str) -> str:
+    author = clean_text(author)
+    if not author:
+        return "#"
+    ch = author[0].upper()
+    if not ch.isalnum():
+        return "#"
+    return ch
+
+
+def safe_relative(path: Path, base: Path) -> Path:
+    try:
+        return path.relative_to(base)
+    except Exception:
+        return Path(path.name)
+
+
+def ensure_unique_file_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+    i = 1
+    while True:
+        cand = parent / f"{stem}_{i}{suffix}"
+        if not cand.exists():
+            return cand
+        i += 1
+
+
+def resolve_collision(path: Path, hash_hex: str) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+    h8 = (hash_hex or "x")[:8]
+    cand = parent / f"{stem}_{h8}{suffix}"
+    if not cand.exists():
+        return cand
+    i = 1
+    while True:
+        cand = parent / f"{stem}_{h8}_{i}{suffix}"
+        if not cand.exists():
+            return cand
+        i += 1
+
+
+def safe_move(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        dst = ensure_unique_file_path(dst)
+    shutil.move(str(src), str(dst))
+
+
+def link_or_copy(src: Path, dst: Path) -> None:
+    try:
+        os.link(src, dst)
+    except Exception:
+        shutil.copy2(src, dst)
+
+
+def atomic_replace(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(src, dst)
+    except OSError:
+        # Windows: fallback для разных дисков (например C: -> E:).
+        shutil.move(str(src), str(dst))
+
+
+def truncate(value: str, max_len: int) -> str:
+    if len(value) <= max_len:
+        return value
+    return value[: max_len - 3] + "..."
+
+
+def format_subprocess_error(result: subprocess.CompletedProcess, max_len: int = 350) -> str:
+    stderr = clean_text(result.stderr or "")
+    stdout = clean_text(result.stdout or "")
+    combined = stderr or stdout or "no stderr/stdout"
+    return truncate(combined, max_len)
+
+
+def build_source_db_name(source_dirs: list[Path]) -> str:
+    if not source_dirs:
+        source_dirs = [Path("source")]
+    canonical: list[str] = []
+    for src in source_dirs:
+        try:
+            canonical.append(str(src.resolve()))
+        except Exception:
+            canonical.append(str(src))
+    joined = "||".join(sorted(canonical))
+    if len(source_dirs) == 1:
+        base_src = source_dirs[0]
+        base = sanitize_component(base_src.name or "source", max_len=12).lower()
+        base = re.sub(r"[^a-zA-Z0-9_-]+", "_", base).strip("_").lower() or "source"
+    else:
+        base = f"multi{len(source_dirs)}"
+    h6 = xxhash.xxh64(joined.encode("utf-8", errors="ignore")).hexdigest()[:6]
+    return f"ls_{base}_{h6}.db"
+
+
+def parse_sources_input(values: list[str]) -> list[Path]:
+    out: list[Path] = []
+    seen: set[str] = set()
+    for raw in values:
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        for part in re.split(r"[;\n]+", text):
+            value = part.strip()
+            if not value:
+                continue
+            p = Path(value)
+            key = str(p).lower() if os.name == "nt" else str(p)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(p)
+    return out
+
+
+
+def _bind_agent_methods() -> None:
+    from agents import agent_a1_search
+    from agents import agent_a2_unpack
+    from agents import agent_a3_detect
+    from agents import agent_a4_dedupe
+    from agents import agent_a5_tags
+    from agents import agent_a6_lm
+    from agents import agent_a7_rename
+    from agents import agent_a8_pack
+
+    LibrarySorter._scanner_loop = agent_a1_search._scanner_loop
+
+    LibrarySorter._unpack_loop = agent_a2_unpack._unpack_loop
+    LibrarySorter._extract_archive_and_route = agent_a2_unpack._extract_archive_and_route
+    LibrarySorter._process_nested_archive_task = agent_a2_unpack._process_nested_archive_task
+
+    LibrarySorter._detect_loop = agent_a3_detect._detect_loop
+    LibrarySorter._is_book_candidate = agent_a3_detect._is_book_candidate
+    LibrarySorter._handle_nobook = agent_a3_detect._handle_nobook
+    LibrarySorter._move_source_to_nobook = agent_a3_detect._move_source_to_nobook
+    LibrarySorter._source_root_for_path = agent_a3_detect._source_root_for_path
+
+    LibrarySorter._dedupe_loop = agent_a4_dedupe._dedupe_loop
+    LibrarySorter._handle_duplicate = agent_a4_dedupe._handle_duplicate
+
+    LibrarySorter._tags_loop = agent_a5_tags._tags_loop
+    LibrarySorter._extract_metadata = agent_a5_tags._extract_metadata
+    LibrarySorter._needs_lm = agent_a5_tags._needs_lm
+    LibrarySorter._needs_genre_only_lm = agent_a5_tags._needs_genre_only_lm
+    LibrarySorter._merge_lm_metadata = agent_a5_tags._merge_lm_metadata
+
+    LibrarySorter._lm_loop = agent_a6_lm._lm_loop
+
+    LibrarySorter._rename_loop = agent_a7_rename._rename_loop
+    LibrarySorter._build_destination = agent_a7_rename._build_destination
+
+    LibrarySorter._pack_loop = agent_a8_pack._pack_loop
+    LibrarySorter._pack_task = agent_a8_pack._pack_task
+
+
+_bind_agent_methods()
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(
+        description="Многопоточный конвейер сортировки библиотеки с Ollama и XXH64."
+    )
+    p.add_argument("--sources", nargs="+", default=DEFAULT_SOURCE_DIRS)
+    p.add_argument("--source", action="append", dest="legacy_source", help=argparse.SUPPRESS)
+    p.add_argument("--target", default=DEFAULT_TARGET_DIR)
+    p.add_argument("--dupes", default=DEFAULT_DUPES_DIR)
+    p.add_argument("--nobook", default=DEFAULT_NOBOOK_DIR)
+    p.add_argument("--error", default=DEFAULT_ERROR_DIR)
+    p.add_argument("--temp", default=DEFAULT_TEMP_BASE)
+    p.add_argument("--lm-url", default=DEFAULT_LM_URL)
+    p.add_argument("--lm-model", default=DEFAULT_LM_MODEL)
+    p.add_argument("--lm-api-key", default=DEFAULT_LM_API_KEY, help="Bearer API key (OpenRouter, OpenAI, etc.). Leave empty for Ollama.")
+    p.add_argument("--lm-url-rename", default=DEFAULT_LM_URL_RENAME, help="A7 rename provider URL (falls back to --lm-url if empty).")
+    p.add_argument("--lm-model-rename", default=DEFAULT_LM_MODEL_RENAME, help="A7 rename model (falls back to --lm-model if empty).")
+    p.add_argument("--lm-api-key-rename", default=DEFAULT_LM_API_KEY_RENAME, help="A7 rename API key (falls back to --lm-api-key if empty).")
+    p.add_argument("--queue-size", type=int, default=DEFAULT_QUEUE_SIZE)
+    p.add_argument("--unpack-workers", type=int, default=DEFAULT_UNPACK_WORKERS)
+    p.add_argument("--detect-workers", type=int, default=DEFAULT_DETECT_WORKERS)
+    p.add_argument("--tag-workers", type=int, default=DEFAULT_TAG_WORKERS)
+    p.add_argument("--lm-workers", type=int, default=DEFAULT_LM_WORKERS)
+    p.add_argument("--rename-workers", type=int, default=DEFAULT_RENAME_WORKERS)
+    p.add_argument("--dedupe-workers", type=int, default=DEFAULT_DEDUPE_WORKERS)
+    p.add_argument("--pack-workers", type=int, default=DEFAULT_PACK_WORKERS)
+    p.add_argument("--max-parallel-archives", type=int, default=DEFAULT_MAX_PARALLEL_ARCHIVES)
+    p.add_argument(
+        "--keep-source",
+        action="store_true",
+        help="Сохранять исходные файлы после успешной упаковки (поведение по умолчанию).",
+    )
+    p.add_argument(
+        "--delete-source",
+        action="store_true",
+        help="Опасный режим: удалять исходники только после проверки упакованной копии.",
+    )
+    p.add_argument(
+        "--keep-temp-nobooks",
+        action="store_true",
+        help="Сохранять некнижные временные файлы из архивов в NOBOOK_DIR",
+    )
+    p.add_argument("--lm-timeout-sec", type=int, default=DEFAULT_LM_TIMEOUT_SEC)
+    p.add_argument("--lm-input-chars", type=int, default=DEFAULT_LM_INPUT_CHARS)
+    p.add_argument("--lm-max-output-tokens", type=int, default=DEFAULT_LM_MAX_OUTPUT_TOKENS)
+    p.add_argument(
+        "--no-isbn-lookup",
+        action="store_true",
+        help="Не искать метаданные по ISBN через внешние книжные каталоги.",
+    )
+    p.add_argument(
+        "--isbn-provider",
+        choices=("auto", "openlibrary", "googlebooks"),
+        default=DEFAULT_ISBN_PROVIDER
+        if DEFAULT_ISBN_PROVIDER in {"auto", "openlibrary", "googlebooks"}
+        else "auto",
+        help="Провайдер ISBN lookup: auto, openlibrary или googlebooks.",
+    )
+    p.add_argument(
+        "--rename-output",
+        dest="rename_output",
+        action="store_true",
+        default=DEFAULT_TRANSLATE_OUTPUT_NAMES,
+        help="Переводить финальные имена папок и ZIP под выбранный язык.",
+    )
+    p.add_argument(
+        "--no-rename-output",
+        dest="rename_output",
+        action="store_false",
+        help="Не переводить финальные имена папок и ZIP.",
+    )
+    p.add_argument(
+        "--output-language",
+        choices=("auto", "ru", "en"),
+        default=DEFAULT_OUTPUT_LANGUAGE if DEFAULT_OUTPUT_LANGUAGE in {"auto", "ru", "en"} else "auto",
+        help="Язык финальных имен при --rename-output.",
+    )
+    p.add_argument(
+        "--persist-state",
+        action="store_true",
+        help="Сохранять служебную БД/логи после завершения (по умолчанию удаляются).",
+    )
+    args = p.parse_args()
+    source_values: list[str] = []
+    source_values.extend(args.sources or [])
+    source_values.extend(args.legacy_source or [])
+    source_dirs = parse_sources_input(source_values)
+    if not source_dirs:
+        source_dirs = [Path(p) for p in DEFAULT_SOURCE_DIRS]
+
+    return Config(
+        source_dirs=source_dirs,
+        target_dir=Path(args.target),
+        dupes_dir=Path(args.dupes),
+        nobook_dir=Path(args.nobook),
+        error_dir=Path(args.error),
+        temp_base=Path(args.temp),
+        lm_url=str(args.lm_url).strip(),
+        lm_model=str(args.lm_model).strip(),
+        lm_api_key=str(args.lm_api_key).strip(),
+        lm_url_rename=str(args.lm_url_rename or "").strip(),
+        lm_model_rename=str(args.lm_model_rename or "").strip(),
+        lm_api_key_rename=str(args.lm_api_key_rename or "").strip(),
+        queue_size=max(1, args.queue_size),
+        unpack_workers=max(1, args.unpack_workers),
+        detect_workers=max(1, args.detect_workers),
+        tag_workers=max(1, args.tag_workers),
+        lm_workers=max(1, args.lm_workers),
+        rename_workers=max(1, args.rename_workers),
+        dedupe_workers=max(1, args.dedupe_workers),
+        pack_workers=max(1, args.pack_workers),
+        max_parallel_archives=max(1, args.max_parallel_archives),
+        delete_source_after_pack=bool(args.delete_source and not args.keep_source),
+        keep_temp_nobooks=bool(args.keep_temp_nobooks),
+        lm_timeout_sec=max(10, args.lm_timeout_sec),
+        lm_input_chars=max(200, args.lm_input_chars),
+        lm_max_output_tokens=max(40, args.lm_max_output_tokens),
+        isbn_lookup=DEFAULT_ISBN_LOOKUP and not args.no_isbn_lookup,
+        isbn_provider=args.isbn_provider,
+        translate_output_names=bool(args.rename_output),
+        output_language=args.output_language,
+        ephemeral_mode=not args.persist_state,
+    )
+
+
+def main() -> int:
+    config = parse_args()
+    sorter = LibrarySorter(config)
+    return sorter.run()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
