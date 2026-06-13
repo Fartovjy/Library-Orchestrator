@@ -17,7 +17,7 @@ def _lm_loop(self, worker_idx: int) -> None:
         try:
             task: FileTask = self.q56.get(timeout=0.3)
         except queue.Empty:
-            if self.tag_done.is_set() and self.q56.empty():
+            if self.tag_done.is_set() and self.isbn_done.is_set() and self.q56.empty():
                 break
             continue
         try:
@@ -54,46 +54,65 @@ def _lm_loop(self, worker_idx: int) -> None:
                         )
                     elif self.config.lm_fast_precheck:
                         self.metrics.mark_lm_stat("fast_no_result")
-                    snippet = extract_text_snippet(
-                        task.path, max_chars=self.config.lm_input_chars
-                    )
-                    if snippet and has_meaningful_lm_text(
-                        snippet, min_letters=self.config.lm_min_snippet_letters
-                    ):
-                        lm_input = snippet
-                        lm_input_mode = "snippet"
-                    elif self.config.lm_force_full_metadata or self.config.lm_always_try_without_snippet:
-                        lm_input = build_lm_fallback_context(
-                            task, max_chars=self.config.lm_input_chars
-                        )
-                        lm_input_mode = "fallback_context"
-                        self.metrics.add_event(f"LM fallback-context: {display_name}")
-                    else:
-                        lm_input = ""
-                        lm_input_mode = "none"
-                        self.metrics.add_event(f"LM skip(no text): {display_name}")
-                    self.logger.info(
-                        "A6 full_input path=%s mode=%s chars=%d",
-                        task.path,
-                        lm_input_mode,
-                        len(lm_input),
-                    )
-                    if lm_input:
-                        self.metrics.mark_lm_stat("full_request")
-                        lm_data = self.lm_client.enrich(task, lm_input)
+
+                    if self.config.lm_iterative_read:
+                        # ── Глубокий итеративный режим ──────────────────────
+                        self.metrics.mark_lm_stat("iter_request")
+                        lm_data = self.lm_client.enrich_iterative(task)
                         if lm_data:
-                            self.metrics.mark_lm_stat("full_ok")
+                            self.metrics.mark_lm_stat("iter_ok")
                             self._merge_lm_metadata(task.metadata, lm_data)
                             self.logger.info(
-                                "A6 full_ok path=%s data=%s",
+                                "A6 iter_ok path=%s conf=%.1f data=%s",
                                 task.path,
+                                float(lm_data.get("confidence", 0.0)),
                                 json.dumps(lm_data, ensure_ascii=False),
                             )
                         else:
-                            self.metrics.mark_lm_stat("full_no_result")
-                            self.logger.info("A6 full_no_result path=%s", task.path)
+                            self.metrics.mark_lm_stat("iter_no_result")
+                            self.logger.info("A6 iter_no_result path=%s", task.path)
                     else:
-                        self.metrics.mark_lm_stat("full_skipped_no_input")
+                        # ── Одиночный запрос (стандартный режим) ────────────
+                        snippet = extract_text_snippet(
+                            task.path, max_chars=self.config.lm_input_chars
+                        )
+                        if snippet and has_meaningful_lm_text(
+                            snippet, min_letters=self.config.lm_min_snippet_letters
+                        ):
+                            lm_input = snippet
+                            lm_input_mode = "snippet"
+                        elif self.config.lm_force_full_metadata or self.config.lm_always_try_without_snippet:
+                            lm_input = build_lm_fallback_context(
+                                task, max_chars=self.config.lm_input_chars
+                            )
+                            lm_input_mode = "fallback_context"
+                            self.metrics.add_event(f"LM fallback-context: {display_name}")
+                        else:
+                            lm_input = ""
+                            lm_input_mode = "none"
+                            self.metrics.add_event(f"LM skip(no text): {display_name}")
+                        self.logger.info(
+                            "A6 full_input path=%s mode=%s chars=%d",
+                            task.path,
+                            lm_input_mode,
+                            len(lm_input),
+                        )
+                        if lm_input:
+                            self.metrics.mark_lm_stat("full_request")
+                            lm_data = self.lm_client.enrich(task, lm_input)
+                            if lm_data:
+                                self.metrics.mark_lm_stat("full_ok")
+                                self._merge_lm_metadata(task.metadata, lm_data)
+                                self.logger.info(
+                                    "A6 full_ok path=%s data=%s",
+                                    task.path,
+                                    json.dumps(lm_data, ensure_ascii=False),
+                                )
+                            else:
+                                self.metrics.mark_lm_stat("full_no_result")
+                                self.logger.info("A6 full_no_result path=%s", task.path)
+                        else:
+                            self.metrics.mark_lm_stat("full_skipped_no_input")
             elif decision == "genre_only":
                 self.metrics.mark_lm_stat("genre_only_request")
                 lm_data = self.lm_client.enrich_genre_only(task)

@@ -24,6 +24,7 @@ def _rename_loop(self, worker_idx: int) -> None:
             self.metrics.set_active_item("A7", active_slot, task.path.name)
             self.metrics.mark_stage("A7")
             task.dest_zip = self._build_destination(task)
+            self.metrics.set_active_item("A7", active_slot, f"→ {task.dest_zip.name}")
             self.logger.info("A7 route path=%s dest=%s", task.path, task.dest_zip)
             self._put_with_stop(self.q78, task)
             self.db.mark_file(task, "rename_done", str(task.dest_zip))
@@ -43,9 +44,14 @@ def _build_destination(self, task: FileTask) -> Path:
     md = task.metadata
     md.genre = normalize_genre(md.genre or "Unknown")
     output_language = normalize_output_language(self.config.output_language)
-    title_value = md.title or task.path.stem
-    author_value = md.author or "Unknown Author"
-    genre_value = md.genre or "Unknown"
+
+    # Умный выбор: метаданные → парсинг имени файла → цепочка архивов → стем
+    title_value  = pick_best_title(md, task)
+    author_value = pick_best_author(md, task)
+    # Чистим название: хвостовой цифровой ID + дубль автора в начале
+    title_value  = clean_book_title(title_value, author_value) or title_value
+    genre_value  = md.genre or "Unknown"
+
     if self.config.translate_output_names:
         translated = self.lm_client.translate_output_metadata(
             task, md, output_language

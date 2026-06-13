@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Надежный конвейер сортировки большой библиотеки:
 1) Поиск файлов
@@ -124,12 +124,17 @@ DEFAULT_LM_ALWAYS_TRY_WITHOUT_SNIPPET = bool(
 )
 DEFAULT_LM_STRICT_JSON_MODE = bool(getattr(setting, "LM_STRICT_JSON_MODE", True))
 DEFAULT_LM_MIN_SNIPPET_LETTERS = int(getattr(setting, "LM_MIN_SNIPPET_LETTERS", 24))
+# Deep iterative analysis
+DEFAULT_LM_DEEP_ITER_CHUNK_SIZE = int(getattr(setting, "LM_DEEP_ITER_CHUNK_SIZE", 4000))
+DEFAULT_LM_DEEP_ITER_MAX_ITERS  = int(getattr(setting, "LM_DEEP_ITER_MAX_ITERS", 8))
+DEFAULT_LM_DEEP_ITER_CONFIDENCE = float(getattr(setting, "LM_DEEP_ITER_CONFIDENCE", 4.5))
 DEFAULT_SEED_HASHES_FROM_TARGET = bool(getattr(setting, "SEED_HASHES_FROM_TARGET", True))
 DEFAULT_TARGET_HASH_SCAN_WORKERS = int(
     getattr(setting, "TARGET_HASH_SCAN_WORKERS", max(2, min(8, os.cpu_count() or 4)))
 )
 DEFAULT_ISBN_LOOKUP = bool(getattr(setting, "ISBN_LOOKUP", True))
 DEFAULT_ISBN_PROVIDER = str(getattr(setting, "ISBN_PROVIDER", "auto")).strip().lower()
+DEFAULT_ISBN_WORKERS = int(getattr(setting, "ISBN_WORKERS", 1))
 DEFAULT_TRANSLATE_OUTPUT_NAMES = bool(
     getattr(setting, "TRANSLATE_OUTPUT_NAMES", False)
 )
@@ -366,13 +371,14 @@ BOOK_CONTENT_TOKENS: tuple[str, ...] = (
     "©",
 )
 
-AGENT_KEYS = ("A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8")
+AGENT_KEYS = ("A1", "A2", "A3", "A4", "A5", "A5b", "A6", "A7", "A8")
 AGENT_LABELS = {
     "A1": "Поиск",
     "A2": "Распаковка",
     "A3": "Книга?",
     "A4": "XXH64",
     "A5": "Теги",
+    "A5b": "ISBN",
     "A6": "Ollama",
     "A7": "Переименование",
     "A8": "Упаковка",
@@ -431,9 +437,15 @@ class Config:
     target_hash_scan_workers: int = DEFAULT_TARGET_HASH_SCAN_WORKERS
     isbn_lookup: bool = DEFAULT_ISBN_LOOKUP
     isbn_provider: str = DEFAULT_ISBN_PROVIDER
+    isbn_workers: int = DEFAULT_ISBN_WORKERS
     translate_output_names: bool = DEFAULT_TRANSLATE_OUTPUT_NAMES
     output_language: str = DEFAULT_OUTPUT_LANGUAGE
     ephemeral_mode: bool = True
+    # Глубокий итеративный анализ
+    lm_iterative_read: bool = False
+    lm_deep_iter_chunk_size: int = DEFAULT_LM_DEEP_ITER_CHUNK_SIZE
+    lm_deep_iter_max_iters: int = DEFAULT_LM_DEEP_ITER_MAX_ITERS
+    lm_deep_iter_confidence: float = DEFAULT_LM_DEEP_ITER_CONFIDENCE
 
 
 class _IsbnRateLimited(Exception):
@@ -448,6 +460,7 @@ class Metadata:
     subgenres: list[str] = field(default_factory=list)
     confidence: float = 0.0
     source: str = "none"
+    isbn: str = ""
 
 
 @dataclass
@@ -463,9 +476,11 @@ class FileTask:
     dest_zip: Optional[Path] = None
     canonical_zip: Optional[Path] = None
     xxh64: Optional[str] = None
+    size_bytes: int = 0
     is_book_candidate: bool = False
     book_seen_counted: bool = False
     book_done_counted: bool = False
+    isbn_candidates: list[str] = field(default_factory=list)
 
 
 def format_duration_hms(seconds: Optional[int]) -> str:
@@ -517,6 +532,8 @@ class Metrics:
         self.events: deque[str] = deque(maxlen=10)
         self.active_stage_items: dict[str, dict[str, str]] = defaultdict(dict)
         self.active_stage_started: dict[str, dict[str, float]] = defaultdict(dict)
+        self.bytes_seen: int = 0   # sum of source file sizes discovered by A1
+        self.bytes_done: int = 0   # sum of source file sizes fully processed
 
     def set_mode(self, mode: str) -> None:
         with self.lock:
@@ -556,6 +573,13 @@ class Metrics:
             slot = sorted(stage_map.keys())[0]
             out[stage] = stage_map[slot]
         return out
+
+    def _snapshot_per_slot_items(self) -> dict[str, dict[str, str]]:
+        return {
+            stage: dict(stage_map)
+            for stage, stage_map in self.active_stage_items.items()
+            if stage_map
+        }
 
     def _snapshot_active_counts(self) -> dict[str, int]:
         return {
@@ -611,6 +635,14 @@ class Metrics:
         with self.lock:
             self.nobook_files += 1
 
+    def add_bytes_seen(self, n: int) -> None:
+        with self.lock:
+            self.bytes_seen += n
+
+    def add_bytes_done(self, n: int) -> None:
+        with self.lock:
+            self.bytes_done += n
+
     def mark_stage(self, stage: str, error: bool = False) -> None:
         with self.lock:
             self.stage_touched_at[stage] = time.time()
@@ -660,19 +692,26 @@ class Metrics:
             total_remaining = downstream_backlog + a2_estimated_books
             total_estimated_books = done + total_remaining
 
-            pct = (
-                0.0
-                if total_estimated_books == 0
-                else (done / total_estimated_books) * 100.0
-            )
+            bytes_seen = self.bytes_seen
+            bytes_done = self.bytes_done
+
+            # Volume-based progress and ETA
+            gb_seen = bytes_seen / 1_073_741_824
+            gb_done = bytes_done / 1_073_741_824
+            gb_remaining = max(0.0, gb_seen - gb_done)
+            gb_per_min = (gb_done / elapsed * 60.0) if elapsed > 0 and gb_done > 0 else 0.0
+
+            pct = (gb_done / gb_seen * 100.0) if gb_seen > 0 else 0.0
             pct = max(0.0, min(100.0, pct))
 
             eta_seconds: Optional[int]
-            if done > 0 and elapsed > 0:
-                speed = done / elapsed  # books per second
-                eta_seconds = int(total_remaining / max(speed, 1e-9)) if total_remaining > 0 else 0
+            if gb_per_min > 0 and gb_remaining > 0:
+                eta_seconds = int(gb_remaining / gb_per_min * 60.0)
+            elif gb_remaining == 0 and gb_done > 0:
+                eta_seconds = 0
             else:
                 eta_seconds = None
+
             return {
                 "mode": self.mode,
                 "seen": seen,
@@ -688,6 +727,10 @@ class Metrics:
                 "eta_sec": eta_seconds,
                 "elapsed": format_duration_hms(elapsed),
                 "eta": format_duration_hms(eta_seconds),
+                "gb_seen": round(gb_seen, 2),
+                "gb_done": round(gb_done, 2),
+                "gb_remaining": round(gb_remaining, 2),
+                "gb_per_min": round(gb_per_min, 2),
                 "stage_processed": stage_processed,
                 "stage_errors": stage_errors,
                 "results": results,
@@ -695,6 +738,7 @@ class Metrics:
                 "lm_stats": lm_stats,
                 "events": list(self.events),
                 "active_stage_items": self._snapshot_active_items(),
+                "active_stage_per_slot": self._snapshot_per_slot_items(),
                 "active_stage_counts": active_stage_counts,
                 "active_stage_slots": active_stage_slots,
                 "active_stage_elapsed": active_stage_elapsed,
@@ -705,12 +749,16 @@ class Metrics:
 
 
 class ManifestDB:
+    _MARK_FILE_BATCH_SIZE = 500
+
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self._lock = threading.Lock()
         self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=FULL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA cache_size=-65536")  # ~64 MB page cache in RAM
+        self._mark_file_buf: list[tuple] = []
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -772,19 +820,35 @@ class ManifestDB:
 
     def mark_file(self, task: FileTask, status: str, message: str = "") -> None:
         now = datetime.now(timezone.utc).isoformat()
-        with self._lock, self.conn:
-            self.conn.execute(
-                """
-                INSERT INTO files(task_id, source_path, status, message, updated_at)
-                VALUES(?, ?, ?, ?, ?)
-                ON CONFLICT(task_id) DO UPDATE SET
-                    source_path=excluded.source_path,
-                    status=excluded.status,
-                    message=excluded.message,
-                    updated_at=excluded.updated_at
-                """,
-                (task.task_id, str(task.path), status, message, now),
-            )
+        row = (task.task_id, str(task.path), status, message, now)
+        with self._lock:
+            self._mark_file_buf.append(row)
+            if len(self._mark_file_buf) >= self._MARK_FILE_BATCH_SIZE:
+                self._flush_mark_file_buf()
+
+    def _flush_mark_file_buf(self) -> None:
+        """Flush buffered mark_file rows. Must be called under self._lock."""
+        if not self._mark_file_buf:
+            return
+        rows, self._mark_file_buf = self._mark_file_buf, []
+        self.conn.executemany(
+            """
+            INSERT INTO files(task_id, source_path, status, message, updated_at)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(task_id) DO UPDATE SET
+                source_path=excluded.source_path,
+                status=excluded.status,
+                message=excluded.message,
+                updated_at=excluded.updated_at
+            """,
+            rows,
+        )
+        self.conn.commit()
+
+    def flush(self) -> None:
+        """Force-flush any buffered writes. Call before close() or checkpoints."""
+        with self._lock:
+            self._flush_mark_file_buf()
 
     def claim_hash(
         self,
@@ -842,11 +906,19 @@ class ManifestDB:
 
     def close(self) -> None:
         with self._lock:
+            self._flush_mark_file_buf()
             self.conn.close()
 
     def remove_hash(self, xxh64_hex: str) -> None:
         with self._lock, self.conn:
             self.conn.execute("DELETE FROM hashes WHERE xxh64 = ?", (xxh64_hex,))
+
+    def get_canonical_zip(self, xxh64_hex: str) -> Optional[str]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT canonical_zip FROM hashes WHERE xxh64 = ?", (xxh64_hex,)
+            ).fetchone()
+            return row[0] if row else None
 
     def get_target_index(self, path_key: str) -> Optional[dict[str, Any]]:
         with self._lock:
@@ -1014,6 +1086,29 @@ class TempTracker:
         self._refs: dict[Path, int] = defaultdict(int)
         self.logger = logger
         self.metrics = metrics
+        self._cleanup_queue: queue.Queue[Optional[Path]] = queue.Queue()
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_worker, name="TempCleanup", daemon=True
+        )
+        self._cleanup_thread.start()
+
+    def _cleanup_worker(self) -> None:
+        while True:
+            root = self._cleanup_queue.get()
+            if root is None:
+                self._cleanup_queue.task_done()
+                break
+            try:
+                shutil.rmtree(root, ignore_errors=True)
+                self.metrics.add_event(f"Temp cleaned: {root}")
+            except Exception as exc:
+                self.logger.exception("Ошибка очистки temp %s: %s", root, exc)
+            finally:
+                self._cleanup_queue.task_done()
+
+    def stop(self) -> None:
+        self._cleanup_queue.put(None)
+        self._cleanup_thread.join(timeout=30)
 
     def register(self, root: Optional[Path]) -> None:
         if not root:
@@ -1024,20 +1119,13 @@ class TempTracker:
     def release(self, root: Optional[Path]) -> None:
         if not root:
             return
-        should_delete = False
         with self._lock:
             if root not in self._refs:
                 return
             self._refs[root] -= 1
             if self._refs[root] <= 0:
                 del self._refs[root]
-                should_delete = True
-        if should_delete:
-            try:
-                shutil.rmtree(root, ignore_errors=True)
-                self.metrics.add_event(f"Temp cleaned: {root}")
-            except Exception as exc:
-                self.logger.exception("Ошибка очистки temp %s: %s", root, exc)
+                self._cleanup_queue.put(root)
 
 
 class LMStudioClient:
@@ -1159,19 +1247,34 @@ class LMStudioClient:
             "unknown genre",
         }
 
+    def _brief_metadata(self, md: "Metadata") -> str:
+        """Compact JSON of the only fields useful to the LM (saves input tokens).
+        Drops heuristic-internal fields like source/confidence/hint/lang."""
+        return json.dumps(
+            {
+                "title": getattr(md, "title", "") or "",
+                "author": getattr(md, "author", "") or "",
+                "genre": getattr(md, "genre", "") or "",
+                "isbn": getattr(md, "isbn", "") or "",
+            },
+            ensure_ascii=False,
+        )
+
     def _lm_result_is_strong(self, parsed: Optional[dict[str, Any]]) -> bool:
+        """Fast precheck accept gate.
+
+        Strict: title AND genre must be confident; author may stay Unknown
+        (chapter files, scans without author tag etc. — full request can't
+        recover author either, no point burning tokens on it)."""
         if not parsed:
             return False
         title = clean_text(parsed.get("title", ""))
-        author = clean_text(parsed.get("author", ""))
         genre = normalize_genre(clean_text(parsed.get("genre", "")) or "Unknown")
         try:
             conf = float(parsed.get("confidence", 0.0))
         except Exception:
             conf = 0.0
         if self._is_unknown_title(title):
-            return False
-        if self._is_unknown_author(author):
             return False
         if self._is_unknown_genre(genre):
             return False
@@ -1202,40 +1305,47 @@ class LMStudioClient:
         system_prompt = (
             "РОЛЬ И ЗАДАЧА: Ты — машина для быстрой предварительной каталогизации книги. "
             "Используй только имя файла, путь, цепочку архивов и уже найденные метаданные. "
-            "Не выдумывай. Если в каком-то поле нет уверенности, верни Unknown. "
             f"Жанр выбирай только из списка: {genre_list}. "
-            """Не добавляй никаких пояснений, только чистый JSON.
-
-ПРИМЕР ВЫВОДА:
-{
-  "results": [
-    {
-      "title": "Название А",
-      "author": "Автор X",
-      "genre_analysis": {
-        "primary_genre": "Научная фантастика",
-        "subgenres": [],
-        "confidence_score": 5.0
-      }
-    }
-  ]
-}"""
+            "Алиасы (приведи к канону): Sci-Fi/Science Fiction → Фантастика; "
+            "Fantasy → Фэнтези; Mystery/Thriller → Детективы и триллеры; "
+            "Fiction → Художественная литература; Non-fiction → Документальная литература. "
+            "ЯЗЫК ПОЛЕЙ: title и author — в оригинальной форме (для русских книг — кириллица). "
+            "НЕ транслитерируй русские имена латиницей. "
+            "Если поле НЕЛЬЗЯ определить — оставь ПУСТУЮ строку ''. НЕ пиши 'Unknown'. "
+            "Не добавляй никаких пояснений, только чистый JSON.\n"
+            "confidence_score — реальная уверенность 0.0–5.0. НЕ ставь 5.0 по умолчанию.\n"
+            "Шкала: 5.0 = всё ясно из имени файла; 4.5 = автор неизвестен но title+genre ясны; "
+            "3.5 = только жанр угадан; 2.0 = почти ничего не ясно.\n"
+            "\nПРИМЕР ВЫВОДА:\n"
+            "{\n"
+            '  "results": [\n'
+            "    {\n"
+            '      "title": "Дюна",\n'
+            '      "author": "Фрэнк Герберт",\n'
+            '      "genre_analysis": {\n'
+            '        "primary_genre": "Фантастика",\n'
+            '        "confidence_score": 4.2\n'
+            "      }\n"
+            "    }\n"
+            "  ]\n"
+            "}"
         )
+        lang_hint = (getattr(task.metadata, "lang", "") or "").strip().lower() or "ru"
         user_prompt = (
             "БЫСТРЫЙ КОНТЕКСТ КНИГИ:\n"
             f"Имя файла: {task.path.name}\n"
-            f"Текущие теги и эвристики: {json.dumps(task.metadata.__dict__, ensure_ascii=False)}\n"
+            f"Язык контента: {lang_hint}\n"
+            f"Текущие теги: {self._brief_metadata(task.metadata)}\n"
             f"{context}\n"
             "Верни JSON строго по шаблону: один объект в массиве results для этой книги. "
-            "Если title, author или genre определить надежно нельзя, используй Unknown."
+            "Если title или author надёжно определить нельзя — оставь поле ПУСТОЙ строкой '' "
+            "(НЕ 'Unknown' и НЕ имя файла). Имя файла НЕ копируй как название."
         )
         request_payload = {
             "model": self.config.lm_model,
             "temperature": 0.0,
-            "max_tokens": min(
-                int(self.config.lm_fast_max_output_tokens),
-                int(self.config.lm_max_output_tokens),
-            ),
+            # Fast precheck uses its own token budget — independent of full-request cap.
+            "max_tokens": int(self.config.lm_fast_max_output_tokens),
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -1264,19 +1374,24 @@ class LMStudioClient:
             parsed = parse_model_payload(content)
             retry_content = ""
             if not parsed:
+                # Minimal retry: keep only system prompt + tiny schema reminder.
+                # Drops the original context to save input tokens.
                 retry_payload = {
-                    **request_payload,
-                    "messages": request_payload["messages"]
-                    + [
+                    "model": request_payload["model"],
+                    "temperature": 0.0,
+                    "max_tokens": request_payload["max_tokens"],
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
                         {
                             "role": "user",
                             "content": (
-                                "Верни только валидный JSON-объект без markdown и текста вокруг. "
-                                "Строго структура: {\"results\":[{\"title\":\"...\",\"author\":\"...\","
-                                "\"genre_analysis\":{\"primary_genre\":\"...\",\"subgenres\":[],"
-                                "\"confidence_score\":5.0}}]}"
+                                f"Книга: {task.path.name}. "
+                                f"Теги: {self._brief_metadata(task.metadata)}. "
+                                "Верни только JSON: {\"results\":[{\"title\":\"...\","
+                                "\"author\":\"...\",\"genre_analysis\":"
+                                "{\"primary_genre\":\"...\",\"confidence_score\":4.0}}]}"
                             ),
-                        }
+                        },
                     ],
                 }
                 retry, retry_mode = self._post_chat(
@@ -1342,27 +1457,36 @@ class LMStudioClient:
             "РОЛЬ И ЗАДАЧА: Ты — машина для категоризации литературных произведений. "
             "Твоя задача — принять данные о книге и вернуть результат в строгом JSON-формате. "
             f"Жанр выбирай только из списка: {genre_list}. "
-            """Не добавляй никаких вводных слов или заключений, только чистый JSON.
-
-ПРИМЕР ВЫВОДА:
-{
-  "results": [
-    {
-      "title": "Название А",
-      "author": "Автор X",
-      "genre_analysis": {
-        "primary_genre": "Научная фантастика",
-        "subgenres": ["Транспортный триллер", "Дистопия"],
-        "confidence_score": 5.0
-      }
-    }
-  ]
-}"""
+            "Алиасы (приведи к канону): Sci-Fi/Science Fiction → Фантастика; "
+            "Fantasy → Фэнтези; Mystery/Thriller → Детективы и триллеры; "
+            "Fiction → Художественная литература; Non-fiction → Документальная литература. "
+            "ЯЗЫК ПОЛЕЙ: title и author — в оригинальной форме произведения "
+            "(для русских книг — кириллица, для английских — латиница). "
+            "НЕ транслитерируй русские имена латиницей и не переводи на английский. "
+            "Если title или author НЕЛЬЗЯ определить из текста — оставь поле ПУСТОЙ строкой ''. "
+            "НЕ пиши 'Unknown', 'Untitled', 'None' и не повторяй имя файла как название книги. "
+            "Не добавляй никаких вводных слов или заключений, только чистый JSON.\n"
+            "confidence_score — твоя реальная уверенность от 0.0 до 5.0. НЕ ставь 5.0 по умолчанию.\n"
+            "\nПРИМЕР ВЫВОДА:\n"
+            "{\n"
+            '  "results": [\n'
+            "    {\n"
+            '      "title": "Дюна",\n'
+            '      "author": "Фрэнк Герберт",\n'
+            '      "genre_analysis": {\n'
+            '        "primary_genre": "Фантастика",\n'
+            '        "confidence_score": 4.4\n'
+            "      }\n"
+            "    }\n"
+            "  ]\n"
+            "}"
         )
+        lang_hint = (getattr(task.metadata, "lang", "") or "").strip().lower() or "ru"
         user_prompt = (
             "ДАННЫЕ О КНИГЕ:\n"
             f"Имя файла: {task.path.name}\n"
-            f"Текущие теги и эвристики: {json.dumps(task.metadata.__dict__, ensure_ascii=False)}\n"
+            f"Язык контента: {lang_hint}\n"
+            f"Текущие теги: {self._brief_metadata(task.metadata)}\n"
             "Фрагмент текста/контекст (ограниченный, не вся книга):\n"
             f"{snippet}"
         )
@@ -1374,7 +1498,7 @@ class LMStudioClient:
         )
         request_payload = {
             "model": self.config.lm_model,
-            "temperature": 0.1,
+            "temperature": 0.0,
             "max_tokens": self.config.lm_max_output_tokens,
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -1407,20 +1531,24 @@ class LMStudioClient:
             parsed = parse_model_payload(content)
             retry_content = ""
             if not parsed:
+                # Minimal retry: keep only system prompt + tiny schema reminder.
+                # Drops the original snippet to save input tokens.
                 retry_payload = {
-                    **request_payload,
+                    "model": request_payload["model"],
                     "temperature": 0.0,
-                    "messages": request_payload["messages"]
-                    + [
+                    "max_tokens": request_payload["max_tokens"],
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
                         {
                             "role": "user",
                             "content": (
-                                "Верни только валидный JSON-объект без markdown и текста вокруг. "
-                                "Строго структура: {\"results\":[{\"title\":\"...\",\"author\":\"...\","
-                                "\"genre_analysis\":{\"primary_genre\":\"...\",\"subgenres\":[\"...\"],"
-                                "\"confidence_score\":5.0}}]}"
+                                f"Книга: {task.path.name}. "
+                                f"Теги: {self._brief_metadata(task.metadata)}. "
+                                "Верни только JSON: {\"results\":[{\"title\":\"...\","
+                                "\"author\":\"...\",\"genre_analysis\":"
+                                "{\"primary_genre\":\"...\",\"confidence_score\":4.0}}]}"
                             ),
-                        }
+                        },
                     ],
                 }
                 retry, retry_mode = self._post_chat(
@@ -1486,23 +1614,29 @@ class LMStudioClient:
             return cached
 
         system_prompt = (
-            "You are a library cataloguer. Return ONLY a JSON object, no explanations. "
-            "Format: {\"genre\":\"...\",\"confidence\":0.0} where confidence is 0.0–1.0. "
-            f"Choose genre strictly from this list: {', '.join(CANONICAL_GENRES)}. "
-            "Use title, author, filename, path, archive folder names and text snippet as clues. "
-            "Make your best guess even with limited data — use 'Unknown' only if there are "
-            "absolutely no clues at all."
+            "Ты — каталогизатор библиотеки. Верни ТОЛЬКО JSON-объект, без пояснений. "
+            "Формат: {\"genre\":\"...\",\"confidence\":0.0} где confidence от 0.0 до 5.0. "
+            f"Выбирай жанр строго из списка: {', '.join(CANONICAL_GENRES)}. "
+            "Алиасы: Sci-Fi/Science Fiction → Фантастика; Fantasy → Фэнтези; "
+            "Mystery/Thriller → Детективы и триллеры; Fiction/Roman → Художественная литература; "
+            "Non-fiction → Документальная литература. "
+            "Опирайся в первую очередь на СОДЕРЖАНИЕ (фрагмент текста), затем на title/author/путь. "
+            "НЕ ставь 'Фантастика' по умолчанию: книги о психологии, отношениях, здоровье, "
+            "кулинарии — это НЕ фантастика. Если жанр неясен — ставь низкий confidence "
+            "(1.0–2.0), а не угадывай популярный жанр наугад."
         )
-        snippet = extract_text_snippet(task.path, max_chars=300)
+        snippet = extract_text_snippet(task.path, max_chars=700)
         archive_chain = " -> ".join(task.archive_chain) if task.archive_chain else ""
+        lang_hint = (getattr(task.metadata, "lang", "") or "").strip().lower() or "ru"
         user_prompt = (
-            f"Filename: {task.path.name}\n"
+            f"Имя файла: {task.path.name}\n"
             f"Title: {task.metadata.title}\n"
             f"Author: {task.metadata.author}\n"
-            f"Archive path: {archive_chain or task.path}\n"
+            f"Архивный путь: {archive_chain or task.path}\n"
+            f"Язык контента: {lang_hint}\n"
         )
         if snippet:
-            user_prompt += f"Text snippet:\n{snippet[:300]}\n"
+            user_prompt += f"Фрагмент текста:\n{snippet[:700]}\n"
         request_payload = {
             "model": self.config.lm_model,
             "temperature": 0.0,
@@ -1538,18 +1672,21 @@ class LMStudioClient:
             parsed = parse_model_payload(content)
             retry_content = ""
             if not parsed:
+                # Minimal retry: drop snippet, keep only system + tiny schema reminder.
                 retry_payload = {
-                    **request_payload,
+                    "model": request_payload["model"],
                     "temperature": 0.0,
-                    "messages": request_payload["messages"]
-                    + [
+                    "max_tokens": request_payload["max_tokens"],
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
                         {
                             "role": "user",
                             "content": (
-                                "Верни только валидный JSON-объект без markdown и текста вокруг. "
-                                "Строго ключи: genre, confidence."
+                                f"Книга: {task.path.name}. "
+                                f"Title: {task.metadata.title}. Author: {task.metadata.author}. "
+                                "Верни только JSON: {\"genre\":\"...\",\"confidence\":0.0} (confidence 0.0–5.0)"
                             ),
-                        }
+                        },
                     ],
                 }
                 retry, retry_mode = self._post_chat(
@@ -1591,6 +1728,202 @@ class LMStudioClient:
             self.logger.warning("Ollama genre-only недоступен: %s", exc)
             return None
 
+    def enrich_iterative(self, task: FileTask) -> Optional[dict[str, Any]]:
+        """
+        Глубокий итеративный анализ: подаёт текст книги частями в накапливающемся диалоге.
+        Останавливается когда confidence_score >= порога или текст исчерпан.
+        Автоматически откатывается к одиночному запросу если текст недоступен.
+        """
+        if not self.available:
+            self.logger.warning("LM iterative unavailable: requests import failed")
+            return None
+
+        chunk_size     = self.config.lm_deep_iter_chunk_size
+        max_iters      = self.config.lm_deep_iter_max_iters
+        conf_threshold = self.config.lm_deep_iter_confidence  # шкала 0–5
+
+        # ── 1. Извлечь весь доступный текст ─────────────────────────────────
+        max_total = chunk_size * max_iters
+        full_text = extract_all_text_for_iter(task.path, max_chars=max_total)
+
+        if not full_text or not has_meaningful_lm_text(
+            full_text, min_letters=self.config.lm_min_snippet_letters
+        ):
+            self.logger.info(
+                "LM iter: no text → single-shot fallback path=%s", task.path
+            )
+            fallback = build_lm_fallback_context(
+                task, max_chars=self.config.lm_input_chars
+            )
+            if fallback:
+                return self.enrich(task, fallback)
+            return None
+
+        # ── 2. Нарезаем на части ─────────────────────────────────────────────
+        chunks = [
+            full_text[i : i + chunk_size]
+            for i in range(0, len(full_text), chunk_size)
+        ][:max_iters]
+
+        # ── 3. Кэш ───────────────────────────────────────────────────────────
+        payload_seed = {
+            "schema": "lm_iter_v1",
+            "path": task.path.name,
+            "metadata": task.metadata.__dict__,
+            "chunks_hash": xxhash.xxh64(
+                full_text.encode("utf-8", errors="ignore")
+            ).hexdigest(),
+        }
+        cache_key = xxhash.xxh64(
+            json.dumps(payload_seed, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        cached = self.db.get_lm_cache(cache_key)
+        if cached:
+            self.logger.info(
+                "LM iter cache_hit path=%s key=%s", task.path, cache_key[:10]
+            )
+            return cached
+
+        # ── 4. Системный промпт ──────────────────────────────────────────────
+        genre_list = ", ".join(CANONICAL_GENRES)
+        system_prompt = (
+            "РОЛЬ: Ты — машина категоризации книг. Я буду подавать текст книги по частям.\n"
+            "После КАЖДОЙ части отвечай ТОЛЬКО JSON, без пояснений и лишних слов:\n"
+            '{"results":[{"title":"...","author":"...","genre_analysis":'
+            '{"primary_genre":"...","confidence_score":0.0,"need_more_text":true}}]}\n'
+            f"Жанры только из: {genre_list}.\n"
+            "ИСТОЧНИК ИСТИНЫ — ТЕКСТ книги, а не имя файла. Имя файла часто "
+            "транслитерировано латиницей или содержит цифровой ID — его НЕЛЬЗЯ копировать "
+            "в title/author. Восстанови настоящие title и author из САМОГО ТЕКСТА "
+            "(титул, шапка, первые страницы) кириллицей.\n"
+            "РАЗДЕЛЯЙ автора и название: author — ТОЛЬКО имя автора; title — ТОЛЬКО "
+            "название книги БЕЗ имени автора. Не дублируй автора внутри title.\n"
+            "УБИРАЙ из title служебный мусор: цифровые ID, расширения (.fb2/.zip), "
+            "номера вида .294160 — это не часть названия.\n"
+            "ЖАНР: выбери наиболее подходящий по СОДЕРЖАНИЮ. НЕ ставь 'Фантастика' "
+            "по умолчанию когда не уверен — для книг по психологии, отношениям, здоровью "
+            "бери соответствующий жанр; если жанр неясен — снизь confidence_score, "
+            "а не угадывай наугад.\n"
+            "confidence_score — реальная уверенность 0.0–5.0. НЕ ставь 5.0 по умолчанию.\n"
+            "need_more_text: false — когда confidence_score >= 4.5 и ты уверен.\n"
+            "ЯЗЫК: title и author — в оригинальной форме (для русских книг — кириллица). "
+            "НЕ транслитерируй кириллицу латиницей и не переводи на английский.\n"
+            "Если поле нельзя определить из текста — пустая строка '', НЕ 'Unknown' "
+            "и НЕ имя файла.\n"
+            "Только JSON, никаких слов вне JSON."
+        )
+
+        lang_hint = (getattr(task.metadata, "lang", "") or "").strip().lower() or "ru"
+        archive_chain = " -> ".join(task.archive_chain) if task.archive_chain else "(нет)"
+        context_prefix = (
+            f"Имя файла: {task.path.name}\n"
+            f"Язык: {lang_hint}\n"
+            f"Теги: {self._brief_metadata(task.metadata)}\n"
+            f"Архивный путь: {archive_chain}\n\n"
+        )
+
+        messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        last_parsed: Optional[dict[str, Any]] = None
+
+        for i, chunk in enumerate(chunks):
+            chunk_label = f"Часть {i + 1}/{len(chunks)}"
+            user_content = (
+                f"{context_prefix}{chunk_label}:\n{chunk}"
+                if i == 0
+                else f"{chunk_label}:\n{chunk}"
+            )
+            messages.append({"role": "user", "content": user_content})
+
+            request_payload: dict[str, Any] = {
+                "model": self.config.lm_model,
+                "temperature": 0.0,
+                "max_tokens": self.config.lm_max_output_tokens,
+                "messages": messages,
+            }
+
+            try:
+                resp, _ = self._post_chat(
+                    request_payload, timeout=(6, self.config.lm_timeout_sec)
+                )
+                if resp.status_code >= 400:
+                    self.logger.warning(
+                        "LM iter HTTP %s iter=%d path=%s body=%s",
+                        resp.status_code, i + 1, task.path,
+                        self._response_error_brief(resp),
+                    )
+                    break
+
+                data = resp.json()
+                content = (
+                    data.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                    .strip()
+                )
+
+                parsed = parse_model_payload(content)
+                if parsed:
+                    last_parsed = parsed
+                    # Добавляем ответ ассистента в историю для следующей итерации
+                    messages.append({"role": "assistant", "content": content})
+
+                    confidence = float(parsed.get("confidence", 0.0))
+
+                    # Проверяем need_more_text из сырого JSON
+                    need_more = True
+                    try:
+                        raw_obj = parse_json_object(content)
+                        if raw_obj:
+                            results = raw_obj.get("results", [raw_obj])
+                            if isinstance(results, list) and results:
+                                ga = results[0].get("genre_analysis", {})
+                                need_more = bool(ga.get("need_more_text", True))
+                    except Exception:
+                        pass
+
+                    self.logger.info(
+                        "LM iter %d/%d path=%s conf=%.1f need_more=%s genre=%s",
+                        i + 1, len(chunks), task.path,
+                        confidence, need_more, parsed.get("genre", "?"),
+                    )
+                    self.metrics.add_event(
+                        f"LM iter {i + 1}/{len(chunks)} "
+                        f"conf={confidence:.1f}: {task.path.name[:28]}"
+                    )
+
+                    if not need_more or confidence >= conf_threshold:
+                        self.logger.info(
+                            "LM iter done at %d/%d conf=%.1f path=%s",
+                            i + 1, len(chunks), confidence, task.path,
+                        )
+                        break
+                else:
+                    # Неудачный парсинг — не добавляем в историю, пробуем следующую часть
+                    self.logger.warning(
+                        "LM iter %d non-json path=%s raw=%s",
+                        i + 1, task.path, truncate(clean_text(content), 120),
+                    )
+
+            except Exception as exc:
+                self.logger.warning(
+                    "LM iter %d exception path=%s: %s", i + 1, task.path, exc
+                )
+                break
+
+        if last_parsed:
+            self.db.set_lm_cache(cache_key, last_parsed)
+            self.logger.info(
+                "LM iter final path=%s conf=%.1f payload=%s",
+                task.path,
+                float(last_parsed.get("confidence", 0.0)),
+                json.dumps(last_parsed, ensure_ascii=False),
+            )
+        else:
+            self.metrics.add_event(
+                f"LM iter: нет результата для {task.path.name[:30]}"
+            )
+        return last_parsed
+
     def translate_output_metadata(
         self,
         task: FileTask,
@@ -1624,6 +1957,13 @@ class LMStudioClient:
             self.logger.info("LM rename cache_hit path=%s key=%s", task.path, cache_key[:16])
             return {str(k): str(v) for k, v in cached.items() if v}
 
+        # Skip LM if title and author are already in the target language script.
+        if _text_already_in_language(original_title, lang) and _text_already_in_language(original_author, lang):
+            self.logger.info("LM rename skip(already %s) path=%s", lang, task.path)
+            translated["title"] = original_title
+            translated["author"] = original_author
+            return translated
+
         target_name = "Russian" if lang == "ru" else "English"
         system_prompt = (
             "You are a careful library catalog translator. "
@@ -1631,8 +1971,12 @@ class LMStudioClient:
             "Return only a valid JSON object with keys title and author. "
             "Do not add explanations. Preserve volume numbers, part numbers, editions, "
             "technical abbreviations, ISBNs and series markers. "
-            "For authors, use the established name in the target language when it is well known; "
-            "otherwise transliterate. Do not invent missing metadata."
+            "CRITICAL: if the title or author is ALREADY written in the target language's "
+            f"script ({target_name}), return it UNCHANGED — do not transliterate or alter it. "
+            "Never convert Cyrillic to Latin when the target language is Russian. "
+            "For authors written in a DIFFERENT script, use the established target-language "
+            "form when well known; transliterate only as a last resort. "
+            "Do not invent missing metadata."
         )
         user_prompt = (
             f"Target language: {target_name}\n"
@@ -1786,12 +2130,24 @@ class TerminalUI:
                 "Keys: Esc/Ctrl+S=Stop+Cleanup"
             ).ljust(width)
         )
+        gb_done = snap.get("gb_done", 0.0)
+        gb_seen = snap.get("gb_seen", 0.0)
+        gb_remaining = snap.get("gb_remaining", 0.0)
+        gb_per_min = snap.get("gb_per_min", 0.0)
         lines.append(
             (
                 f"Progress: [{bar}] {snap['pct']:6.2f}%   "
+                f"{gb_done:.2f} / {gb_seen:.2f} GB   "
+                f"Remaining: {gb_remaining:.2f} GB   "
+                f"Speed: {gb_per_min:.2f} GB/min   "
+                f"ETA: {snap['eta']}"
+            ).ljust(width)
+        )
+        lines.append(
+            (
                 f"Books found: {snap['seen']}   Books done: {snap['done']}   "
                 f"Packed: {book_results.get('packed', 0)}   "
-                f"Dupes: {book_results.get('duplicate', 0)}   "
+                f"Dupes: {book_results.get('duplicate', 0) + book_results.get('duplicate_temp', 0)}   "
                 f"NoBook: {snap.get('nobook_files', 0)}   "
                 f"Book failed: {book_results.get('failed', 0)}"
             ).ljust(width)
@@ -1869,6 +2225,7 @@ class LibrarySorter:
         self.unpack_done = threading.Event()
         self.detect_done = threading.Event()
         self.tag_done = threading.Event()
+        self.isbn_done = threading.Event()
         self.lm_done = threading.Event()
         self.rename_done = threading.Event()
         self.dedupe_done = threading.Event()
@@ -1893,14 +2250,18 @@ class LibrarySorter:
         self._archive_has_book: set[Path] = set()
         self._archive_book_total: dict[Path, int] = defaultdict(int)
         self._archive_book_packed: dict[Path, int] = defaultdict(int)
+        self._archive_sizes: dict[Path, int] = defaultdict(int)
 
         self.q12 = queue.Queue()
         self.q23 = queue.Queue(maxsize=config.queue_size)
         self.q34 = queue.Queue(maxsize=config.queue_size)
         self.q45 = queue.Queue(maxsize=config.queue_size)
+        self.q5_isbn = queue.Queue(maxsize=config.queue_size)
         self.q56 = queue.Queue(maxsize=config.queue_size)
         self.q67 = queue.Queue(maxsize=config.queue_size)
         self.q78 = queue.Queue(maxsize=config.queue_size)
+        # Live folder injection: UI puts Path objects here while pipeline runs
+        self._live_source_queue: queue.Queue[Optional[Path]] = queue.Queue()
 
         self.threads: list[threading.Thread] = []
         self.ui = TerminalUI(self.metrics, self)
@@ -1954,6 +2315,32 @@ class LibrarySorter:
     def should_stop(self) -> bool:
         return self.stop_event.is_set()
 
+    def add_live_source_dir(self, path: Path) -> None:
+        """Inject a new source directory while the pipeline is running."""
+        self._live_source_queue.put(path)
+
+    def _all_downstream_idle(self) -> bool:
+        """Return True when every agent downstream of A1 is idle and all queues empty.
+
+        Used by A1's live-wait loop to decide when the pipeline has naturally
+        finished processing all discovered files (no more drops pending).
+        """
+        for q in (
+            self.q12, self.q23, self.q34, self.q45,
+            self.q5_isbn, self.q56, self.q67, self.q78,
+        ):
+            if not q.empty():
+                return False
+        if self.unpack_active.get() != 0:
+            return False
+        with self.metrics.lock:
+            for stage, stage_map in self.metrics.active_stage_items.items():
+                if stage == "A1":
+                    continue  # A1 itself is in live-wait, ignore
+                if stage_map:
+                    return False
+        return True
+
     def queue_sizes(self) -> dict[str, int]:
         return {
             "A1": 0,
@@ -1961,6 +2348,7 @@ class LibrarySorter:
             "A3": self.q23.qsize(),
             "A4": self.q34.qsize(),
             "A5": self.q45.qsize(),
+            "A5b": self.q5_isbn.qsize(),
             "A6": self.q56.qsize(),
             "A7": self.q67.qsize(),
             "A8": self.q78.qsize(),
@@ -1972,6 +2360,7 @@ class LibrarySorter:
             "unpack_done": self.unpack_done.is_set(),
             "detect_done": self.detect_done.is_set(),
             "dedupe_done": self.dedupe_done.is_set(),
+            "isbn_done": self.isbn_done.is_set(),
         }
 
     def ensure_dirs(self) -> None:
@@ -2363,6 +2752,7 @@ class LibrarySorter:
             else:
                 self.metrics.set_mode("END_ERROR")
             self._stop_background_indexing()
+            self.temp_tracker.stop()
             self.ui.stop()
             self.keyboard.stop()
             self.db.close()
@@ -2381,6 +2771,7 @@ class LibrarySorter:
             "A4", self.config.dedupe_workers, self._dedupe_loop, self.dedupe_done
         )
         self._spawn_group("A5", self.config.tag_workers, self._tags_loop, self.tag_done)
+        self._spawn_group("A5b", self.config.isbn_workers, self._isbn_loop, self.isbn_done)
         self._spawn_group("A6", self.config.lm_workers, self._lm_loop, self.lm_done)
         self._spawn_group(
             "A7", self.config.rename_workers, self._rename_loop, self.rename_done
@@ -2428,6 +2819,8 @@ class LibrarySorter:
     def _mark_discovered_task(self, task: FileTask) -> None:
         self.metrics.mark_task_seen()
         self.metrics.mark_stage("A1")
+        if task.size_bytes > 0:
+            self.metrics.add_bytes_seen(task.size_bytes)
         if suffix_lower(task.path) in BOOK_EXTENSIONS and not task.book_seen_counted:
             task.book_seen_counted = True
             self.metrics.mark_book_seen()
@@ -2534,12 +2927,10 @@ class LibrarySorter:
         return out or None
 
     def _lookup_isbn_googlebooks(self, isbn: str) -> Optional[dict[str, str]]:
-        # Rate-limit: Google Books allows ~1 req/sec per IP without an API key.
-        # Serialize all workers through a single lock and enforce a 1.2-second gap.
-        _GBOOKS_MIN_INTERVAL = 1.2
+        # Secondary in-function serializer — the main throttle is ISBN_MIN_INTERVAL in A5b.
         with _GBOOKS_LOCK:
             now = time.monotonic()
-            wait = _GBOOKS_LAST_REQUEST[0] + _GBOOKS_MIN_INTERVAL - now
+            wait = _GBOOKS_LAST_REQUEST[0] + 1.0 - now
             if wait > 0:
                 time.sleep(wait)
             _GBOOKS_LAST_REQUEST[0] = time.monotonic()
@@ -2552,13 +2943,19 @@ class LibrarySorter:
                 timeout=(4, 8),
             )
             if resp.status_code == 429:
-                # Rate-limited despite our throttle — back off, then raise so
-                # the caller does NOT cache this as "not_found".
+                # Exponential backoff: 60s → 120s → 240s → cap 480s.
+                with _GBOOKS_LOCK:
+                    _GBOOKS_CONSEC_429[0] += 1
+                    consec = _GBOOKS_CONSEC_429[0]
+                backoff = min(60.0 * (2 ** (consec - 1)), 480.0)
                 self.logger.warning(
-                    "ISBN lookup googlebooks rate-limited (429), backing off isbn=%s",
+                    "ISBN lookup googlebooks rate-limited (429), backoff=%.0fs "
+                    "(attempt %d) isbn=%s",
+                    backoff,
+                    consec,
                     isbn,
                 )
-                time.sleep(5.0)
+                time.sleep(backoff)
                 raise _IsbnRateLimited(isbn)
             if resp.status_code >= 400:
                 self.logger.warning(
@@ -2568,6 +2965,11 @@ class LibrarySorter:
                 )
                 return None
             payload = resp.json()
+            # Successful response — reset consecutive-429 counter.
+            with _GBOOKS_LOCK:
+                _GBOOKS_CONSEC_429[0] = 0
+        except _IsbnRateLimited:
+            raise  # let _lookup_isbn_metadata_with_provider see it (skip caching as not_found)
         except Exception as exc:
             self.logger.warning("ISBN lookup googlebooks failed isbn=%s: %s", isbn, exc)
             return None
@@ -2608,7 +3010,9 @@ class LibrarySorter:
         out = {k: v for k, v in out.items() if v and v != "Unknown"}
         return out or None
 
-    def _enrich_metadata_from_isbn(self, task: FileTask, md: Metadata, fmt_tags: dict[str, str]) -> None:
+    def _find_isbn_candidates(self, task: FileTask, md: Metadata, fmt_tags: dict[str, str]) -> None:
+        """Phase 1 (A5, fast/local): search filename, tags and file snippet for ISBNs.
+        Stores unique candidates in task.isbn_candidates; does NOT make network calls."""
         if not self.config.isbn_lookup:
             return
         haystack_parts = [
@@ -2623,7 +3027,17 @@ class LibrarySorter:
         if not isbns:
             snippet = extract_text_snippet(task.path, max_chars=1600)
             isbns = extract_isbns_from_text(snippet)
+        # Deduplicate while preserving order.
+        seen: set[str] = set()
         for isbn in isbns:
+            if isbn not in seen:
+                seen.add(isbn)
+                task.isbn_candidates.append(isbn)
+
+    def _perform_isbn_network_lookup(self, task: FileTask) -> None:
+        """Phase 2 (A5b ISBN worker, network): try each candidate and update metadata on hit."""
+        md = task.metadata
+        for isbn in task.isbn_candidates:
             data = self._lookup_isbn_metadata(isbn)
             if not data:
                 continue
@@ -2633,9 +3047,10 @@ class LibrarySorter:
                 md.author = data["author"]
             if data.get("genre"):
                 md.genre = normalize_genre(data["genre"])
+            md.isbn = isbn
             md.source = "isbn"
             md.confidence = max(md.confidence, 0.9)
-            self.logger.info("ISBN metadata isbn=%s path=%s data=%s", isbn, task.path, data)
+            self.logger.info("A5b isbn=%s path=%s data=%s", isbn, task.path, data)
             return
 
     def _md_brief(self, md: Metadata) -> str:
@@ -2723,7 +3138,17 @@ class LibrarySorter:
         self.temp_tracker.release(task.cleanup_root)
         self._mark_archive_progress(task, result)
         self.metrics.mark_task_done(result)
-        if task.is_book_candidate and not task.book_done_counted:
+        if task.size_bytes > 0:
+            if result == "archive_unpacked":
+                top_level_archive = task.archive_source if task.archive_source else task.path
+                with self._archive_state_lock:
+                    self._archive_sizes[top_level_archive] += task.size_bytes
+            else:
+                self.metrics.add_bytes_done(task.size_bytes)
+        if result == "failed" and not task.book_done_counted:
+            task.book_done_counted = True
+            self.metrics.mark_book_done("failed")
+        elif task.is_book_candidate and not task.book_done_counted:
             task.book_done_counted = True
             self.metrics.mark_book_done(result)
 
@@ -2821,12 +3246,42 @@ class LibrarySorter:
     def _duplicate_output_is_verified(self, task: FileTask) -> bool:
         canonical = task.canonical_zip
         if not canonical or not canonical.exists() or not canonical.is_file():
-            self.logger.warning(
-                "Duplicate verification failed: canonical missing source=%s canonical=%s",
-                task.path,
-                canonical or "",
+            # canonical может быть устаревшим temp-путём из предыдущего прогона или
+            # гонки между A4 и A8. Делаем свежий запрос в БД — A8 мог уже обновить путь.
+            if task.xxh64:
+                fresh = self.db.get_canonical_zip(task.xxh64)
+                if fresh:
+                    fresh_path = Path(fresh)
+                    if fresh_path.exists() and fresh_path.is_file():
+                        task.canonical_zip = fresh_path
+                        canonical = fresh_path
+                        # Продолжаем проверку с актуальным путём
+                    else:
+                        self.logger.debug(
+                            "Duplicate: canonical stale/missing (was temp path from interrupted run)"
+                            " source=%s canonical=%s fresh=%s — treating as verified",
+                            task.path, canonical or "", fresh,
+                        )
+                        return True  # дубль обработан корректно; не проваливаем архив
+            if not canonical or not canonical.exists() or not canonical.is_file():
+                self.logger.warning(
+                    "Duplicate verification failed: canonical missing source=%s canonical=%s",
+                    task.path,
+                    canonical or "",
+                )
+                return False
+        try:
+            canonical.resolve(strict=False).relative_to(
+                self.config.temp_base.resolve(strict=False)
             )
-            return False
+            self.logger.debug(
+                "Duplicate: canonical is an in-flight temp file source=%s canonical=%s — treating as verified",
+                task.path, canonical,
+            )
+            return True
+        except Exception:
+            pass
+
         try:
             canonical.resolve(strict=False).relative_to(
                 self.config.target_dir.resolve(strict=False)
@@ -2869,7 +3324,7 @@ class LibrarySorter:
         return True
 
     def _clear_all_queues(self) -> None:
-        for q in (self.q12, self.q23, self.q34, self.q45, self.q56, self.q67, self.q78):
+        for q in (self.q12, self.q23, self.q34, self.q45, self.q5_isbn, self.q56, self.q67, self.q78):
             while True:
                 try:
                     _ = q.get_nowait()
@@ -3052,18 +3507,25 @@ class LibrarySorter:
 
             if pending <= 0:
                 del self._archive_pending[archive_path]
+                archive_size = self._archive_sizes.pop(archive_path, 0)
+                if archive_size > 0:
+                    self.metrics.add_bytes_done(archive_size)
                 has_book = archive_path in self._archive_has_book
                 book_total = self._archive_book_total.pop(archive_path, 0)
                 book_packed = self._archive_book_packed.pop(archive_path, 0)
                 self._archive_has_book.discard(archive_path)
                 self._archive_failed.discard(archive_path)
                 stop_requested = self.should_stop() or self.cleanup_event.is_set()
-                if not failed and self.config.delete_source_after_pack and not stop_requested:
-                    if has_book and book_total > 0 and book_packed == book_total:
+                # Принцип: Source должен опустеть. Каждый файл уже куда-то поехал
+                # (packed → TARGET, duplicate → Duplicates, failed → Error, nobook → NoBook).
+                # Поэтому архив-источник тоже не нужен.
+                if self.config.delete_source_after_pack and not stop_requested:
+                    if has_book:
+                        # Удаляем архив. Отдельные книги (packed/duplicate/failed)
+                        # уже распределены по нужным папкам.
                         action = "delete_archive"
-                    elif has_book:
-                        action = "preserve_archive"
                     else:
+                        # В архиве не было ни одной книги — целиком в NoBook.
                         action = "move_nobook"
 
         if action == "delete_archive" and archive_path.exists():
@@ -3260,6 +3722,17 @@ def is_archive(path: Path) -> bool:
 # Google Books API rate-limiter (shared across all pipeline workers).
 _GBOOKS_LOCK: threading.Lock = threading.Lock()
 _GBOOKS_LAST_REQUEST: list[float] = [0.0]  # mutable container so workers share state
+
+# Global ISBN stage rate-limiter: ~6 requests/min = 1 per 10s across all providers.
+# Google Books free quota is small; 10s gap keeps us well under the daily ceiling.
+# Workers hold the lock only to read/write the timestamp, then sleep outside.
+# Public names so agent_a5b_isbn can access them via `from library_pipeline import *`.
+ISBN_RATE_LOCK: threading.Lock = threading.Lock()
+ISBN_LAST_TS: list[float] = [0.0]   # 0.0 → far past, first worker never waits
+ISBN_MIN_INTERVAL: float = 10.0     # ~6 req/min — conservative for Google Books free tier
+
+# Tracks consecutive 429 responses for exponential backoff (reset on success).
+_GBOOKS_CONSEC_429: list[int] = [0]
 
 
 def xxh64_file(path: Path, chunk_size: int = 4 * 1024 * 1024, timeout: float = 60.0) -> str:
@@ -3486,13 +3959,77 @@ def extract_text_snippet(path: Path, max_chars: int = 1800) -> str:
     return ""
 
 
-def decode_text_bytes(raw: bytes) -> str:
-    for enc in ("utf-8", "utf-16", "cp1251", "latin1"):
-        try:
-            return raw.decode(enc, errors="ignore")
-        except Exception:
-            continue
+def extract_all_text_for_iter(path: Path, max_chars: int = 32_000) -> str:
+    """
+    Извлекает максимально доступный читаемый текст для итеративного глубокого анализа.
+    В отличие от extract_text_snippet читает больше контента и обходит несколько разделов.
+    """
+    ext = suffix_lower(path)
+    try:
+        if ext in {".txt", ".md", ".csv", ".tsv", ".json", ".rtf"}:
+            return read_text_head(path, max_chars)
+        if ext in {".fb2", ".xml"}:
+            # FB2 — XML; вырезаем теги для чистого текста без разметки
+            raw = read_text_head(path, max_chars + 8000)
+            return clean_text(strip_xml_tags(raw))[:max_chars]
+        if ext in {".html", ".htm"}:
+            raw = read_text_head(path, max_chars + 4000)
+            return clean_text(strip_xml_tags(raw))[:max_chars]
+        if ext == ".docx":
+            with zipfile.ZipFile(path, "r") as zf:
+                if "word/document.xml" in zf.namelist():
+                    raw_bytes = zf.read("word/document.xml")
+                    txt = strip_xml_tags(raw_bytes.decode("utf-8", errors="ignore"))
+                    return clean_text(txt)[:max_chars]
+        if ext == ".epub":
+            collected: list[str] = []
+            total = 0
+            with zipfile.ZipFile(path, "r") as zf:
+                candidates = sorted(
+                    n for n in zf.namelist()
+                    if n.lower().endswith((".xhtml", ".html", ".htm"))
+                )
+                for name in candidates:
+                    if total >= max_chars:
+                        break
+                    try:
+                        chunk_raw = zf.read(name)
+                        chunk_txt = clean_text(
+                            strip_xml_tags(chunk_raw.decode("utf-8", errors="ignore"))
+                        )
+                        if chunk_txt.strip():
+                            collected.append(chunk_txt)
+                            total += len(chunk_txt)
+                    except Exception:
+                        continue
+            return "\n".join(collected)[:max_chars]
+        if ext == ".pdf":
+            try:
+                import pypdf  # type: ignore
+                reader = pypdf.PdfReader(str(path))
+                parts: list[str] = []
+                total = 0
+                for page in reader.pages:
+                    if total >= max_chars:
+                        break
+                    page_txt = clean_text(page.extract_text() or "")
+                    if page_txt:
+                        parts.append(page_txt)
+                        total += len(page_txt)
+                return "\n".join(parts)[:max_chars]
+            except Exception:
+                return ""
+        if ext in {".djvu", ".djv"}:
+            return extract_djvu_text_snippet(path, max_chars)
+        if ext == ".doc":
+            return extract_doc_text_snippet(path, max_chars)
+    except Exception:
+        return ""
     return ""
+
+
+def decode_text_bytes(raw: bytes) -> str:
+    return smart_decode_bytes(raw)
 
 
 def run_text_tool(args: list[str], timeout_sec: int = 15) -> str:
@@ -3529,17 +4066,75 @@ def extract_doc_text_snippet(path: Path, max_chars: int) -> str:
     return text[:max_chars] if text else ""
 
 
-def read_text_head(path: Path, max_chars: int) -> str:
-    raw = b""
-    with open(path, "rb") as f:
-        raw = f.read(max_chars * 4)
-    for enc in ("utf-8", "utf-16", "cp1251", "latin1"):
+_XML_ENCODING_RE = re.compile(rb'encoding\s*=\s*["\']([\w\-]+)["\']', re.IGNORECASE)
+# Кодировки-кандидаты для эвристического выбора (русские книги обычно cp1251).
+_DECODE_CANDIDATES = ("cp1251", "koi8-r", "cp1252", "iso-8859-5", "latin1")
+
+
+def _cyrillic_score(text: str) -> int:
+    """Грубая оценка «русскости»: число кириллических букв минус штраф за replacement-символы."""
+    cyr = sum(1 for ch in text if "Ѐ" <= ch <= "ӿ")
+    bad = text.count("�")
+    return cyr - bad * 5
+
+
+def smart_decode_bytes(raw: bytes) -> str:
+    """
+    Надёжно декодирует байты текста/XML, корректно определяя кодировку.
+
+    Старый код декодировал utf-8 с errors='ignore' ПЕРВЫМ и возвращал результат
+    на первой же итерации. Для русских FB2 в Windows-1251 это молча выкидывало
+    ВСЮ кириллицу (cp1251-байты невалидны как utf-8) и ветка cp1251 не достигалась.
+    """
+    if not raw:
+        return ""
+
+    # 1) BOM — однозначные случаи.
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig", errors="ignore")
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
         try:
-            txt = raw.decode(enc, errors="ignore")
-            return clean_text(txt)[:max_chars]
+            return raw.decode("utf-16", errors="ignore")
+        except Exception:
+            pass
+
+    # 2) Явная декларация кодировки в XML-прологе FB2/HTML.
+    decl = _XML_ENCODING_RE.search(raw[:400])
+    if decl:
+        enc_name = decl.group(1).decode("ascii", errors="ignore").lower()
+        aliases = {
+            "windows-1251": "cp1251", "win-1251": "cp1251", "cp-1251": "cp1251",
+            "windows-1252": "cp1252", "utf8": "utf-8",
+        }
+        enc_name = aliases.get(enc_name, enc_name)
+        try:
+            return raw.decode(enc_name, errors="ignore")
+        except (LookupError, Exception):
+            pass
+
+    # 3) Чистый utf-8 (строгий режим — реальный utf-8 пройдёт, cp1251 упадёт).
+    try:
+        return raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        pass
+
+    # 4) Эвристика: берём кодировку, дающую больше всего кириллицы.
+    best_txt, best_score = "", -(10**9)
+    for enc in _DECODE_CANDIDATES:
+        try:
+            cand = raw.decode(enc, errors="replace")
         except Exception:
             continue
-    return ""
+        score = _cyrillic_score(cand)
+        if score > best_score:
+            best_txt, best_score = cand, score
+    return best_txt or raw.decode("latin1", errors="ignore")
+
+
+def read_text_head(path: Path, max_chars: int) -> str:
+    with open(path, "rb") as f:
+        raw = f.read(max_chars * 4)
+    return clean_text(smart_decode_bytes(raw))[:max_chars]
 
 
 def parse_filename(stem: str) -> dict[str, str]:
@@ -3547,6 +4142,8 @@ def parse_filename(stem: str) -> dict[str, str]:
     patterns = [
         r"^\s*(?P<author>.+?)\s*[-–—]\s*(?P<title>.+?)\s*$",
         r"^\s*(?P<title>.+?)\s*\((?P<author>.+?)\)\s*$",
+        r"^\s*(?P<author>[А-Яа-яA-Za-z\s,]{3,50})\s*\.\s+(?P<title>.+?)\s*$",
+        r"^\s*(?P<author>[А-Яа-яA-Za-z]\.\s*(?:[А-Яа-яA-Za-z]\.\s*)?[А-Яа-яA-Za-z\s,]{3,50})\s*\.\s+(?P<title>.+?)\s*$",
     ]
     for pat in patterns:
         m = re.match(pat, stem_clean)
@@ -3938,6 +4535,23 @@ def normalize_output_language(language: str) -> str:
     return "ru"
 
 
+def _text_already_in_language(text: str, lang: str) -> bool:
+    """Return True if text is already predominantly written in the target language script.
+
+    ru → majority Cyrillic; en → majority Latin. Ignores short/empty strings.
+    Threshold 60%: allows mixed names (e.g. 'J.R.R. Tolkien' still passes for 'en').
+    """
+    letters = [c for c in text if c.isalpha()]
+    if len(letters) < 3:
+        return True  # too short to judge — don't waste an LM call
+    if lang == "ru":
+        cyrillic = sum(1 for c in letters if "Ѐ" <= c <= "ӿ")
+        return cyrillic / len(letters) >= 0.60
+    # "en" — mostly Latin
+    latin = sum(1 for c in letters if c.isascii())
+    return latin / len(letters) >= 0.60
+
+
 def translate_genre_for_output(genre: str, target_language: str) -> str:
     canonical = normalize_genre(genre or "Unknown")
     if normalize_output_language(target_language) == "en":
@@ -4300,6 +4914,146 @@ def first_letter(author: str) -> str:
     return ch
 
 
+# ── Фильтрация мусорных LM-ответов и умный выбор имён для A7 ─────────────────
+
+# Строки-заглушки, которые LM возвращает когда не может определить поле
+LM_SKIP_VALUES: frozenset[str] = frozenset({
+    "", "unknown", "unknown title", "unknown author",
+    "untitled", "title", "author", "n/a", "none", "...",
+    "книга", "автор", "неизвестно", "неизвестный",
+    "не определено", "неизвестен", "нет данных",
+})
+
+
+def lm_value_is_garbage(value: str) -> bool:
+    """True если строка — заглушка LM или числовой machine-generated ID."""
+    v = clean_text(value).lower()
+    if v in LM_SKIP_VALUES:
+        return True
+    # Числовые/ID-строки: "665224", "2_5309915140886365302" и т.п. — машинные имена.
+    # НО короткие числа (≤4 цифр без подчёркивания) могут быть реальными
+    # названиями-годами: "1984", "2001", "451" — их сохраняем.
+    if v and re.fullmatch(r'[\d_.\-\s]+', v):
+        digits_only = re.sub(r'[_.\-\s]', '', v)
+        if '_' in v or len(digits_only) >= 5:
+            return True
+    # Слишком короткое
+    if len(v) < 2:
+        return True
+    return False
+
+
+def pick_best_title(md: "Metadata", task: "FileTask") -> str:
+    """
+    Лучшее доступное название для построения пути A7.
+    Приоритет:
+    1. Метаданные (LM/теги)
+    2. Структурированный «Автор — Название» из имени файла (оба поля найдены)
+    3. Структурированный «Автор — Название» из цепочки архивов (сразу берём)
+    4. Многословный стем архива (≥2 значимых слова) как запасной кандидат
+    5. Стем файла без структуры (title-only из parse_filename)
+    6. Сырой стем файла
+    """
+    if md.title and not lm_value_is_garbage(md.title):
+        return md.title
+
+    # Структурированный паттерн из имени файла: нужны оба поля (автор + название)
+    parsed = parse_filename(task.path.stem)
+    t_stem = parsed.get("title", "")
+    a_stem = parsed.get("author", "")
+    if t_stem and a_stem and not lm_value_is_garbage(t_stem):
+        return t_stem
+
+    # Цепочка архивов: структурированные «Автор — Название» имеют наивысший приоритет
+    arch_title_candidate: str = ""
+    for arch_name in task.archive_chain:
+        arch_stem = Path(arch_name).stem
+        parsed_a = parse_filename(arch_stem)
+        t2 = parsed_a.get("title", "")
+        a2 = parsed_a.get("author", "")
+        if t2 and not lm_value_is_garbage(t2):
+            if a2:
+                return t2  # Структурированный паттерн — берём немедленно
+            # Без автора — кандидат, если достаточно многословный
+            if not arch_title_candidate:
+                meaningful = [w for w in t2.split() if w.isalpha() and len(w) > 2]
+                if len(meaningful) >= 2:
+                    arch_title_candidate = t2
+
+    if arch_title_candidate:
+        return arch_title_candidate
+
+    # Стем файла без структуры (напр. «Война и мир.fb2» → title-only)
+    if t_stem and not lm_value_is_garbage(t_stem):
+        return t_stem
+
+    return task.path.stem
+
+
+def pick_best_author(md: "Metadata", task: "FileTask") -> str:
+    """
+    Лучший доступный автор для построения пути A7 (аналогично pick_best_title).
+    """
+    if md.author and not lm_value_is_garbage(md.author):
+        return md.author
+    parsed = parse_filename(task.path.stem)
+    a = parsed.get("author", "")
+    if a and not lm_value_is_garbage(a):
+        return a
+    for arch_name in task.archive_chain:
+        arch_stem = Path(arch_name).stem
+        parsed_a = parse_filename(arch_stem)
+        a2 = parsed_a.get("author", "")
+        if a2 and not lm_value_is_garbage(a2):
+            return a2
+    return "Unknown Author"
+
+
+# Хвостовой машинный ID в названии: "...рода.294160", "...Eshli.291543"
+_TRAILING_ID_RE = re.compile(r"[\s._\-]+\d{5,}\s*$")
+
+
+def clean_book_title(title: str, author: str = "") -> str:
+    """
+    Чистит название перед построением пути A7:
+    1. Срезает хвостовой цифровой ID (".294160", "_291543" — 5+ цифр в конце).
+    2. Убирает дублирующийся префикс автора ("Дилья Эникиева Счастье…" → "Счастье…").
+    """
+    t = clean_text(title)
+    if not t:
+        return t
+
+    # 1) Хвостовой числовой ID
+    stripped = _TRAILING_ID_RE.sub("", t).strip()
+    if stripped and not lm_value_is_garbage(stripped):
+        t = stripped
+
+    # 2) Дубль автора в начале названия
+    a = clean_text(author)
+    if a and a.lower() not in ("unknown author", "неизвестный автор"):
+        tl, al = t.lower(), a.lower()
+        if tl.startswith(al) and len(t) > len(a) + 1:
+            rest = t[len(a):].lstrip(" .,-—–:")
+            if rest and not lm_value_is_garbage(rest):
+                t = rest
+        else:
+            # Автор может идти словами в другом порядке (Фамилия Имя ↔ Имя Фамилия)
+            a_parts = [p for p in re.split(r"[\s.]+", a) if len(p) > 1]
+            if len(a_parts) >= 2 and all(p.lower() in tl for p in a_parts):
+                first_word = t.split()[0].lower() if t.split() else ""
+                if first_word in (p.lower() for p in a_parts):
+                    # начинается с части автора — срежем подряд идущие токены автора
+                    tokens = t.split()
+                    aset = {p.lower() for p in a_parts}
+                    i = 0
+                    while i < len(tokens) and tokens[i].lower().strip(".,") in aset:
+                        i += 1
+                    rest = " ".join(tokens[i:]).lstrip(" .,-—–:")
+                    if rest and not lm_value_is_garbage(rest):
+                        t = rest
+    return t.strip()
+
+
 def safe_relative(path: Path, base: Path) -> Path:
     try:
         return path.relative_to(base)
@@ -4424,6 +5178,7 @@ def _bind_agent_methods() -> None:
     from agents import agent_a3_detect
     from agents import agent_a4_dedupe
     from agents import agent_a5_tags
+    from agents import agent_a5b_isbn
     from agents import agent_a6_lm
     from agents import agent_a7_rename
     from agents import agent_a8_pack
@@ -4448,6 +5203,8 @@ def _bind_agent_methods() -> None:
     LibrarySorter._needs_lm = agent_a5_tags._needs_lm
     LibrarySorter._needs_genre_only_lm = agent_a5_tags._needs_genre_only_lm
     LibrarySorter._merge_lm_metadata = agent_a5_tags._merge_lm_metadata
+
+    LibrarySorter._isbn_loop = agent_a5b_isbn._isbn_loop
 
     LibrarySorter._lm_loop = agent_a6_lm._lm_loop
 
@@ -4509,6 +5266,8 @@ def parse_args() -> Config:
         action="store_true",
         help="Не искать метаданные по ISBN через внешние книжные каталоги.",
     )
+    p.add_argument("--isbn-workers", type=int, default=DEFAULT_ISBN_WORKERS,
+                   help="Число воркеров ISBN-очереди (рекомендуется 1–2; упирается в rate limit ~28 req/min).")
     p.add_argument(
         "--isbn-provider",
         choices=("auto", "openlibrary", "googlebooks"),
@@ -4578,6 +5337,7 @@ def parse_args() -> Config:
         lm_max_output_tokens=max(40, args.lm_max_output_tokens),
         isbn_lookup=DEFAULT_ISBN_LOOKUP and not args.no_isbn_lookup,
         isbn_provider=args.isbn_provider,
+        isbn_workers=max(1, args.isbn_workers),
         translate_output_names=bool(args.rename_output),
         output_language=args.output_language,
         ephemeral_mode=not args.persist_state,

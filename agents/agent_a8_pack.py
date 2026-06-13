@@ -21,7 +21,8 @@ def _pack_loop(self, worker_idx: int) -> None:
                 break
             continue
         try:
-            self.metrics.set_active_item("A8", active_slot, task.path.name)
+            display_name = task.dest_zip.name if task.dest_zip else task.path.name
+            self.metrics.set_active_item("A8", active_slot, display_name)
             self.metrics.mark_stage("A8")
             self._pack_task(task)
             if task.xxh64 and task.dest_zip:
@@ -46,10 +47,15 @@ def _pack_loop(self, worker_idx: int) -> None:
             self.db.mark_file(task, "pack_failed", str(exc))
             if task.xxh64:
                 self.db.remove_hash(task.xxh64)
-            self.metrics.add_event(
-                f"Pack failed: {task.path.name} -> {truncate(str(exc), 160)}"
-            )
-            self._move_to_error_dir(task, reason=str(exc)[:120])
+            if not self.should_stop() and not self.cleanup_event.is_set():
+                self.metrics.add_event(
+                    f"Pack failed: {task.path.name} -> {truncate(str(exc), 160)}"
+                )
+                self._move_to_error_dir(task, reason=str(exc)[:120])
+            else:
+                self.logger.info(
+                    "A8 pack interrupted by stop — source kept in place: %s", task.path
+                )
             self._finalize_task(task, result="failed")
         finally:
             self.metrics.clear_active_item("A8", active_slot)
@@ -75,9 +81,7 @@ def _pack_task(self, task: FileTask) -> None:
         "-bd",
         "-bb0",
         "-tzip",
-        "-mx=9",
-        "-mfb=258",
-        "-mpass=15",
+        "-mx=3",   # fast zip: books are already compressed formats
         str(tmp_zip),
         local_input,
     ]
@@ -104,4 +108,16 @@ def _pack_task(self, task: FileTask) -> None:
 
     atomic_replace(tmp_zip, dest)
     task.dest_zip = dest
+
+    # Переименовываем файл внутри архива, чтобы он совпадал с именем zip.
+    # Пример: Афганец.zip должен содержать Афганец.fb2, а не 10103.fb2.
+    new_internal = dest.stem + task.path.suffix.lower()
+    old_internal = task.path.name
+    if new_internal != old_internal and not lm_value_is_garbage(dest.stem):
+        cmd_rn = [self.seven_zip, "rn", "-y", "-bd", str(dest), old_internal, new_internal]
+        result_rn = self._run_cmd_with_cancel(cmd_rn, timeout_sec=30)
+        if result_rn.returncode != 0:
+            self.logger.warning(
+                "A8 rn failed for %s: %s", dest, format_subprocess_error(result_rn, 120)
+            )
 

@@ -33,18 +33,16 @@ LM_MODEL = 'mistralai/mistral-nemo'
 LM_API_KEY = 'sk-or-v1-PASTE_YOUR_OPENROUTER_KEY_HERE'
 
 # --- Отдельный провайдер для А7 (переименование) ---
-# Если не задано (пусто) — А7 использует те же LM_URL / LM_MODEL / LM_API_KEY что и А6.
-# Смысл: А6 (жанр/метаданные) → большая облачная модель (OpenRouter),
-#         А7 (перевод имён) → быстрая локальная модель (Ollama).
-# LM_URL_RENAME = 'http://127.0.0.1:11434/v1/chat/completions'
-# LM_MODEL_RENAME = 'gemma4:e4b'
-# LM_API_KEY_RENAME = ''
-LM_URL_RENAME = ''
-LM_MODEL_RENAME = ''
-LM_API_KEY_RENAME = ''
+# А7 использует локальный Ollama (qwen2.5:7b) — быстрый, хороший русский,
+# влезает в RTX 2060 8 GB в 4-бит (~4.5 GB VRAM).
+# А6 (жанр/метаданные) продолжает работать через OpenRouter выше.
+LM_URL_RENAME = 'http://127.0.0.1:11434/v1/chat/completions'
+LM_MODEL_RENAME = 'qwen2.5:7b'
+LM_API_KEY_RENAME = ''  # Ollama — ключ не нужен
 
-# Необязательно. Если не задавать TEMP_BASE — используется <TARGET_DIR>\_TempPipeline.
-# TEMP_BASE = r"D:\Library\_TempPipeline"
+# RAM-диск R: создан и настроен автозапуском (задача LibSort_RAMDisk_R в Планировщике).
+# Допишите это в ваш setting.py:
+TEMP_BASE = r"R:\_TempPipeline"
 
 # Количество агентов/воркеров по стадиям:
 # A2 Распаковка, A3 Книга?, A4 XXH64, A5 Теги, A6 Ollama, A7 Переименование, A8 Упаковка
@@ -74,7 +72,7 @@ LM_DEEP_MAX_OUTPUT_TOKENS = 1024
 LM_FAST_PRECHECK = True
 LM_FAST_INPUT_CHARS = 900
 LM_FAST_MAX_OUTPUT_TOKENS = 180
-LM_FAST_CONFIDENCE_MIN = 4.0
+LM_FAST_CONFIDENCE_MIN = 4.5
 
 LM_FORCE_FULL_METADATA = False
 LM_FILL_UNKNOWN_AUTHOR = True
@@ -83,6 +81,7 @@ LM_STRICT_JSON_MODE = True
 LM_MIN_SNIPPET_LETTERS = 24
 ISBN_LOOKUP = True
 ISBN_PROVIDER = 'auto'
+ISBN_WORKERS = 1   # ISBN network queue workers; rate limit ~6 req/min (10s gap), 1 worker is enough
 TRANSLATE_OUTPUT_NAMES = True
 KEEP_SOURCES = False
 OUTPUT_LANGUAGE = 'ru'

@@ -47,7 +47,12 @@ def _unpack_loop(self, worker_idx: int) -> None:
             self.logger.exception("Agent2: ошибка %s: %s", task.path, exc)
             self.metrics.mark_stage("A2", error=True)
             self.db.mark_file(task, "unpack_failed", str(exc))
-            self._move_to_error_dir(task, reason=f"A2 unpack: {str(exc)[:120]}")
+            if not self.should_stop() and not self.cleanup_event.is_set():
+                self._move_to_error_dir(task, reason=f"A2 unpack: {str(exc)[:120]}")
+            else:
+                self.logger.info(
+                    "A2 unpack interrupted by stop — source kept in place: %s", task.path
+                )
             self._finalize_task(task, result="failed")
         finally:
             self.metrics.clear_active_item("A2", active_slot)
@@ -94,6 +99,7 @@ def _extract_archive_and_route(self, task: FileTask) -> int:
                 archive_chain=task.archive_chain + [task.path.name],
                 archive_source=source_archive,
                 cleanup_root=temp_root,
+                size_bytes=safe_filesize(file_path),
             )
             self.temp_tracker.register(temp_root)
             self._mark_discovered_task(new_task)
@@ -134,6 +140,11 @@ def _process_nested_archive_task(self, task: FileTask) -> None:
         self.logger.exception("Agent2 nested: ошибка %s: %s", task.path, exc)
         self.metrics.mark_stage("A2", error=True)
         self.db.mark_file(task, "unpack_failed", str(exc))
-        self._move_to_error_dir(task, reason=f"A2 nested unpack: {str(exc)[:120]}")
+        if not self.should_stop() and not self.cleanup_event.is_set():
+            self._move_to_error_dir(task, reason=f"A2 nested unpack: {str(exc)[:120]}")
+        else:
+            self.logger.info(
+                "A2 nested unpack interrupted by stop — source kept in place: %s", task.path
+            )
         self._finalize_task(task, result="failed")
 

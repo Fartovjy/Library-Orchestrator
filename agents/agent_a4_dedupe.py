@@ -78,9 +78,27 @@ def _handle_duplicate(self, task: FileTask, canonical: Optional[str]) -> str:
         )
         return "duplicate"
     else:
-        # Для временных файлов дубликат фиксируем в журнале и освобождаем temp.
+        # Дубликат из распакованного архива: сохраняем сам файл в DUPES_DIR/<hash>/
+        # с префиксом архива-родителя, чтобы потом можно было понять, откуда он взялся.
+        # Без этого файл просто терялся при очистке temp, и папка Duplicates пустовала.
+        base_name = sanitize_component(task.path.stem)
+        ext = task.path.suffix.lower()
+        h8 = (task.xxh64 or "dup")[:12]
+        archive_marker = (
+            sanitize_component(task.archive_source.stem)
+            if task.archive_source
+            else "archive"
+        )
+        out_dir = self.config.dupes_dir / h8
+        out_dir.mkdir(parents=True, exist_ok=True)
+        dst = ensure_unique_file_path(out_dir / f"{archive_marker}__{base_name}{ext}")
+        try:
+            safe_move(task.path, dst)
+        except FileNotFoundError:
+            # Temp уже подчистили — это не критично, оставляем только запись в логе.
+            self.logger.debug("Duplicate temp source already gone: %s", task.path)
         self.metrics.add_event(
-            f"Duplicate temp: {task.path.name}; canonical={Path(canonical).name if canonical else 'n/a'}"
+            f"Duplicate temp -> {dst.name}; canonical={Path(canonical).name if canonical else 'n/a'}"
         )
         return "duplicate_temp"
 
